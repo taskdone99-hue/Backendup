@@ -118,7 +118,7 @@ class CheckUsernameResponse(BaseModel):
     username: str
     available: bool
     message: str
-
+    suggestions: list[str] | None = None
 
 # ---- Register / Login ----
 

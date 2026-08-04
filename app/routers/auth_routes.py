@@ -172,20 +172,35 @@ def _issue_token_pair(db: Session, user: models.User) -> schemas.TokenResponse:
     return schemas.TokenResponse(
         access_token=access_token, refresh_token=refresh_token, user=user
     )
+import random
 
-
-# ---- Username availability ----
-
+def _generate_username_suggestions(db: Session, base: str, count: int = 4) -> list[str]:
+    suggestions = []
+    candidates = [
+        f"{base}{random.randint(10, 999)}",
+        f"{base}_{random.randint(1, 99)}",
+        f"the_{base}",
+        f"{base}_official",
+        f"real_{base}",
+        f"{base}{random.randint(1000, 9999)}",
+    ]
+    for candidate in candidates:
+        if len(suggestions) >= count:
+            break
+        if not _username_taken(db, candidate):
+            suggestions.append(candidate)
+    return suggestions
+# ---- Username availability -
 @router.post("/check-username", response_model=schemas.CheckUsernameResponse)
 def check_username(payload: schemas.CheckUsernameRequest, db: Session = Depends(get_db)):
     taken = _username_taken(db, payload.username)
+    suggestions = _generate_username_suggestions(db, payload.username) if taken else None
     return schemas.CheckUsernameResponse(
         username=payload.username,
         available=not taken,
         message="Username is available" if not taken else "Username is already taken",
-    )
-
-
+        suggestions=suggestions,
+    ) 
 # ---- Register (steps 1-4: username -> identifier -> password -> DOB) ----
 
 @router.post("/register", response_model=schemas.OTPResponse, status_code=status.HTTP_201_CREATED)
