@@ -249,24 +249,39 @@ def register(payload: schemas.RegisterRequest, db: Session = Depends(get_db)):
 
 
 # ---- Login ----
+# ---- Login ----
 
 @router.post("/login", response_model=schemas.TokenResponse)
 def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
-    identifier, channel = schemas.normalize_identifier(payload.identifier)
-    user = _get_user_by_identifier(db, identifier, channel)
+    identifier = payload.identifier.strip()
+
+    # Try email or phone first
+    try:
+        normalized, channel = schemas.normalize_identifier(identifier)
+        user = _get_user_by_identifier(db, normalized, channel)
+    except ValueError:
+        # If it's not an email or phone, treat it as a username
+        user = (
+            db.query(models.User)
+            .filter(models.User.username == identifier)
+            .first()
+        )
 
     invalid_credentials = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Incorrect email/phone number or password",
+        detail="Incorrect username/email/phone number or password",
     )
 
     if user is None or not user.hashed_password:
         raise invalid_credentials
+
     if not verify_password(payload.password, user.hashed_password):
         raise invalid_credentials
+
     if not user.is_active:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="This account has been deactivated"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account has been deactivated",
         )
 
     return _issue_token_pair(db, user)

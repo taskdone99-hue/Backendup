@@ -166,9 +166,20 @@ class LoginRequest(BaseModel):
     @field_validator("identifier")
     @classmethod
     def validate_identifier(cls, v: str) -> str:
-        normalized, _ = normalize_identifier(v)
-        return normalized
+        v = v.strip()
 
+        # Email
+        if _EMAIL_RE.match(v):
+            return v.lower()
+
+        # Phone number
+        try:
+            return _normalize_phone(v)
+        except ValueError:
+            pass
+
+        # Username
+        return _validate_username_format(v)
 
 # ---- Refresh / Logout ----
 
