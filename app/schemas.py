@@ -24,9 +24,8 @@ def _normalize_phone(value: str) -> str:
         parsed = phonenumbers.parse(value, None)
     except phonenumbers.NumberParseException:
         raise ValueError(
-            "Enter the phone number in E.164 format, including country code, e.g. +919876543210"
-        )
-
+    "Please include your country code, e.g. +91 for India, +1 for the US, etc."
+)
     if not phonenumbers.is_valid_number(parsed):
         raise ValueError("This does not look like a valid phone number")
 

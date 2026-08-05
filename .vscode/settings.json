@@ -1,0 +1,19 @@
+{
+    "sqltools.connections": [
+        {
+            "mysqlOptions": {
+                "authProtocol": "default",
+                "enableSsl": "Disabled"
+            },
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "database-2.ci9ueyck4xdq.us-east-1.rds.amazonaws.com",
+            "port": 3306,
+            "driver": "MySQL",
+            "name": "otp-auth-rds",
+            "database": "otp_auth_api",
+            "username": "admin",
+            "password": "Anjali9989"
+        }
+    ]
+}
