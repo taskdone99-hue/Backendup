@@ -1,13 +1,22 @@
+import os
+
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.database import Base, engine
-from app.routers import auth_routes
+from app.routers import auth_routes, user_routes, story_routes, content_routes
 
-# Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production)
+# Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
+# For an existing DB that already has a `users` table, also run
+# `python -m app.add_profile_columns` once to add the new profile columns —
+# create_all() only creates missing tables, it doesn't alter existing ones.
 Base.metadata.create_all(bind=engine)
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
 
 app = FastAPI(title="Phone OTP Auth API")
 
@@ -58,7 +67,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 app.include_router(auth_routes.router)
+app.include_router(user_routes.router)
+app.include_router(story_routes.router)
+app.include_router(content_routes.router)
+app.include_router(content_routes.reels_router)
 
 
 @app.get("/")

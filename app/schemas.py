@@ -5,7 +5,7 @@ from datetime import date, datetime
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.models import Gender, OTPChannel, OTPPurpose
+from app.models import Gender, MediaType, OTPChannel, OTPPurpose
 
 PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
 # Matches Instagram's own minimum signup age.
@@ -251,3 +251,164 @@ class AccessTokenResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+# ==========================================================================
+# Profile / Follow / Posts / Reels / Stories
+# ==========================================================================
+
+# ---- User profile ----
+
+class UserProfileOut(BaseModel):
+    """Public-facing profile — what GET /api/users/:id and follower/following lists return."""
+    id: int
+    username: str
+    full_name: str | None
+    bio: str | None
+    avatar_url: str | None
+    is_private: bool
+    is_phone_verified: bool
+    is_email_verified: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class UserProfileUpdate(BaseModel):
+    """PUT /api/users/:id — every field optional so callers can patch just what changed."""
+    full_name: str | None = Field(default=None, max_length=100)
+    bio: str | None = Field(default=None, max_length=150)
+    gender: Gender | None = None
+    is_private: bool | None = None
+
+    @field_validator("full_name")
+    @classmethod
+    def strip_full_name(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+    @field_validator("bio")
+    @classmethod
+    def strip_bio(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
+class AvatarUploadResponse(BaseModel):
+    message: str
+    avatar_url: str
+
+
+class UserStatsOut(BaseModel):
+    user_id: int
+    posts_count: int
+    followers_count: int
+    following_count: int
+
+
+class UserSummaryOut(BaseModel):
+    """Compact user shape used inside lists — followers, following, suggested."""
+    id: int
+    username: str
+    full_name: str | None
+    avatar_url: str | None
+    is_following: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+# ---- Follow system ----
+
+class FollowStatusResponse(BaseModel):
+    message: str
+    following: bool
+
+
+class PaginatedUsersResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[UserSummaryOut]
+
+
+# ---- Posts / Reels / Saved ----
+
+class PostOut(BaseModel):
+    id: int
+    user_id: int
+    caption: str | None
+    media_url: str
+    media_type: MediaType
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReelOut(BaseModel):
+    id: int
+    user_id: int
+    caption: str | None
+    video_url: str
+    thumbnail_url: str | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedPostsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[PostOut]
+
+
+class PaginatedReelsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[ReelOut]
+
+
+# ---- Stories ----
+
+class StoryOut(BaseModel):
+    id: int
+    user_id: int
+    media_url: str
+    media_type: MediaType
+    caption: str | None
+    created_at: datetime
+    expires_at: datetime
+    views_count: int = 0
+    viewed_by_me: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class StoryUserFeedOut(BaseModel):
+    """One entry per followed user who has an active story, grouping their stories together."""
+    user: UserSummaryOut
+    stories: list[StoryOut]
+    has_unseen: bool
+
+
+class StoryFeedResponse(BaseModel):
+    items: list[StoryUserFeedOut]
+
+
+class StoryViewerOut(BaseModel):
+    id: int
+    username: str
+    avatar_url: str | None
+    viewed_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class StoryViewResponse(BaseModel):
+    message: str
+    views_count: int

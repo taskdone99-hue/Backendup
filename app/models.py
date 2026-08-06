@@ -9,6 +9,8 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import relationship
@@ -34,6 +36,11 @@ class Gender(str, enum.Enum):
     prefer_not_to_say = "prefer_not_to_say"
 
 
+class MediaType(str, enum.Enum):
+    image = "image"
+    video = "video"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -47,6 +54,11 @@ class User(Base):
     hashed_password = Column(String(255), nullable=True)
     date_of_birth = Column(Date, nullable=True)
     gender = Column(Enum(Gender), nullable=True)
+    # Profile fields (displayed on the profile page, editable via PUT /api/users/:id)
+    full_name = Column(String(100), nullable=True)
+    bio = Column(String(150), nullable=True)
+    avatar_url = Column(String(500), nullable=True)
+    is_private = Column(Boolean, default=False, nullable=False)
     is_phone_verified = Column(Boolean, default=False, nullable=False)
     is_email_verified = Column(Boolean, default=False, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -55,6 +67,9 @@ class User(Base):
     refresh_tokens = relationship(
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )
+    posts = relationship("Post", back_populates="user", cascade="all, delete-orphan")
+    reels = relationship("Reel", back_populates="user", cascade="all, delete-orphan")
+    stories = relationship("Story", back_populates="user", cascade="all, delete-orphan")
 
 
 class PendingSignup(Base):
@@ -107,3 +122,108 @@ class RefreshToken(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="refresh_tokens")
+
+
+class Follow(Base):
+    """
+    A directed edge: `follower_id` follows `following_id`. No approval step
+    for private accounts is modeled here — follows are effective immediately.
+    """
+
+    __tablename__ = "follows"
+    __table_args__ = (
+        UniqueConstraint("follower_id", "following_id", name="uq_follow_pair"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    follower_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    following_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    follower = relationship("User", foreign_keys=[follower_id])
+    following = relationship("User", foreign_keys=[following_id])
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    caption = Column(Text, nullable=True)
+    media_url = Column(String(500), nullable=False)
+    media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="posts")
+    saves = relationship("SavedPost", back_populates="post", cascade="all, delete-orphan")
+
+
+class Reel(Base):
+    __tablename__ = "reels"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    caption = Column(Text, nullable=True)
+    video_url = Column(String(500), nullable=False)
+    thumbnail_url = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="reels")
+
+
+class SavedPost(Base):
+    """A user bookmarking a post — powers GET /api/users/:id/saved."""
+
+    __tablename__ = "saved_posts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "post_id", name="uq_saved_post"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    post = relationship("Post", back_populates="saves")
+
+
+class Story(Base):
+    """
+    Stories are ephemeral (default 24h). `expires_at` is set at creation time
+    and every read query filters on it, so an expired story disappears from
+    the API immediately even before the cleanup job removes the row.
+
+    Actual deletion of expired rows is handled out-of-band by a scheduled job
+    (RDS/cron) that runs `app/cleanup_expired_stories.py` — see that file.
+    """
+
+    __tablename__ = "stories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    media_url = Column(String(500), nullable=False)
+    media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
+    caption = Column(String(280), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    user = relationship("User", back_populates="stories")
+    views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
+
+
+class StoryView(Base):
+    """Records that `viewer_id` has seen `story_id` — powers the viewers list / view count."""
+
+    __tablename__ = "story_views"
+    __table_args__ = (
+        UniqueConstraint("story_id", "viewer_id", name="uq_story_view"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    story_id = Column(Integer, ForeignKey("stories.id"), nullable=False, index=True)
+    viewer_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    viewed_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    story = relationship("Story", back_populates="views")
+    viewer = relationship("User", foreign_keys=[viewer_id])
