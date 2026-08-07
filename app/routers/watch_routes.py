@@ -49,11 +49,18 @@ def _now() -> datetime:
 
 def _close_session(session: models.WatchSession, ended_at: datetime) -> None:
     """Stamp a session as ended in place. Caller commits."""
-    watch_seconds = int((ended_at - session.started_at).total_seconds())
-    if watch_seconds < 0:
-        # Clock skew guard — should be unreachable since both timestamps
-        # come from this server, but never persist a negative duration.
-        watch_seconds = 0
+
+    started_at = session.started_at
+
+    # Normalize timezone from DB
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+
+    if ended_at.tzinfo is None:
+        ended_at = ended_at.replace(tzinfo=timezone.utc)
+        
+
+    watch_seconds = max(0, int((ended_at - started_at).total_seconds()))
 
     session.ended_at = ended_at
     session.watch_seconds = watch_seconds
