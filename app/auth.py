@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
@@ -28,16 +28,12 @@ OTP_EXPIRE_MINUTES = int(os.getenv("OTP_EXPIRE_MINUTES", "5"))
 OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "30"))
 OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
 
-# HTTPBearer just reads "Authorization: Bearer <token>" — no token-fetching
-# handshake, so Swagger's Authorize dialog is a single "paste your token"
-# field instead of a username/password/client_id form aimed at an OAuth2
-# token endpoint (which /api/auth/login isn't — it takes a JSON body, not
-# OAuth2 form data).
-bearer_scheme = HTTPBearer()
+# tokenUrl points at login since that's the primary way a client gets a token now
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 # auto_error=False lets public-but-personalizable endpoints (e.g. follower
 # lists that show "is_following" when you're logged in) work with or
 # without a token, instead of 401ing anonymous callers outright.
-bearer_scheme_optional = HTTPBearer(auto_error=False)
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
 
 
 # ---- OTP helpers ----
@@ -91,15 +87,13 @@ def create_access_token(data: dict) -> str:
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
+    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ) -> models.User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    token = credentials.credentials
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("type") != "access":
@@ -117,13 +111,11 @@ def get_current_user(
 
 
 def get_current_user_optional(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme_optional),
-    db: Session = Depends(get_db),
+    token: str | None = Depends(oauth2_scheme_optional), db: Session = Depends(get_db)
 ) -> Optional[models.User]:
     """Like get_current_user, but returns None instead of raising for missing/invalid tokens."""
-    if credentials is None:
+    if token is None:
         return None
-    token = credentials.credentials
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("type") != "access":

@@ -371,6 +371,60 @@ class PaginatedReelsResponse(BaseModel):
     items: list[ReelOut]
 
 
+# ---- Watch tracking (reel watch-time) ----
+
+class WatchStartRequest(BaseModel):
+    reel_id: int = Field(..., gt=0)
+
+
+class WatchStartResponse(BaseModel):
+    session_id: int
+    reel_id: int
+    started_at: datetime
+
+
+class WatchEndRequest(BaseModel):
+    session_id: int = Field(..., gt=0)
+    # started_at/ended_at are deliberately NOT accepted from the client here —
+    # trusting a client-supplied timestamp would let a modified app inflate
+    # watch time. started_at was fixed at /watch/start and ended_at is always
+    # the server's clock at the moment this request is handled.
+
+
+class WatchEndResponse(BaseModel):
+    session_id: int
+    reel_id: int
+    watch_seconds: int
+    counted: bool  # False when under the "ignore short sessions" floor
+
+
+class WatchHistoryItem(BaseModel):
+    session_id: int
+    reel_id: int
+    started_at: datetime
+    ended_at: datetime
+    watch_seconds: int
+
+
+class PaginatedWatchHistoryResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[WatchHistoryItem]
+
+
+class WatchPeriodStats(BaseModel):
+    watch_seconds: int
+    reels_watched: int
+
+
+class WatchStatsResponse(BaseModel):
+    today: WatchPeriodStats
+    week: WatchPeriodStats
+    month: WatchPeriodStats
+    total: WatchPeriodStats
+
+
 # ---- Stories ----
 
 class StoryOut(BaseModel):

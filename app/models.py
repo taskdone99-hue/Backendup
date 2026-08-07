@@ -171,6 +171,48 @@ class Reel(Base):
     user = relationship("User", back_populates="reels")
 
 
+class WatchSession(Base):
+    """
+    One row per start/end cycle of a user watching a single reel — this is
+    what makes "actual watch time" possible instead of just app-open time.
+
+    `active_owner_id` mirrors `user_id` while the session is open (started
+    but not yet ended) and is set back to NULL the moment it ends or is
+    auto-closed by a later /watch/start. MySQL allows multiple NULLs through
+    a unique index, so the UniqueConstraint below enforces "at most one open
+    session per user" at the database level — the same trick used for
+    partial unique indexes in Postgres, adapted for MySQL. This closes the
+    race window that an application-level check alone would leave open
+    between two near-simultaneous /watch/start calls.
+    """
+
+    __tablename__ = "watch_sessions"
+    __table_args__ = (
+        UniqueConstraint("active_owner_id", name="uq_watch_session_active_owner"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id"), nullable=False, index=True)
+
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    watch_seconds = Column(Integer, nullable=True)
+
+    # NULL once ended; see class docstring for why this exists.
+    active_owner_id = Column(Integer, nullable=True, index=True)
+
+    # Sessions under the "ignore short sessions" floor are kept for audit
+    # (bot/abuse analysis) but excluded from history + stats via this flag
+    # rather than being deleted outright.
+    is_valid = Column(Boolean, default=True, nullable=False, index=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    reel = relationship("Reel", foreign_keys=[reel_id])
+
+
 class SavedPost(Base):
     """A user bookmarking a post — powers GET /api/users/:id/saved."""
 
