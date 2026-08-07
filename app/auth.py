@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
@@ -29,11 +29,9 @@ OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "30")
 OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
 
 # tokenUrl points at login since that's the primary way a client gets a token now
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
-# auto_error=False lets public-but-personalizable endpoints (e.g. follower
-# lists that show "is_following" when you're logged in) work with or
-# without a token, instead of 401ing anonymous callers outright.
-oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
+bearer_scheme = HTTPBearer()
+
+bearer_scheme_optional = HTTPBearer(auto_error=False)
 
 
 # ---- OTP helpers ----
@@ -87,51 +85,67 @@ def create_access_token(data: dict) -> str:
 
 
 def get_current_user(
-    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db)
 ) -> models.User:
+
+    token = credentials.credentials
+
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
         if payload.get("type") != "access":
             raise credentials_exception
-        user_id: str = payload.get("sub")
+
+        user_id = payload.get("sub")
+
         if user_id is None:
             raise credentials_exception
+
     except JWTError:
         raise credentials_exception
 
     user = db.query(models.User).filter(models.User.id == int(user_id)).first()
+
     if user is None or not user.is_active:
         raise credentials_exception
+
     return user
 
-
 def get_current_user_optional(
-    token: str | None = Depends(oauth2_scheme_optional), db: Session = Depends(get_db)
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme_optional),
+    db: Session = Depends(get_db)
 ) -> Optional[models.User]:
-    """Like get_current_user, but returns None instead of raising for missing/invalid tokens."""
-    if token is None:
+
+    if credentials is None:
         return None
+
+    token = credentials.credentials
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("type") != "access":
             return None
+
         user_id = payload.get("sub")
         if user_id is None:
             return None
+
     except JWTError:
         return None
 
     user = db.query(models.User).filter(models.User.id == int(user_id)).first()
+
     if user is None or not user.is_active:
         return None
+
     return user
-
-
 # ---- Refresh token helpers ----
 # Refresh tokens are opaque random strings (not JWTs). Only their hash is
 # stored, so a leaked database dump doesn't hand out valid refresh tokens —
