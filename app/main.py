@@ -7,7 +7,15 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.database import Base, engine
-from app.routers import auth_routes, user_routes, story_routes, content_routes, watch_routes
+from app.routers import (
+    auth_routes,
+    user_routes,
+    story_routes,
+    content_routes,
+    watch_routes,
+    comment_routes,
+    video_routes,
+)
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
 # For an existing DB that already has a `users` table, also run
@@ -75,6 +83,8 @@ app.include_router(story_routes.router)
 app.include_router(content_routes.router)
 app.include_router(content_routes.reels_router)
 app.include_router(watch_routes.router)
+app.include_router(comment_routes.router)
+app.include_router(video_routes.router)
 
 
 @app.get("/")

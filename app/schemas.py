@@ -5,7 +5,7 @@ from datetime import date, datetime
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.models import Gender, MediaType, OTPChannel, OTPPurpose
+from app.models import Gender, LikeTargetType, MediaType, OTPChannel, OTPPurpose
 
 PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
 # Matches Instagram's own minimum signup age.
@@ -466,3 +466,188 @@ class StoryViewerOut(BaseModel):
 class StoryViewResponse(BaseModel):
     message: str
     views_count: int
+
+
+# ==========================================================================
+# Posts (detail) / Reels (detail) / Comments / Likes / Video creation
+# ==========================================================================
+
+# ---- Posts ----
+
+class PostUpdate(BaseModel):
+    """PUT /api/posts/:id — only the caption can be changed after creation."""
+    caption: str | None = Field(default=None, max_length=2200)
+
+    @field_validator("caption")
+    @classmethod
+    def strip_caption(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
+class PostDetailOut(PostOut):
+    likes_count: int = 0
+    comments_count: int = 0
+    is_liked: bool = False
+
+
+class PaginatedPostDetailResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[PostDetailOut]
+
+
+# ---- Reels / Video ----
+
+class ReelDetailOut(ReelOut):
+    title: str | None = None
+    remixed_from_id: int | None = None
+    likes_count: int = 0
+    is_liked: bool = False
+
+
+class PaginatedReelDetailResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[ReelDetailOut]
+
+
+class VideoMetadataUpdate(BaseModel):
+    """PUT /api/videos/:id/metadata — both fields optional so callers can patch just one."""
+    title: str | None = Field(default=None, max_length=150)
+    description: str | None = Field(default=None, max_length=2200, description="Stored as the reel's caption")
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+    @field_validator("description")
+    @classmethod
+    def strip_description(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
+class ThumbnailUploadResponse(BaseModel):
+    message: str
+    thumbnail_url: str
+
+
+class CollaboratorAddRequest(BaseModel):
+    user_id: int = Field(..., gt=0)
+
+
+class CollaboratorOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    added_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CollaboratorsResponse(BaseModel):
+    message: str
+    collaborators: list[CollaboratorOut]
+
+
+class RevenueShareEntry(BaseModel):
+    user_id: int = Field(..., gt=0)
+    percentage: int = Field(..., ge=0, le=100)
+
+
+class RevenueSplitUpdateRequest(BaseModel):
+    """
+    PUT /api/videos/:id/revenue-split — replaces the entire split in one call.
+    Every entry must be the video's creator or an already-tagged collaborator,
+    and percentages must add up to exactly 100.
+    """
+    splits: list[RevenueShareEntry] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_splits(self) -> "RevenueSplitUpdateRequest":
+        user_ids = [s.user_id for s in self.splits]
+        if len(user_ids) != len(set(user_ids)):
+            raise ValueError("Each user can only appear once in the revenue split")
+        total = sum(s.percentage for s in self.splits)
+        if total != 100:
+            raise ValueError(f"Revenue split percentages must add up to 100 (got {total})")
+        return self
+
+
+class RevenueShareOut(BaseModel):
+    user_id: int
+    percentage: int
+
+
+class RevenueSplitResponse(BaseModel):
+    message: str
+    splits: list[RevenueShareOut]
+
+
+# ---- Comments ----
+
+class CommentCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2200)
+
+    @field_validator("content")
+    @classmethod
+    def strip_content(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Comment can't be empty")
+        return v
+
+
+class CommentOut(BaseModel):
+    id: int
+    post_id: int
+    user_id: int
+    parent_id: int | None
+    content: str
+    created_at: datetime
+    likes_count: int = 0
+    replies_count: int = 0
+    is_liked: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedCommentsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[CommentOut]
+
+
+# ---- Likes ----
+
+class LikeCreate(BaseModel):
+    target_type: LikeTargetType
+    target_id: int = Field(..., gt=0)
+
+
+class LikeOut(BaseModel):
+    id: int
+    user_id: int
+    target_type: LikeTargetType
+    target_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LikeActionResponse(BaseModel):
+    message: str
+    like: LikeOut | None = None
+    likes_count: int
+
+
+class PaginatedLikesResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[UserSummaryOut]

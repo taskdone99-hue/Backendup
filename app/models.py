@@ -41,6 +41,12 @@ class MediaType(str, enum.Enum):
     video = "video"
 
 
+class LikeTargetType(str, enum.Enum):
+    post = "post"
+    reel = "reel"
+    comment = "comment"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -164,11 +170,63 @@ class Reel(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     caption = Column(Text, nullable=True)
+    # Separate from `caption` — metadata endpoints (PUT /api/videos/:id/metadata)
+    # treat title/description as distinct fields; caption doubles as description.
+    title = Column(String(150), nullable=True)
     video_url = Column(String(500), nullable=False)
     thumbnail_url = Column(String(500), nullable=True)
+    # Deliberately NOT a ForeignKey: a real FK with the default RESTRICT
+    # behavior would block deleting an original reel once anything remixes
+    # its audio. This is an informal reference to reels.id instead — a
+    # remix that outlives its original just keeps a dangling id.
+    remixed_from_id = Column(Integer, nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="reels")
+    collaborators = relationship(
+        "ReelCollaborator", back_populates="reel", cascade="all, delete-orphan"
+    )
+    revenue_splits = relationship(
+        "ReelRevenueShare", back_populates="reel", cascade="all, delete-orphan"
+    )
+
+
+class ReelCollaborator(Base):
+    """A user tagged as a co-creator on a reel — powers POST /api/videos/:id/collaborators."""
+
+    __tablename__ = "reel_collaborators"
+    __table_args__ = (
+        UniqueConstraint("reel_id", "user_id", name="uq_reel_collaborator"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    added_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    reel = relationship("Reel", back_populates="collaborators")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class ReelRevenueShare(Base):
+    """
+    One row per (reel, user) revenue share. All rows for a given reel are
+    validated (in the schema layer) to sum to 100 before being written —
+    PUT /api/videos/:id/revenue-split replaces the full set atomically.
+    """
+
+    __tablename__ = "reel_revenue_shares"
+    __table_args__ = (
+        UniqueConstraint("reel_id", "user_id", name="uq_reel_revenue_share"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    percentage = Column(Integer, nullable=False)  # whole percent, 0-100
+
+    reel = relationship("Reel", back_populates="revenue_splits")
+    user = relationship("User", foreign_keys=[user_id])
 
 
 class WatchSession(Base):
@@ -228,6 +286,51 @@ class SavedPost(Base):
 
     user = relationship("User", foreign_keys=[user_id])
     post = relationship("Post", back_populates="saves")
+
+
+class Comment(Base):
+    """
+    Comments live on posts only (per the API spec). `parent_id` set means
+    this row is a reply — replies are one level deep, matching how
+    POST /api/comments/:id/reply and GET /api/posts/:postId/comments (which
+    only returns top-level comments) are implemented.
+    """
+
+    __tablename__ = "comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True, index=True)
+    content = Column(String(2200), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    post = relationship("Post", foreign_keys=[post_id])
+    user = relationship("User", foreign_keys=[user_id])
+    parent = relationship("Comment", remote_side=[id], foreign_keys=[parent_id])
+
+
+class Like(Base):
+    """
+    A single generic like table for posts, reels, and comments — `target_type`
+    + `target_id` say what was liked instead of three separate like tables.
+    `target_id` is intentionally not a ForeignKey since it points at three
+    different tables depending on `target_type`; the routers validate the
+    target exists before inserting.
+    """
+
+    __tablename__ = "likes"
+    __table_args__ = (
+        UniqueConstraint("user_id", "target_type", "target_id", name="uq_like_target"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    target_type = Column(Enum(LikeTargetType), nullable=False, index=True)
+    target_id = Column(Integer, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
 
 
 class Story(Base):
