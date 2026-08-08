@@ -6,6 +6,7 @@ __pycache__/
 *.so
 *.egg-info/
 *.egg
+*.pyc
 
 # Virtual Environment
 venv/

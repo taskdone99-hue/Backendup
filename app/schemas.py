@@ -5,7 +5,16 @@ from datetime import date, datetime
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.models import Gender, LikeTargetType, MediaType, OTPChannel, OTPPurpose
+from app.models import (
+    DevicePlatform,
+    Gender,
+    LikeTargetType,
+    MediaType,
+    NotificationType,
+    OTPChannel,
+    OTPPurpose,
+    ShareContentType,
+)
 
 PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
 # Matches Instagram's own minimum signup age.
@@ -651,3 +660,270 @@ class PaginatedLikesResponse(BaseModel):
     limit: int
     offset: int
     items: list[UserSummaryOut]
+
+
+# ==========================================================================
+# Story Highlights
+# ==========================================================================
+
+class HighlightCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=50)
+    cover_url: str | None = None
+    story_ids: list[int] = Field(
+        default_factory=list, description="Active story ids (owned by the caller) to seed the highlight with"
+    )
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Title can't be empty")
+        return v
+
+
+class HighlightUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=50)
+    cover_url: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("Title can't be empty")
+        return v
+
+
+class AddHighlightStoriesRequest(BaseModel):
+    story_ids: list[int] = Field(..., min_length=1)
+
+
+class HighlightItemOut(BaseModel):
+    id: int
+    media_url: str
+    media_type: MediaType
+    caption: str | None
+    source_story_id: int | None
+    added_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class HighlightOut(BaseModel):
+    id: int
+    user_id: int
+    title: str
+    cover_url: str | None
+    created_at: datetime
+    items_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class HighlightDetailOut(HighlightOut):
+    items: list[HighlightItemOut] = Field(default_factory=list)
+
+
+class HighlightsListResponse(BaseModel):
+    items: list[HighlightOut]
+
+
+# ==========================================================================
+# Saved Posts
+# ==========================================================================
+
+class SavePostRequest(BaseModel):
+    post_id: int = Field(..., gt=0)
+
+
+# ==========================================================================
+# Share
+# ==========================================================================
+
+class InternalShareRequest(BaseModel):
+    content_type: ShareContentType
+    content_id: int = Field(..., gt=0)
+    recipient_ids: list[int] = Field(..., min_length=1, description="User ids to share with")
+    message: str | None = Field(default=None, max_length=500)
+
+    @field_validator("recipient_ids")
+    @classmethod
+    def dedupe_recipients(cls, v: list[int]) -> list[int]:
+        deduped = list(dict.fromkeys(v))
+        if not deduped:
+            raise ValueError("At least one recipient is required")
+        return deduped
+
+    @field_validator("message")
+    @classmethod
+    def strip_message(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
+class ShareOut(BaseModel):
+    id: int
+    sender_id: int
+    recipient_id: int
+    content_type: ShareContentType
+    content_id: int
+    message: str | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class InternalShareResponse(BaseModel):
+    message: str
+    shares: list[ShareOut]
+
+
+class ShareLinkResponse(BaseModel):
+    post_id: int
+    url: str
+
+
+# ==========================================================================
+# Snap / Camera & Filters
+# ==========================================================================
+
+class FilterOut(BaseModel):
+    id: str
+    name: str
+    thumbnail_url: str | None = None
+    category: str | None = None
+
+
+class FiltersResponse(BaseModel):
+    items: list[FilterOut]
+
+
+class SnapOut(BaseModel):
+    id: int
+    user_id: int
+    media_url: str
+    media_type: MediaType
+    filter_id: str | None
+    caption: str | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ==========================================================================
+# Chat
+# ==========================================================================
+
+class ConversationCreate(BaseModel):
+    participant_ids: list[int] = Field(
+        ..., min_length=1, description="Other user ids in the conversation (caller is added automatically)"
+    )
+    title: str | None = Field(default=None, max_length=100, description="Group conversation name")
+
+    @field_validator("participant_ids")
+    @classmethod
+    def dedupe_participants(cls, v: list[int]) -> list[int]:
+        deduped = list(dict.fromkeys(v))
+        if not deduped:
+            raise ValueError("At least one other participant is required")
+        return deduped
+
+
+class MessageCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2200)
+
+    @field_validator("content")
+    @classmethod
+    def strip_content(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Message can't be empty")
+        return v
+
+
+class MessageOut(BaseModel):
+    id: int
+    conversation_id: int
+    sender_id: int
+    content: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedMessagesResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[MessageOut]
+
+
+class ConversationOut(BaseModel):
+    id: int
+    is_group: bool
+    title: str | None
+    created_at: datetime
+    participants: list[UserSummaryOut]
+    last_message: MessageOut | None = None
+
+
+class ConversationsResponse(BaseModel):
+    items: list[ConversationOut]
+
+
+class ChatFontUpdateRequest(BaseModel):
+    font: str = Field(..., min_length=1, max_length=50)
+
+
+class ChatFontResponse(BaseModel):
+    message: str
+    font: str
+
+
+# ==========================================================================
+# Notifications
+# ==========================================================================
+
+class NotificationOut(BaseModel):
+    id: int
+    type: NotificationType
+    actor_id: int | None
+    message: str
+    target_type: str | None
+    target_id: int | None
+    is_read: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedNotificationsResponse(BaseModel):
+    total: int
+    unread_count: int
+    limit: int
+    offset: int
+    items: list[NotificationOut]
+
+
+class NotificationReadResponse(BaseModel):
+    message: str
+    notification: NotificationOut
+
+
+class DeviceTokenRequest(BaseModel):
+    token: str = Field(..., min_length=1, max_length=255)
+    platform: DevicePlatform | None = None
+
+
+class DeviceTokenResponse(BaseModel):
+    message: str
+    token: str
+    platform: DevicePlatform | None

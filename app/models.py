@@ -47,6 +47,27 @@ class LikeTargetType(str, enum.Enum):
     comment = "comment"
 
 
+class ShareContentType(str, enum.Enum):
+    post = "post"
+    reel = "reel"
+
+
+class NotificationType(str, enum.Enum):
+    like = "like"
+    comment = "comment"
+    follow = "follow"
+    mention = "mention"
+    share = "share"
+    message = "message"
+    other = "other"
+
+
+class DevicePlatform(str, enum.Enum):
+    ios = "ios"
+    android = "android"
+    web = "web"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -68,6 +89,10 @@ class User(Base):
     is_phone_verified = Column(Boolean, default=False, nullable=False)
     is_email_verified = Column(Boolean, default=False, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    # Per-user chat display-font preference — PUT /api/chat/settings/font.
+    # Nullable/free-form on purpose: the client owns the list of valid font
+    # names, same way it owns theme names, so the API doesn't hardcode one.
+    chat_font = Column(String(50), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     refresh_tokens = relationship(
@@ -76,6 +101,13 @@ class User(Base):
     posts = relationship("Post", back_populates="user", cascade="all, delete-orphan")
     reels = relationship("Reel", back_populates="user", cascade="all, delete-orphan")
     stories = relationship("Story", back_populates="user", cascade="all, delete-orphan")
+    highlights = relationship(
+        "Highlight", back_populates="user", cascade="all, delete-orphan"
+    )
+    snaps = relationship("Snap", back_populates="user", cascade="all, delete-orphan")
+    device_tokens = relationship(
+        "DeviceToken", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class PendingSignup(Base):
@@ -372,3 +404,192 @@ class StoryView(Base):
 
     story = relationship("Story", back_populates="views")
     viewer = relationship("User", foreign_keys=[viewer_id])
+
+
+# ==========================================================================
+# Story Highlights
+# ==========================================================================
+
+class Highlight(Base):
+    """A named, non-expiring collection of story snapshots pinned to a profile."""
+
+    __tablename__ = "highlights"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String(50), nullable=False)
+    cover_url = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="highlights")
+    items = relationship(
+        "HighlightItem",
+        back_populates="highlight",
+        cascade="all, delete-orphan",
+        order_by="HighlightItem.added_at",
+    )
+
+
+class HighlightItem(Base):
+    """
+    A snapshot of a story's media copied into a highlight at add-time. Copying
+    (rather than pointing at the Story row) is deliberate: stories expire and
+    get cleaned up after STORY_LIFETIME_HOURS, but a highlight is meant to
+    outlive that — so it keeps its own independent copy of the media.
+    """
+
+    __tablename__ = "highlight_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    highlight_id = Column(Integer, ForeignKey("highlights.id"), nullable=False, index=True)
+    # Informal reference only (like Reel.remixed_from_id) — the source story
+    # may have expired and been deleted by the time this is read.
+    source_story_id = Column(Integer, nullable=True, index=True)
+    media_url = Column(String(500), nullable=False)
+    media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
+    caption = Column(String(280), nullable=True)
+    added_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    highlight = relationship("Highlight", back_populates="items")
+
+
+# ==========================================================================
+# Share
+# ==========================================================================
+
+class Share(Base):
+    """
+    A record of a post/reel being sent to another user in-app, powering
+    POST /api/share/internal. `content_id` is intentionally not a ForeignKey
+    since it points at either posts or reels depending on `content_type`,
+    same pattern as Like.target_id.
+    """
+
+    __tablename__ = "shares"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    content_type = Column(Enum(ShareContentType), nullable=False)
+    content_id = Column(Integer, nullable=False, index=True)
+    message = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    sender = relationship("User", foreign_keys=[sender_id])
+    recipient = relationship("User", foreign_keys=[recipient_id])
+
+
+# ==========================================================================
+# Snap / Camera & Filters
+# ==========================================================================
+
+class Snap(Base):
+    """
+    A filter-tagged camera capture, powering POST /api/snaps. The catalog of
+    AR filters (GET /api/filters) is a small static list served straight from
+    the router rather than a DB table, so `filter_id` is stored as a plain
+    string id from that catalog instead of a ForeignKey.
+    """
+
+    __tablename__ = "snaps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    media_url = Column(String(500), nullable=False)
+    media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
+    filter_id = Column(String(50), nullable=True)
+    caption = Column(String(280), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="snaps")
+
+
+# ==========================================================================
+# Chat
+# ==========================================================================
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    is_group = Column(Boolean, default=False, nullable=False)
+    # Only meaningful for group conversations; 1:1 chats derive their display
+    # name client-side from the other participant.
+    title = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    participants = relationship(
+        "ConversationParticipant", back_populates="conversation", cascade="all, delete-orphan"
+    )
+    messages = relationship(
+        "Message",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="Message.created_at",
+    )
+
+
+class ConversationParticipant(Base):
+    __tablename__ = "conversation_participants"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "user_id", name="uq_conversation_participant"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    joined_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    conversation = relationship("Conversation", back_populates="participants")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    content = Column(String(2200), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    conversation = relationship("Conversation", back_populates="messages")
+    sender = relationship("User", foreign_keys=[sender_id])
+
+
+# ==========================================================================
+# Notifications
+# ==========================================================================
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    type = Column(Enum(NotificationType), default=NotificationType.other, nullable=False)
+    message = Column(String(500), nullable=False)
+    # Informal reference to the post/reel/comment/etc. this notification is
+    # about, same pattern as Like.target_id — not a ForeignKey since it can
+    # point at different tables depending on `type`.
+    target_type = Column(String(20), nullable=True)
+    target_id = Column(Integer, nullable=True)
+    is_read = Column(Boolean, default=False, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    actor = relationship("User", foreign_keys=[actor_id])
+
+
+class DeviceToken(Base):
+    """An FCM push-notification device token registered to a user."""
+
+    __tablename__ = "device_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    token = Column(String(255), unique=True, index=True, nullable=False)
+    platform = Column(Enum(DevicePlatform), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="device_tokens")
