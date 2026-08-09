@@ -274,6 +274,7 @@ class UserProfileOut(BaseModel):
     username: str
     full_name: str | None
     bio: str | None
+    gender: Gender | None
     avatar_url: str | None
     is_private: bool
     is_phone_verified: bool
