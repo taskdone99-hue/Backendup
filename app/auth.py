@@ -127,7 +127,14 @@ def get_current_user_optional(
         return None
 
     token = credentials.credentials
+    return get_user_from_raw_token(token, db)
 
+
+def get_user_from_raw_token(token: str, db: Session) -> Optional[models.User]:
+    """Same validation as get_current_user, but takes the raw token string
+    directly instead of pulling it from an Authorization header dependency.
+    Used for the chat WebSocket handshake, where the token arrives as a
+    query parameter — browsers' WebSocket API can't set custom headers."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("type") != "access":
@@ -146,6 +153,7 @@ def get_current_user_optional(
         return None
 
     return user
+
 # ---- Refresh token helpers ----
 # Refresh tokens are opaque random strings (not JWTs). Only their hash is
 # stored, so a leaked database dump doesn't hand out valid refresh tokens —

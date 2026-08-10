@@ -21,6 +21,7 @@ from app.routers import (
     snap_routes,
     chat_routes,
     notification_routes,
+    post_details_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -97,6 +98,7 @@ app.include_router(share_routes.router)
 app.include_router(snap_routes.router)
 app.include_router(chat_routes.router)
 app.include_router(notification_routes.router)
+app.include_router(post_details_routes.router)
 
 
 @app.get("/")

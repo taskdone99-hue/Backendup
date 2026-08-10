@@ -34,6 +34,25 @@ def _to_post_detail(
     detail.is_liked = engagement.is_liked_by(
         db, viewer_id, models.LikeTargetType.post, post.id
     )
+    if post.music_url:
+        detail.music = schemas.MusicOut(
+            title=post.music_title,
+            artist=post.music_artist,
+            audio_url=post.music_url,
+            start_seconds=post.music_start_seconds or 0,
+        )
+    if post.location_name:
+        detail.location = schemas.LocationOut(
+            name=post.location_name,
+            latitude=post.location_latitude,
+            longitude=post.location_longitude,
+        )
+    detail.tags_count = (
+        db.query(models.PostTag).filter(models.PostTag.post_id == post.id).count()
+    )
+    detail.members_count = (
+        db.query(models.PostMember).filter(models.PostMember.post_id == post.id).count()
+    )
     return detail
 
 

@@ -6,6 +6,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -192,8 +193,62 @@ class Post(Base):
     media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Post-detail extras — Add Music / Add Location. Both are optional and
+    # inherently one-per-post, so plain nullable columns (not a separate
+    # table) keep a post fetch to a single row read.
+    music_title = Column(String(150), nullable=True)
+    music_artist = Column(String(150), nullable=True)
+    music_url = Column(String(500), nullable=True)
+    music_start_seconds = Column(Integer, nullable=True)
+
+    location_name = Column(String(150), nullable=True)
+    location_latitude = Column(Float, nullable=True)
+    location_longitude = Column(Float, nullable=True)
+
     user = relationship("User", back_populates="posts")
     saves = relationship("SavedPost", back_populates="post", cascade="all, delete-orphan")
+    tags = relationship("PostTag", back_populates="post", cascade="all, delete-orphan")
+    members = relationship("PostMember", back_populates="post", cascade="all, delete-orphan")
+
+
+class PostTag(Base):
+    """A user tagged in a post's media — powers POST /api/posts/:id/tags.
+    x_position/y_position are optional normalized (0.0-1.0) coordinates for
+    placing the tag bubble on the image, same idea as Instagram's tap-to-tag."""
+
+    __tablename__ = "post_tags"
+    __table_args__ = (
+        UniqueConstraint("post_id", "user_id", name="uq_post_tag"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    x_position = Column(Float, nullable=True)
+    y_position = Column(Float, nullable=True)
+    tagged_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    post = relationship("Post", back_populates="tags")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class PostMember(Base):
+    """A user added as a member/co-author on a post — powers
+    POST /api/posts/:id/members. Same pattern as ReelCollaborator below,
+    just for posts."""
+
+    __tablename__ = "post_members"
+    __table_args__ = (
+        UniqueConstraint("post_id", "user_id", name="uq_post_member"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    added_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    post = relationship("Post", back_populates="members")
+    user = relationship("User", foreign_keys=[user_id])
 
 
 class Reel(Base):
@@ -539,6 +594,9 @@ class ConversationParticipant(Base):
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     joined_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Read-receipt watermark: the highest Message.id this participant has
+    # seen in this conversation. NULL means nothing read yet.
+    last_read_message_id = Column(Integer, nullable=True)
 
     conversation = relationship("Conversation", back_populates="participants")
     user = relationship("User", foreign_keys=[user_id])

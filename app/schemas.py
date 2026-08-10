@@ -494,10 +494,27 @@ class PostUpdate(BaseModel):
         return v.strip() if v is not None else v
 
 
+class MusicOut(BaseModel):
+    title: str
+    artist: str | None
+    audio_url: str
+    start_seconds: int
+
+
+class LocationOut(BaseModel):
+    name: str
+    latitude: float | None
+    longitude: float | None
+
+
 class PostDetailOut(PostOut):
     likes_count: int = 0
     comments_count: int = 0
     is_liked: bool = False
+    music: MusicOut | None = None
+    location: LocationOut | None = None
+    tags_count: int = 0
+    members_count: int = 0
 
 
 class PaginatedPostDetailResponse(BaseModel):
@@ -505,6 +522,95 @@ class PaginatedPostDetailResponse(BaseModel):
     limit: int
     offset: int
     items: list[PostDetailOut]
+
+
+# ---- Post details: tag people, add music, add location, add members ----
+
+class PostTagEntry(BaseModel):
+    user_id: int = Field(..., gt=0)
+    x_position: float | None = Field(default=None, ge=0, le=1, description="Normalized 0.0-1.0 horizontal position on the image")
+    y_position: float | None = Field(default=None, ge=0, le=1, description="Normalized 0.0-1.0 vertical position on the image")
+
+
+class TagPeopleRequest(BaseModel):
+    tags: list[PostTagEntry] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique(self) -> "TagPeopleRequest":
+        user_ids = [t.user_id for t in self.tags]
+        if len(user_ids) != len(set(user_ids)):
+            raise ValueError("Each user can only be tagged once per request")
+        return self
+
+
+class PostTagOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    x_position: float | None
+    y_position: float | None
+    tagged_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PostTagsResponse(BaseModel):
+    message: str
+    tags: list[PostTagOut]
+
+
+class PostMemberAddRequest(BaseModel):
+    user_id: int = Field(..., gt=0)
+
+
+class PostMemberOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    added_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PostMembersResponse(BaseModel):
+    message: str
+    members: list[PostMemberOut]
+
+
+class MusicUpdateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=150)
+    artist: str | None = Field(default=None, max_length=150)
+    audio_url: str = Field(..., min_length=1, max_length=500)
+    start_seconds: int = Field(default=0, ge=0, description="Where in the track playback should start")
+
+    @field_validator("title", "artist")
+    @classmethod
+    def strip_text(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
+class MusicResponse(BaseModel):
+    message: str
+    music: MusicOut
+
+
+class LocationUpdateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=150)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Location name can't be empty")
+        return v
+
+
+class LocationResponse(BaseModel):
+    message: str
+    location: LocationOut
 
 
 # ---- Reels / Video ----
@@ -859,6 +965,14 @@ class MessageOut(BaseModel):
         from_attributes = True
 
 
+class ChatParticipantOut(BaseModel):
+    id: int
+    username: str
+    full_name: str | None
+    avatar_url: str | None
+    is_online: bool = False
+
+
 class PaginatedMessagesResponse(BaseModel):
     total: int
     limit: int
@@ -871,8 +985,9 @@ class ConversationOut(BaseModel):
     is_group: bool
     title: str | None
     created_at: datetime
-    participants: list[UserSummaryOut]
+    participants: list[ChatParticipantOut]
     last_message: MessageOut | None = None
+    unread_count: int = 0
 
 
 class ConversationsResponse(BaseModel):
@@ -886,6 +1001,16 @@ class ChatFontUpdateRequest(BaseModel):
 class ChatFontResponse(BaseModel):
     message: str
     font: str
+
+
+class MarkReadResponse(BaseModel):
+    message: str
+    last_read_message_id: int | None
+
+
+class OnlineStatusOut(BaseModel):
+    user_id: int
+    is_online: bool
 
 
 # ==========================================================================
