@@ -53,3 +53,12 @@ def replies_count(db: Session, comment_id: int) -> int:
         .filter(models.Comment.parent_id == comment_id)
         .count()
     )
+def shares_count(db: Session, post_id: int) -> int:
+    return (
+        db.query(models.Share)
+        .filter(
+            models.Share.content_type == models.ShareContentType.post,
+            models.Share.content_id == post_id,
+        )
+        .count()
+    )

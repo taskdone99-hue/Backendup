@@ -511,11 +511,17 @@ class PostDetailOut(PostOut):
     likes_count: int = 0
     comments_count: int = 0
     is_liked: bool = False
+
+    # Feed / Explore fields
+    author: UserSummaryOut | None = None
+    share_count: int = 0
+    hashtags: list[str] = Field(default_factory=list)
+    media_count: int = 1
+
     music: MusicOut | None = None
     location: LocationOut | None = None
     tags_count: int = 0
     members_count: int = 0
-
 
 class PaginatedPostDetailResponse(BaseModel):
     total: int

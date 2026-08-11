@@ -6,7 +6,7 @@ thumbnail / metadata / collaborators / revenue-split" flow lives in
 video_routes.py (it operates on the same Reel rows created here, since this
 app has a single video-content type).
 """
-
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
@@ -24,16 +24,60 @@ reels_router = APIRouter(prefix="/api/reels", tags=["reels"])
 
 
 # ---- internal helpers ----
+def _extract_hashtags(caption: str | None) -> list[str]:
+    if not caption:
+        return []
 
+    hashtags = re.findall(r"#([A-Za-z0-9_]+)", caption)
+
+    # Remove duplicates while preserving first-seen order
+    return list(dict.fromkeys(hashtags))
 def _to_post_detail(
     db: Session, post: models.Post, viewer_id: int | None
 ) -> schemas.PostDetailOut:
     detail = schemas.PostDetailOut.model_validate(post)
-    detail.likes_count = engagement.likes_count(db, models.LikeTargetType.post, post.id)
+
+    # Existing engagement fields
+    detail.likes_count = engagement.likes_count(
+        db, models.LikeTargetType.post, post.id
+    )
     detail.comments_count = engagement.comments_count(db, post.id)
     detail.is_liked = engagement.is_liked_by(
         db, viewer_id, models.LikeTargetType.post, post.id
     )
+
+    # Author information for Home / Explore Feed
+    author = post.user
+    is_following = False
+
+    if viewer_id is not None and viewer_id != author.id:
+        is_following = (
+            db.query(models.Follow)
+            .filter(
+                models.Follow.follower_id == viewer_id,
+                models.Follow.following_id == author.id,
+            )
+            .first()
+            is not None
+        )
+
+    detail.author = schemas.UserSummaryOut(
+        id=author.id,
+        username=author.username,
+        full_name=author.full_name,
+        avatar_url=author.avatar_url,
+        is_following=is_following,
+    )
+
+    # Share count
+    detail.share_count = engagement.shares_count(db, post.id)
+
+    # Hashtags extracted from caption
+    detail.hashtags = _extract_hashtags(post.caption)
+
+    # Current Post model stores one media_url per post
+    detail.media_count = 1
+
     if post.music_url:
         detail.music = schemas.MusicOut(
             title=post.music_title,
@@ -41,20 +85,27 @@ def _to_post_detail(
             audio_url=post.music_url,
             start_seconds=post.music_start_seconds or 0,
         )
+
     if post.location_name:
         detail.location = schemas.LocationOut(
             name=post.location_name,
             latitude=post.location_latitude,
             longitude=post.location_longitude,
         )
-    detail.tags_count = (
-        db.query(models.PostTag).filter(models.PostTag.post_id == post.id).count()
-    )
-    detail.members_count = (
-        db.query(models.PostMember).filter(models.PostMember.post_id == post.id).count()
-    )
-    return detail
 
+    detail.tags_count = (
+        db.query(models.PostTag)
+        .filter(models.PostTag.post_id == post.id)
+        .count()
+    )
+
+    detail.members_count = (
+        db.query(models.PostMember)
+        .filter(models.PostMember.post_id == post.id)
+        .count()
+    )
+
+    return detail
 
 def _to_reel_detail(
     db: Session, reel: models.Reel, viewer_id: int | None
