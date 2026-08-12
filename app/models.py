@@ -63,6 +63,30 @@ class NotificationType(str, enum.Enum):
     other = "other"
 
 
+class MembershipInterval(str, enum.Enum):
+    monthly = "monthly"
+    yearly = "yearly"
+
+
+class MembershipStatus(str, enum.Enum):
+    active = "active"
+    canceled = "canceled"
+    expired = "expired"
+    past_due = "past_due"
+
+
+class PaymentProvider(str, enum.Enum):
+    razorpay = "razorpay"
+    stripe = "stripe"
+
+
+class PaymentStatus(str, enum.Enum):
+    created = "created"
+    paid = "paid"
+    failed = "failed"
+    refunded = "refunded"
+
+
 class DevicePlatform(str, enum.Enum):
     ios = "ios"
     android = "android"
@@ -651,3 +675,107 @@ class DeviceToken(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="device_tokens")
+
+# ==========================================================================
+# Membership & Payments
+# ==========================================================================
+
+class MembershipPlan(Base):
+    __tablename__ = "membership_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500), nullable=True)
+    # Smallest currency unit (e.g. paise/cents) to avoid float rounding issues.
+    price_amount = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default="INR")
+    interval = Column(Enum(MembershipInterval), nullable=False, default=MembershipInterval.monthly)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    memberships = relationship("UserMembership", back_populates="plan")
+
+
+class UserMembership(Base):
+    """A user's current/most-recent subscription to a MembershipPlan.
+
+    One row per user is kept up to date in place (status flips to canceled/
+    expired/past_due rather than deleting rows), so `.../status` always has
+    something to read even after a cancellation.
+    """
+
+    __tablename__ = "user_memberships"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey("membership_plans.id"), nullable=False, index=True)
+    status = Column(Enum(MembershipStatus), nullable=False, default=MembershipStatus.active)
+    current_period_start = Column(DateTime(timezone=True), server_default=func.now())
+    current_period_end = Column(DateTime(timezone=True), nullable=True)
+    # Set once the subscribing payment order is confirmed paid.
+    payment_order_id = Column(Integer, ForeignKey("payment_orders.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    plan = relationship("MembershipPlan", back_populates="memberships")
+
+
+class PaymentOrder(Base):
+    """A single payment-provider order/intent. Created by
+    POST /api/payments/create-order, then flipped to paid/failed by
+    POST /api/payments/webhook when the provider confirms it.
+    """
+
+    __tablename__ = "payment_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey("membership_plans.id"), nullable=True, index=True)
+    provider = Column(Enum(PaymentProvider), nullable=False, default=PaymentProvider.razorpay)
+    provider_order_id = Column(String(100), unique=True, index=True, nullable=False)
+    amount = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default="INR")
+    status = Column(Enum(PaymentStatus), nullable=False, default=PaymentStatus.created)
+    receipt = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    paid_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    plan = relationship("MembershipPlan")
+
+
+# ==========================================================================
+# Discord Integration
+# ==========================================================================
+
+class DiscordLink(Base):
+    """Links a platform user to their Discord account (one-to-one)."""
+
+    __tablename__ = "discord_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    discord_user_id = Column(String(32), unique=True, index=True, nullable=False)
+    discord_username = Column(String(100), nullable=True)
+    linked_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+# ==========================================================================
+# Ads
+# ==========================================================================
+
+class AdImpression(Base):
+    """One recorded ad view/impression, used for basic delivery analytics."""
+
+    __tablename__ = "ad_impressions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    ad_id = Column(String(100), nullable=False, index=True)
+    placement = Column(String(50), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])

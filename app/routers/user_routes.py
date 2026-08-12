@@ -5,6 +5,7 @@ from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.services.media_service import save_upload_file
+from app.routers.content_routes import _to_post_detail
 
 router = APIRouter(tags=["users"])
 
@@ -90,21 +91,24 @@ def upload_avatar(
     return schemas.AvatarUploadResponse(message="Avatar updated", avatar_url=url)
 
 
-@router.get("/api/users/{user_id}/posts", response_model=schemas.PaginatedPostsResponse)
+@router.get("/api/users/{user_id}/posts", response_model=schemas.PaginatedPostDetailResponse)
 def get_user_posts(
     user_id: int,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
 ):
     _get_user_or_404(db, user_id)
 
     query = db.query(models.Post).filter(models.Post.user_id == user_id)
     total = query.count()
-    items = (
+    posts = (
         query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
     )
-    return schemas.PaginatedPostsResponse(total=total, limit=limit, offset=offset, items=items)
+    viewer_id = current_user.id if current_user else None
+    items = [_to_post_detail(db, p, viewer_id) for p in posts]
+    return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
 
 @router.get("/api/users/{user_id}/reels", response_model=schemas.PaginatedReelsResponse)

@@ -47,18 +47,35 @@ def comments_count(db: Session, post_id: int) -> int:
     )
 
 
+def shares_count(db: Session, content_type: models.ShareContentType, content_id: int) -> int:
+    return (
+        db.query(models.Share)
+        .filter(
+            models.Share.content_type == content_type,
+            models.Share.content_id == content_id,
+        )
+        .count()
+    )
+
+
+def is_saved_by(db: Session, user_id: int | None, post_id: int) -> bool:
+    if user_id is None:
+        return False
+
+    return (
+        db.query(models.SavedPost)
+        .filter(
+            models.SavedPost.user_id == user_id,
+            models.SavedPost.post_id == post_id,
+        )
+        .first()
+        is not None
+    )
+
+
 def replies_count(db: Session, comment_id: int) -> int:
     return (
         db.query(models.Comment)
         .filter(models.Comment.parent_id == comment_id)
-        .count()
-    )
-def shares_count(db: Session, post_id: int) -> int:
-    return (
-        db.query(models.Share)
-        .filter(
-            models.Share.content_type == models.ShareContentType.post,
-            models.Share.content_id == post_id,
-        )
         .count()
     )

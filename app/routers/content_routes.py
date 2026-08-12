@@ -6,6 +6,7 @@ thumbnail / metadata / collaborators / revenue-split" flow lives in
 video_routes.py (it operates on the same Reel rows created here, since this
 app has a single video-content type).
 """
+
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -22,62 +23,42 @@ from app.services import engagement
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 reels_router = APIRouter(prefix="/api/reels", tags=["reels"])
 
+_HASHTAG_PATTERN = re.compile(r"#(\w+)")
 
-# ---- internal helpers ----
+
 def _extract_hashtags(caption: str | None) -> list[str]:
+    """Pulls #tags out of a caption, de-duplicated, in first-seen order.
+
+    Captions are free text (there's no separate hashtags table), so this
+    is computed on read rather than stored — good enough for display, but
+    not queryable/filterable in the DB. If hashtag search/discovery is
+    ever needed, promote this into a real PostHashtag table populated on
+    post create/update instead.
+    """
     if not caption:
         return []
+    seen: dict[str, None] = {}
+    for match in _HASHTAG_PATTERN.finditer(caption):
+        tag = match.group(1)
+        seen.setdefault(tag, None)
+    return list(seen.keys())
 
-    hashtags = re.findall(r"#([A-Za-z0-9_]+)", caption)
 
-    # Remove duplicates while preserving first-seen order
-    return list(dict.fromkeys(hashtags))
+# ---- internal helpers ----
+
 def _to_post_detail(
     db: Session, post: models.Post, viewer_id: int | None
 ) -> schemas.PostDetailOut:
     detail = schemas.PostDetailOut.model_validate(post)
-
-    # Existing engagement fields
-    detail.likes_count = engagement.likes_count(
-        db, models.LikeTargetType.post, post.id
-    )
+    detail.author = schemas.UserSummaryOut.model_validate(post.user)
+    detail.likes_count = engagement.likes_count(db, models.LikeTargetType.post, post.id)
     detail.comments_count = engagement.comments_count(db, post.id)
+    detail.share_count = engagement.shares_count(db, models.ShareContentType.post, post.id)
+    detail.hashtags = _extract_hashtags(post.caption)
     detail.is_liked = engagement.is_liked_by(
         db, viewer_id, models.LikeTargetType.post, post.id
     )
-
-    # Author information for Home / Explore Feed
-    author = post.user
-    is_following = False
-
-    if viewer_id is not None and viewer_id != author.id:
-        is_following = (
-            db.query(models.Follow)
-            .filter(
-                models.Follow.follower_id == viewer_id,
-                models.Follow.following_id == author.id,
-            )
-            .first()
-            is not None
-        )
-
-    detail.author = schemas.UserSummaryOut(
-        id=author.id,
-        username=author.username,
-        full_name=author.full_name,
-        avatar_url=author.avatar_url,
-        is_following=is_following,
-    )
-
-    # Share count
-    detail.share_count = engagement.shares_count(db, post.id)
-
-    # Hashtags extracted from caption
-    detail.hashtags = _extract_hashtags(post.caption)
-
-    # Current Post model stores one media_url per post
-    detail.media_count = 1
-
+    detail.is_saved = engagement.is_saved_by(db, viewer_id, post.id)
     if post.music_url:
         detail.music = schemas.MusicOut(
             title=post.music_title,
@@ -85,27 +66,20 @@ def _to_post_detail(
             audio_url=post.music_url,
             start_seconds=post.music_start_seconds or 0,
         )
-
     if post.location_name:
         detail.location = schemas.LocationOut(
             name=post.location_name,
             latitude=post.location_latitude,
             longitude=post.location_longitude,
         )
-
     detail.tags_count = (
-        db.query(models.PostTag)
-        .filter(models.PostTag.post_id == post.id)
-        .count()
+        db.query(models.PostTag).filter(models.PostTag.post_id == post.id).count()
     )
-
     detail.members_count = (
-        db.query(models.PostMember)
-        .filter(models.PostMember.post_id == post.id)
-        .count()
+        db.query(models.PostMember).filter(models.PostMember.post_id == post.id).count()
     )
-
     return detail
+
 
 def _to_reel_detail(
     db: Session, reel: models.Reel, viewer_id: int | None

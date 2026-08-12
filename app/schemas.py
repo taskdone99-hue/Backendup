@@ -10,9 +10,13 @@ from app.models import (
     Gender,
     LikeTargetType,
     MediaType,
+    MembershipInterval,
+    MembershipStatus,
     NotificationType,
     OTPChannel,
     OTPPurpose,
+    PaymentProvider,
+    PaymentStatus,
     ShareContentType,
 )
 
@@ -508,20 +512,23 @@ class LocationOut(BaseModel):
 
 
 class PostDetailOut(PostOut):
+    author: UserSummaryOut | None = None
     likes_count: int = 0
     comments_count: int = 0
-    is_liked: bool = False
-
-    # Feed / Explore fields
-    author: UserSummaryOut | None = None
     share_count: int = 0
-    hashtags: list[str] = Field(default_factory=list)
+    hashtags: list[str] = []
+    # Number of media items attached to the post. Posts currently store a
+    # single `media_url` each (no carousel/multi-image support yet), so
+    # this is always 1 — included now so the frontend has a stable field
+    # to key off if/when carousel posts are added.
     media_count: int = 1
-
+    is_liked: bool = False
+    is_saved: bool = False
     music: MusicOut | None = None
     location: LocationOut | None = None
     tags_count: int = 0
     members_count: int = 0
+
 
 class PaginatedPostDetailResponse(BaseModel):
     total: int
@@ -1059,3 +1066,133 @@ class DeviceTokenResponse(BaseModel):
     message: str
     token: str
     platform: DevicePlatform | None
+
+# ==========================================================================
+# Membership & Payments
+# ==========================================================================
+
+class MembershipPlanOut(BaseModel):
+    id: int
+    name: str
+    description: str | None
+    price_amount: int
+    currency: str
+    interval: MembershipInterval
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class MembershipPlansResponse(BaseModel):
+    plans: list[MembershipPlanOut]
+
+
+class SubscribeRequest(BaseModel):
+    plan_id: int
+    # Optional: ties this subscription to a payment that was already
+    # confirmed paid via POST /api/payments/create-order + webhook.
+    payment_order_id: int | None = None
+
+
+class MembershipOut(BaseModel):
+    id: int
+    plan: MembershipPlanOut
+    status: MembershipStatus
+    current_period_start: datetime
+    current_period_end: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+class SubscribeResponse(BaseModel):
+    message: str
+    membership: MembershipOut
+
+
+class MembershipStatusResponse(BaseModel):
+    is_member: bool
+    membership: MembershipOut | None
+
+
+class CreateOrderRequest(BaseModel):
+    plan_id: int
+    provider: PaymentProvider = PaymentProvider.razorpay
+
+
+class CreateOrderResponse(BaseModel):
+    order_id: str
+    amount: int
+    currency: str
+    provider: PaymentProvider
+    # Public key the client SDK needs to open the provider's checkout —
+    # e.g. RAZORPAY_KEY_ID / STRIPE_PUBLISHABLE_KEY. Null when the server
+    # has no provider keys configured (dev/log mode).
+    provider_key: str | None
+    status: PaymentStatus
+
+
+class PaymentWebhookResponse(BaseModel):
+    message: str
+    order_id: str | None = None
+    status: PaymentStatus | None = None
+
+
+# ==========================================================================
+# Discord Integration
+# ==========================================================================
+
+class DiscordServerStatsOut(BaseModel):
+    guild_id: str | None
+    name: str | None
+    member_count: int | None
+    online_count: int | None
+    invite_url: str | None
+    # True when these numbers came live from Discord's widget API; false
+    # when DISCORD_GUILD_ID isn't configured or the widget is unreachable.
+    live: bool
+
+
+class DiscordLinkRequest(BaseModel):
+    discord_user_id: str = Field(..., min_length=1, max_length=32)
+    discord_username: str | None = Field(default=None, max_length=100)
+
+
+class DiscordLinkResponse(BaseModel):
+    message: str
+    discord_user_id: str
+    discord_username: str | None
+    linked_at: datetime
+
+
+class DiscordWebhookResponse(BaseModel):
+    message: str
+    event: str | None = None
+
+
+# ==========================================================================
+# Ads
+# ==========================================================================
+
+class AdImpressionRequest(BaseModel):
+    ad_id: str = Field(..., min_length=1, max_length=100)
+    placement: str | None = Field(default=None, max_length=50)
+
+
+class AdImpressionResponse(BaseModel):
+    message: str
+    ad_id: str
+    placement: str | None
+
+
+class AdSlotOut(BaseModel):
+    placement: str
+    enabled: bool
+    frequency: int  # show one ad every N feed/reel items in this placement
+
+
+class AdConfigResponse(BaseModel):
+    ad_network: str | None
+    test_mode: bool
+    slots: list[AdSlotOut]
