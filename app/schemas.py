@@ -451,6 +451,8 @@ class StoryOut(BaseModel):
     expires_at: datetime
     views_count: int = 0
     viewed_by_me: bool = False
+    reactions_count: int = 0
+    my_reaction: str | None = None
 
     class Config:
         from_attributes = True
@@ -467,6 +469,10 @@ class StoryFeedResponse(BaseModel):
     items: list[StoryUserFeedOut]
 
 
+class MyStoriesResponse(BaseModel):
+    items: list[StoryOut]
+
+
 class StoryViewerOut(BaseModel):
     id: int
     username: str
@@ -477,9 +483,56 @@ class StoryViewerOut(BaseModel):
         from_attributes = True
 
 
+class StoryViewersResponse(BaseModel):
+    views_count: int
+    items: list[StoryViewerOut]
+
+
 class StoryViewResponse(BaseModel):
     message: str
     views_count: int
+
+
+# ---- Story reactions & replies ----
+
+class StoryReactionCreate(BaseModel):
+    emoji: str = Field(..., min_length=1, max_length=16)
+
+    @field_validator("emoji")
+    @classmethod
+    def strip_emoji(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Reaction can't be empty")
+        return v
+
+
+class StoryReactorOut(BaseModel):
+    id: int
+    username: str
+    avatar_url: str | None
+    emoji: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class StoryReactionsResponse(BaseModel):
+    reactions_count: int
+    items: list[StoryReactorOut]
+
+
+class StoryReplyCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2200)
+
+    @field_validator("content")
+    @classmethod
+    def strip_content(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Reply can't be empty")
+        return v
 
 
 # ==========================================================================
@@ -972,6 +1025,7 @@ class MessageOut(BaseModel):
     conversation_id: int
     sender_id: int
     content: str
+    reply_to_story_id: int | None = None
     created_at: datetime
 
     class Config:

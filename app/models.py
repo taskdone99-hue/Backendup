@@ -466,6 +466,7 @@ class Story(Base):
 
     user = relationship("User", back_populates="stories")
     views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
+    reactions = relationship("StoryReaction", back_populates="story", cascade="all, delete-orphan")
 
 
 class StoryView(Base):
@@ -483,6 +484,27 @@ class StoryView(Base):
 
     story = relationship("Story", back_populates="views")
     viewer = relationship("User", foreign_keys=[viewer_id])
+
+
+class StoryReaction(Base):
+    """
+    A single emoji reaction from `user_id` on `story_id` — one per (story, user),
+    tapping a new emoji just replaces the previous one, same as Instagram.
+    """
+
+    __tablename__ = "story_reactions"
+    __table_args__ = (
+        UniqueConstraint("story_id", "user_id", name="uq_story_reaction"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    story_id = Column(Integer, ForeignKey("stories.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    emoji = Column(String(16), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    story = relationship("Story", back_populates="reactions")
+    user = relationship("User", foreign_keys=[user_id])
 
 
 # ==========================================================================
@@ -633,6 +655,12 @@ class Message(Base):
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     content = Column(String(2200), nullable=False)
+    # Set when this message is a "story reply" (tapping reply on someone's
+    # story sends a DM). SET NULL on delete so replying to a story that later
+    # expires/gets removed doesn't wipe out the DM history.
+    reply_to_story_id = Column(
+        Integer, ForeignKey("stories.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")
