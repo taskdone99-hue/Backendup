@@ -1,6 +1,7 @@
 import os
 import re
 
+from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 from fastapi import HTTPException
 import secrets
@@ -28,11 +29,14 @@ from app.auth import (
     OTP_RESEND_COOLDOWN_SECONDS,
     OTP_MAX_ATTEMPTS,
 )
-from app.services.sms_service import send_otp_sms
+from app.services.sms_service import (
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+    TWILIO_VERIFY_SERVICE_SID,
+    is_twilio_configured,
+    send_otp_sms,
+)
 from app.services.email_service import send_otp_email, send_password_reset_email
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_VERIFY_SERVICE_SID = os.getenv("TWILIO_VERIFY_SERVICE_SID")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -400,22 +404,23 @@ def verify_otp(
 ):
     identifier, channel = schemas.normalize_identifier(payload.identifier)
 
-    # Verify OTP through Twilio Verify
-    if channel == OTPChannel.phone:
-        client = Client(
-            TWILIO_ACCOUNT_SID,
-            TWILIO_AUTH_TOKEN,
-        )
-
-        verification_check = (
-            client.verify.v2
-            .services(TWILIO_VERIFY_SERVICE_SID)
-            .verification_checks
-            .create(
-                to=identifier,
-                code=payload.otp,
+    if channel == OTPChannel.phone and is_twilio_configured():
+        # Twilio Verify is authoritative for phone once configured — it
+        # generated and sent its own code (see sms_service.send_otp_sms),
+        # so it has to be the one that checks it too.
+        try:
+            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+            verification_check = (
+                client.verify.v2
+                .services(TWILIO_VERIFY_SERVICE_SID)
+                .verification_checks
+                .create(to=identifier, code=payload.otp)
             )
-        )
+        except TwilioRestException as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Couldn't verify the code right now — please try again shortly.",
+            ) from e
 
         if verification_check.status != "approved":
             raise HTTPException(
@@ -424,7 +429,9 @@ def verify_otp(
             )
 
     else:
-        # Keep your existing email OTP verification
+        # Email always uses this; phone falls back to it too when Twilio
+        # Verify isn't configured (local dev/demo — matches the console-log
+        # fallback in sms_service.send_otp_sms).
         _consume_otp(
             db,
             identifier,
