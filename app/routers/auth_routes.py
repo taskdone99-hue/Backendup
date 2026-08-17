@@ -1,5 +1,8 @@
 import os
 import re
+
+from twilio.rest import Client
+from fastapi import HTTPException
 import secrets
 from datetime import datetime, timezone
 
@@ -27,6 +30,9 @@ from app.auth import (
 )
 from app.services.sms_service import send_otp_sms
 from app.services.email_service import send_otp_email, send_password_reset_email
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_VERIFY_SERVICE_SID = os.getenv("TWILIO_VERIFY_SERVICE_SID")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -388,44 +394,90 @@ def request_otp(payload: schemas.RequestOTPRequest, db: Session = Depends(get_db
 
 
 @router.post("/verify-otp", response_model=schemas.TokenResponse)
-def verify_otp(payload: schemas.VerifyOTPRequest, db: Session = Depends(get_db)):
+def verify_otp(
+    payload: schemas.VerifyOTPRequest,
+    db: Session = Depends(get_db)
+):
     identifier, channel = schemas.normalize_identifier(payload.identifier)
-    _consume_otp(db, identifier, payload.purpose, payload.otp)
 
-    user = _get_user_by_identifier(db, identifier, channel)
+    # Verify OTP through Twilio Verify
+    if channel == OTPChannel.phone:
+        client = Client(
+            TWILIO_ACCOUNT_SID,
+            TWILIO_AUTH_TOKEN,
+        )
+
+        verification_check = (
+            client.verify.v2
+            .services(TWILIO_VERIFY_SERVICE_SID)
+            .verification_checks
+            .create(
+                to=identifier,
+                code=payload.otp,
+            )
+        )
+
+        if verification_check.status != "approved":
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or expired OTP"
+            )
+
+    else:
+        # Keep your existing email OTP verification
+        _consume_otp(
+            db,
+            identifier,
+            payload.purpose,
+            payload.otp
+        )
+
+    user = _get_user_by_identifier(
+        db,
+        identifier,
+        channel
+    )
+
     if user is None:
-        # Finish the /register flow: promote the pending signup (username,
-        # password, DOB) into a real account now that the code is confirmed.
         pending = (
             db.query(models.PendingSignup)
-            .filter(models.PendingSignup.identifier == identifier)
+            .filter(
+                models.PendingSignup.identifier == identifier
+            )
             .first()
         )
+
         if pending is not None:
             username = pending.username
-            # Someone else may have grabbed the username while this pending
-            # signup sat unverified — fall back to a unique variant rather
-            # than fail the signup outright.
+
             if _username_taken(db, username):
-                username = _generate_placeholder_username(db, username)
+                username = _generate_placeholder_username(
+                    db,
+                    username
+                )
+
             user = models.User(
                 username=username,
                 hashed_password=pending.hashed_password,
                 date_of_birth=pending.date_of_birth,
                 gender=pending.gender,
             )
+
             db.delete(pending)
+
         else:
-            # No /register step preceded this — the original phone/email-only
-            # OTP flow (no username chosen yet). Assign a placeholder the
-            # user can change later via a profile-update endpoint (not
-            # covered by this API yet).
-            user = models.User(username=_generate_placeholder_username(db, identifier))
+            user = models.User(
+                username=_generate_placeholder_username(
+                    db,
+                    identifier
+                )
+            )
 
         if channel == OTPChannel.email:
             user.email = identifier
         else:
             user.phone_number = identifier
+
         db.add(user)
         db.commit()
         db.refresh(user)
@@ -434,6 +486,7 @@ def verify_otp(payload: schemas.VerifyOTPRequest, db: Session = Depends(get_db))
         user.is_email_verified = True
     else:
         user.is_phone_verified = True
+
     db.commit()
     db.refresh(user)
 
