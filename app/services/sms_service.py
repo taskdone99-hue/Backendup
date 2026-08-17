@@ -9,36 +9,35 @@ To use a different provider (MSG91, AWS SNS, Fast2SMS, etc.), just swap the
 body of `send_otp_sms` for that provider's send call — the rest of the app
 doesn't need to change.
 """
-
-import logging
 import os
+import logging
+from twilio.rest import Client
 
-logger = logging.getLogger("sms_service")
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+TWILIO_VERIFY_SERVICE_SID = os.getenv("TWILIO_VERIFY_SERVICE_SID")
 
 
 def send_otp_sms(phone_number: str, otp: str) -> None:
-    message = f"Your verification code is {otp}. It expires in a few minutes."
+    client = Client(
+        TWILIO_ACCOUNT_SID,
+        TWILIO_AUTH_TOKEN,
+    )
 
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER:
-        _send_via_twilio(phone_number, message)
-    else:
-        # Console/log backend — good enough for local dev and demos.
-        logger.info("[SMS to %s] %s", phone_number, message)
+    verification = (
+        client.verify.v2
+        .services(TWILIO_VERIFY_SERVICE_SID)
+        .verifications
+        .create(
+            channel="sms",
+            to=phone_number,
+        )
+    )
 
-
-def _send_via_twilio(phone_number: str, message: str) -> None:
-    # Uncomment after `pip install twilio` and setting the TWILIO_* env vars.
-    #
-    from twilio.rest import Client
-    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    client.messages.create(
-    body="message",
-    from_=TWILIO_FROM_NUMBER,
-    to=phone_number,
-)
-    logger.info("[Twilio SMS to %s] %s", phone_number, message)
+    logger.info(
+        "Twilio Verify SMS sent to %s, status=%s",
+        phone_number,
+        verification.status,
+    )
