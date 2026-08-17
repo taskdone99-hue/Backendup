@@ -37,7 +37,7 @@ def _send_via_twilio(phone_number: str, message: str) -> None:
     from twilio.rest import Client
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     client.messages.create(
-    body="sms_2fa",
+    body="message",
     from_=TWILIO_FROM_NUMBER,
     to=phone_number,
 )
