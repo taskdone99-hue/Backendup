@@ -6,4 +6,4 @@ venv/
 app/static/avatars/*
 app/static/posts/*
 app/static/reels/*
-app/static/thumbnails/*
+app/static/thumbnails/*.env
