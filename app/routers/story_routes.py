@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user
-from app.routers.user_routes import _is_following
 from app.services.media_service import delete_media_file, save_upload_file
 from app.services.push_service import send_push
 
@@ -139,9 +138,9 @@ def get_story_feed(
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Active (non-expired) stories from users the current user follows, plus
-    their own, grouped by author — newest author activity first, matching
-    the usual "stories tray" ordering.
+    Active (non-expired) stories from users the current user follows —
+    NOT their own (use GET /api/stories/mine for that) — grouped by author,
+    newest author activity first, matching the usual "stories tray" ordering.
     """
     following_ids = [
         row[0]
@@ -149,11 +148,13 @@ def get_story_feed(
         .filter(models.Follow.follower_id == current_user.id)
         .all()
     ]
-    author_ids = set(following_ids) | {current_user.id}
+
+    if not following_ids:
+        return schemas.StoryFeedResponse(items=[])
 
     stories = (
         _active_story_query(db)
-        .filter(models.Story.user_id.in_(author_ids))
+        .filter(models.Story.user_id.in_(following_ids))
         .order_by(models.Story.created_at.desc())
         .all()
     )
@@ -169,12 +170,9 @@ def get_story_feed(
         has_unseen = any(not s.viewed_by_me for s in story_outs)
 
         user_summary = schemas.UserSummaryOut.model_validate(user)
-        # is_following is never a real column on User — it has to be computed
-        # per viewer. False for the logged-in user's own story is correct;
-        # for anyone else in the tray it should reflect the actual follow.
-        user_summary.is_following = (
-            False if uid == current_user.id else _is_following(db, current_user.id, uid)
-        )
+        # Every author left in this feed is, by construction, someone the
+        # current user follows.
+        user_summary.is_following = True
 
         items.append(
             schemas.StoryUserFeedOut(
