@@ -17,6 +17,7 @@ from app.models import (
     OTPPurpose,
     PaymentProvider,
     PaymentStatus,
+    SavedItemType,
     ShareContentType,
 )
 
@@ -541,13 +542,43 @@ class StoryReplyCreate(BaseModel):
 
 # ---- Posts ----
 
-class PostUpdate(BaseModel):
-    """PUT /api/posts/:id — only the caption can be changed after creation."""
-    caption: str | None = Field(default=None, max_length=2200)
+class MusicIn(BaseModel):
+    title: str = Field(..., max_length=150)
+    artist: str | None = Field(default=None, max_length=150)
+    audio_url: str = Field(..., max_length=500)
+    start_seconds: int = Field(default=0, ge=0)
 
-    @field_validator("caption")
+
+class LocationIn(BaseModel):
+    name: str = Field(..., max_length=150)
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+class PostUpdate(BaseModel):
+    """
+    PUT /api/posts/:id. Every field is optional and only touched if present
+    in the request — omit a field to leave it unchanged, send it as `null`
+    to clear it (e.g. `"music": null` removes the post's music).
+
+    Swapping the actual image/video file is a separate call — see
+    PUT /api/posts/:id/media — since that needs a multipart upload rather
+    than JSON.
+    """
+    caption: str | None = Field(default=None, max_length=2200)
+    music: MusicIn | None = None
+    location: LocationIn | None = None
+    alt_text: str | None = Field(default=None, max_length=1000)
+    ai_generated: bool | None = None
+    # Full replacement lists — send the complete set of user ids you want
+    # tagged/added; anyone already tagged/added but missing from the list
+    # gets removed. Omit the field entirely to leave tags/members untouched.
+    tag_user_ids: list[int] | None = None
+    member_user_ids: list[int] | None = None
+
+    @field_validator("caption", "alt_text")
     @classmethod
-    def strip_caption(cls, v: str | None) -> str | None:
+    def strip_text(cls, v: str | None) -> str | None:
         return v.strip() if v is not None else v
 
 
@@ -579,8 +610,12 @@ class PostDetailOut(PostOut):
     is_saved: bool = False
     music: MusicOut | None = None
     location: LocationOut | None = None
+    alt_text: str | None = None
+    ai_generated: bool = False
     tags_count: int = 0
     members_count: int = 0
+    tags: list[UserSummaryOut] = []
+    members: list[UserSummaryOut] = []
 
 
 class PaginatedPostDetailResponse(BaseModel):
@@ -686,6 +721,7 @@ class ReelDetailOut(ReelOut):
     remixed_from_id: int | None = None
     likes_count: int = 0
     is_liked: bool = False
+    is_saved: bool = False
 
 
 class PaginatedReelDetailResponse(BaseModel):
@@ -912,6 +948,93 @@ class HighlightsListResponse(BaseModel):
 
 class SavePostRequest(BaseModel):
     post_id: int = Field(..., gt=0)
+
+
+# ---- Saved (generalized: posts / reels / audio / series / collections) ----
+
+class AudioOut(BaseModel):
+    id: int
+    title: str
+    artist: str | None
+    audio_url: str
+
+    class Config:
+        from_attributes = True
+
+
+class SeriesOut(BaseModel):
+    id: int
+    user_id: int
+    title: str
+    cover_url: str | None
+    reels_count: int = 0
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SeriesCreate(BaseModel):
+    title: str = Field(..., max_length=150)
+    cover_url: str | None = None
+    reel_ids: list[int] = Field(default_factory=list)
+
+
+class SavedItemOut(BaseModel):
+    """One row in the Saved tab — exactly one of post/reel/audio/series is
+    set, matching `type`."""
+    type: SavedItemType
+    saved_at: datetime
+    post: PostDetailOut | None = None
+    reel: ReelDetailOut | None = None
+    audio: AudioOut | None = None
+    series: SeriesOut | None = None
+
+
+class PaginatedSavedResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[SavedItemOut]
+
+
+class SaveItemRequest(BaseModel):
+    target_type: SavedItemType
+    target_id: int = Field(..., gt=0)
+
+
+class SavedCollectionOut(BaseModel):
+    id: int
+    user_id: int
+    name: str
+    cover_url: str | None
+    items_count: int = 0
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SavedCollectionCreate(BaseModel):
+    name: str = Field(..., max_length=100)
+    cover_url: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Collection name can't be empty")
+        return v
+
+
+class SavedCollectionsResponse(BaseModel):
+    items: list[SavedCollectionOut]
+
+
+class AddToCollectionRequest(BaseModel):
+    target_type: SavedItemType
+    target_id: int = Field(..., gt=0)
 
 
 # ==========================================================================

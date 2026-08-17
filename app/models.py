@@ -53,6 +53,15 @@ class ShareContentType(str, enum.Enum):
     reel = "reel"
 
 
+class SavedItemType(str, enum.Enum):
+    """What a bookmark points at — powers the Saved tab's category filter
+    (All / Posts / Reels / Audio / Series)."""
+    post = "post"
+    reel = "reel"
+    audio = "audio"
+    series = "series"
+
+
 class NotificationType(str, enum.Enum):
     like = "like"
     comment = "comment"
@@ -229,10 +238,16 @@ class Post(Base):
     location_latitude = Column(Float, nullable=True)
     location_longitude = Column(Float, nullable=True)
 
+    # Accessibility text read out by screen readers — Instagram's "Alt text".
+    alt_text = Column(String(1000), nullable=True)
+    # "AI info" disclosure label — whether the post's media was created or
+    # edited with AI (Instagram's "AI-generated content" toggle).
+    ai_generated = Column(Boolean, default=False, nullable=False)
+
     user = relationship("User", back_populates="posts")
     saves = relationship("SavedPost", back_populates="post", cascade="all, delete-orphan")
-    tags = relationship("PostTag", back_populates="post", cascade="all, delete-orphan")
-    members = relationship("PostMember", back_populates="post", cascade="all, delete-orphan")
+    tag_rows = relationship("PostTag", back_populates="post", cascade="all, delete-orphan")
+    member_rows = relationship("PostMember", back_populates="post", cascade="all, delete-orphan")
 
 
 class PostTag(Base):
@@ -252,7 +267,7 @@ class PostTag(Base):
     y_position = Column(Float, nullable=True)
     tagged_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    post = relationship("Post", back_populates="tags")
+    post = relationship("Post", back_populates="tag_rows")
     user = relationship("User", foreign_keys=[user_id])
 
 
@@ -271,7 +286,7 @@ class PostMember(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     added_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    post = relationship("Post", back_populates="members")
+    post = relationship("Post", back_populates="member_rows")
     user = relationship("User", foreign_keys=[user_id])
 
 
@@ -383,7 +398,12 @@ class WatchSession(Base):
 
 
 class SavedPost(Base):
-    """A user bookmarking a post — powers GET /api/users/:id/saved."""
+    """
+    Legacy post-only bookmark table. Superseded by SavedItem below, which
+    covers posts/reels/audio/series in one place — kept only so
+    old rows aren't lost; see add_saved_items_tables.py for the one-time
+    copy into saved_items. Nothing writes new rows here anymore.
+    """
 
     __tablename__ = "saved_posts"
     __table_args__ = (
@@ -397,6 +417,133 @@ class SavedPost(Base):
 
     user = relationship("User", foreign_keys=[user_id])
     post = relationship("Post", back_populates="saves")
+
+
+class Series(Base):
+    """
+    A creator-authored ordered set of reels ("episodes") — e.g. a recipe
+    series or a multi-part story — separate from bookmarking. Users can
+    then save the whole series via SavedItem(target_type=series).
+
+    ASSUMPTION: "Series" wasn't an existing concept anywhere in this
+    codebase, so this is a best guess at what it means (a reel playlist
+    authored by its creator). Flag if the product intent is different.
+    """
+
+    __tablename__ = "series"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String(150), nullable=False)
+    cover_url = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    reels = relationship(
+        "SeriesReel", back_populates="series", cascade="all, delete-orphan",
+        order_by="SeriesReel.position",
+    )
+
+
+class SeriesReel(Base):
+    """One reel's position within a Series (its "episode" order)."""
+
+    __tablename__ = "series_reels"
+    __table_args__ = (
+        UniqueConstraint("series_id", "reel_id", name="uq_series_reel"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    series_id = Column(Integer, ForeignKey("series.id"), nullable=False, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id"), nullable=False, index=True)
+    position = Column(Integer, nullable=False, default=0)
+
+    series = relationship("Series", back_populates="reels")
+    reel = relationship("Reel", foreign_keys=[reel_id])
+
+
+class Audio(Base):
+    """
+    A saveable "sound" — title/artist/audio_url, optionally traced back to
+    the post or reel it was first used on. Posts/reels don't reference this
+    table for their own playback (they keep their own music_* columns /
+    audio, same as today) — this table only exists so a sound can be
+    bookmarked and reused independently of the post it came from, same as
+    Instagram's "Save Audio".
+
+    ASSUMPTION: there was no Audio/Sound entity anywhere in this codebase
+    before now — flag if "Audio" in the Saved tab was meant to mean
+    something else.
+    """
+
+    __tablename__ = "audio_tracks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(150), nullable=False)
+    artist = Column(String(150), nullable=True)
+    audio_url = Column(String(500), nullable=False, unique=True)
+    source_post_id = Column(Integer, ForeignKey("posts.id"), nullable=True)
+    source_reel_id = Column(Integer, ForeignKey("reels.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SavedCollection(Base):
+    """A user-created named folder for organizing saved items (Instagram
+    'Collections'). A saved item can live in any number of collections."""
+
+    __tablename__ = "saved_collections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    cover_url = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    items = relationship(
+        "SavedCollectionItem", back_populates="collection", cascade="all, delete-orphan"
+    )
+
+
+class SavedItem(Base):
+    """
+    Unified bookmark row covering posts, reels, audio, and series in one
+    table via target_type/target_id — same discriminator pattern as
+    LikeTargetType/ShareContentType above. Replaces SavedPost.
+    """
+
+    __tablename__ = "saved_items"
+    __table_args__ = (
+        UniqueConstraint("user_id", "target_type", "target_id", name="uq_saved_item"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    target_type = Column(Enum(SavedItemType), nullable=False)
+    target_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    collections = relationship(
+        "SavedCollectionItem", back_populates="saved_item", cascade="all, delete-orphan"
+    )
+
+
+class SavedCollectionItem(Base):
+    """One saved item's membership in one collection folder."""
+
+    __tablename__ = "saved_collection_items"
+    __table_args__ = (
+        UniqueConstraint("collection_id", "saved_item_id", name="uq_saved_collection_item"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    collection_id = Column(Integer, ForeignKey("saved_collections.id"), nullable=False, index=True)
+    saved_item_id = Column(Integer, ForeignKey("saved_items.id"), nullable=False, index=True)
+    added_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    collection = relationship("SavedCollection", back_populates="items")
+    saved_item = relationship("SavedItem", back_populates="collections")
 
 
 class Comment(Base):

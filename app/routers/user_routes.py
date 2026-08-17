@@ -128,9 +128,14 @@ def get_user_reels(
     return schemas.PaginatedReelsResponse(total=total, limit=limit, offset=offset, items=items)
 
 
-@router.get("/api/users/{user_id}/saved", response_model=schemas.PaginatedPostsResponse)
+@router.get("/api/users/{user_id}/saved", response_model=schemas.PaginatedSavedResponse)
 def get_saved_posts(
     user_id: int,
+    category: str = Query(
+        "all",
+        pattern="^(all|posts|reels|audio|series)$",
+        description="all | posts | reels | audio | series",
+    ),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -143,16 +148,13 @@ def get_saved_posts(
             detail="You can only view your own saved posts",
         )
 
-    query = (
-        db.query(models.Post)
-        .join(models.SavedPost, models.SavedPost.post_id == models.Post.id)
-        .filter(models.SavedPost.user_id == user_id)
+    # Same underlying data/logic as GET /api/saved — kept here too since
+    # this is the pre-existing spec'd path.
+    from app.routers.saved_routes import get_saved_items
+
+    return get_saved_items(
+        category=category, limit=limit, offset=offset, db=db, current_user=current_user
     )
-    total = query.count()
-    items = (
-        query.order_by(models.SavedPost.created_at.desc()).offset(offset).limit(limit).all()
-    )
-    return schemas.PaginatedPostsResponse(total=total, limit=limit, offset=offset, items=items)
 
 
 @router.get("/api/users/{user_id}/stats", response_model=schemas.UserStatsOut)

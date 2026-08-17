@@ -58,7 +58,9 @@ def _to_post_detail(
     detail.is_liked = engagement.is_liked_by(
         db, viewer_id, models.LikeTargetType.post, post.id
     )
-    detail.is_saved = engagement.is_saved_by(db, viewer_id, post.id)
+    detail.is_saved = engagement.is_saved_by(
+        db, viewer_id, post.id, models.SavedItemType.post
+    )
     if post.music_url:
         detail.music = schemas.MusicOut(
             title=post.music_title,
@@ -78,7 +80,63 @@ def _to_post_detail(
     detail.members_count = (
         db.query(models.PostMember).filter(models.PostMember.post_id == post.id).count()
     )
+    detail.tags = [
+        schemas.UserSummaryOut.model_validate(t.user)
+        for t in db.query(models.PostTag).filter(models.PostTag.post_id == post.id).all()
+    ]
+    detail.members = [
+        schemas.UserSummaryOut.model_validate(m.user)
+        for m in db.query(models.PostMember).filter(models.PostMember.post_id == post.id).all()
+    ]
     return detail
+
+
+def _replace_post_tags(db: Session, post: models.Post, user_ids: list[int]) -> None:
+    """Full replace: tags the given users, untags anyone left off the list."""
+    user_ids = list(dict.fromkeys(user_ids))  # de-dupe, keep order
+    if user_ids:
+        found = db.query(models.User.id).filter(models.User.id.in_(user_ids)).all()
+        found_ids = {row[0] for row in found}
+        missing = set(user_ids) - found_ids
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User id(s) not found: {sorted(missing)}",
+            )
+
+    existing = {
+        t.user_id: t
+        for t in db.query(models.PostTag).filter(models.PostTag.post_id == post.id).all()
+    }
+    for uid in set(existing) - set(user_ids):
+        db.delete(existing[uid])
+    for uid in user_ids:
+        if uid not in existing:
+            db.add(models.PostTag(post_id=post.id, user_id=uid))
+
+
+def _replace_post_members(db: Session, post: models.Post, user_ids: list[int]) -> None:
+    """Full replace of the post's collaborators/members list."""
+    user_ids = list(dict.fromkeys(user_ids))
+    if user_ids:
+        found = db.query(models.User.id).filter(models.User.id.in_(user_ids)).all()
+        found_ids = {row[0] for row in found}
+        missing = set(user_ids) - found_ids
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User id(s) not found: {sorted(missing)}",
+            )
+
+    existing = {
+        m.user_id: m
+        for m in db.query(models.PostMember).filter(models.PostMember.post_id == post.id).all()
+    }
+    for uid in set(existing) - set(user_ids):
+        db.delete(existing[uid])
+    for uid in user_ids:
+        if uid not in existing:
+            db.add(models.PostMember(post_id=post.id, user_id=uid))
 
 
 def _to_reel_detail(
@@ -88,6 +146,9 @@ def _to_reel_detail(
     detail.likes_count = engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
     detail.is_liked = engagement.is_liked_by(
         db, viewer_id, models.LikeTargetType.reel, reel.id
+    )
+    detail.is_saved = engagement.is_saved_by(
+        db, viewer_id, reel.id, models.SavedItemType.reel
     )
     return detail
 
@@ -202,11 +263,73 @@ def update_post(
         )
 
     updates = payload.model_dump(exclude_unset=True)
-    for field, value in updates.items():
-        setattr(post, field, value)
+
+    if "caption" in updates:
+        post.caption = updates["caption"]
+
+    if "alt_text" in updates:
+        post.alt_text = updates["alt_text"]
+
+    if "ai_generated" in updates and updates["ai_generated"] is not None:
+        post.ai_generated = updates["ai_generated"]
+
+    if "music" in updates:
+        music = updates["music"]
+        if music is None:
+            post.music_title = None
+            post.music_artist = None
+            post.music_url = None
+            post.music_start_seconds = None
+        else:
+            post.music_title = music["title"]
+            post.music_artist = music.get("artist")
+            post.music_url = music["audio_url"]
+            post.music_start_seconds = music.get("start_seconds", 0)
+
+    if "location" in updates:
+        location = updates["location"]
+        if location is None:
+            post.location_name = None
+            post.location_latitude = None
+            post.location_longitude = None
+        else:
+            post.location_name = location["name"]
+            post.location_latitude = location.get("latitude")
+            post.location_longitude = location.get("longitude")
+
+    if updates.get("tag_user_ids") is not None:
+        _replace_post_tags(db, post, updates["tag_user_ids"])
+
+    if updates.get("member_user_ids") is not None:
+        _replace_post_members(db, post, updates["member_user_ids"])
 
     db.commit()
     db.refresh(post)
+    return _to_post_detail(db, post, current_user.id)
+
+
+@router.put("/{post_id}/media", response_model=schemas.PostDetailOut)
+def update_post_media(
+    post_id: int,
+    file: UploadFile,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Replace a post's image/video. Separate from PUT /:id because this
+    needs multipart, not JSON."""
+    post = _get_post_or_404(db, post_id)
+    if post.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only update your own posts"
+        )
+
+    old_url = post.media_url
+    url, kind = save_upload_file(file, "posts", allow_video=True)
+    post.media_url = url
+    post.media_type = models.MediaType.video if kind == "video" else models.MediaType.image
+    db.commit()
+    db.refresh(post)
+    delete_media_file(old_url)
     return _to_post_detail(db, post, current_user.id)
 
 
@@ -251,6 +374,42 @@ def delete_post(
     return schemas.MessageResponse(message="Post deleted")
 
 
+def _save_target(
+    db: Session, user_id: int, target_type: models.SavedItemType, target_id: int
+) -> None:
+    existing = (
+        db.query(models.SavedItem)
+        .filter(
+            models.SavedItem.user_id == user_id,
+            models.SavedItem.target_type == target_type,
+            models.SavedItem.target_id == target_id,
+        )
+        .first()
+    )
+    if existing is None:
+        db.add(
+            models.SavedItem(user_id=user_id, target_type=target_type, target_id=target_id)
+        )
+        db.commit()
+
+
+def _unsave_target(
+    db: Session, user_id: int, target_type: models.SavedItemType, target_id: int
+) -> None:
+    existing = (
+        db.query(models.SavedItem)
+        .filter(
+            models.SavedItem.user_id == user_id,
+            models.SavedItem.target_type == target_type,
+            models.SavedItem.target_id == target_id,
+        )
+        .first()
+    )
+    if existing is not None:
+        db.delete(existing)
+        db.commit()
+
+
 @router.post("/{post_id}/save", response_model=schemas.MessageResponse)
 def save_post(
     post_id: int,
@@ -258,16 +417,7 @@ def save_post(
     current_user: models.User = Depends(get_current_user),
 ):
     _get_post_or_404(db, post_id)
-
-    existing = (
-        db.query(models.SavedPost)
-        .filter(models.SavedPost.user_id == current_user.id, models.SavedPost.post_id == post_id)
-        .first()
-    )
-    if existing is None:
-        db.add(models.SavedPost(user_id=current_user.id, post_id=post_id))
-        db.commit()
-
+    _save_target(db, current_user.id, models.SavedItemType.post, post_id)
     return schemas.MessageResponse(message="Post saved")
 
 
@@ -277,15 +427,7 @@ def unsave_post(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    existing = (
-        db.query(models.SavedPost)
-        .filter(models.SavedPost.user_id == current_user.id, models.SavedPost.post_id == post_id)
-        .first()
-    )
-    if existing is not None:
-        db.delete(existing)
-        db.commit()
-
+    _unsave_target(db, current_user.id, models.SavedItemType.post, post_id)
     return schemas.MessageResponse(message="Post unsaved")
 
 
@@ -463,3 +605,24 @@ def remix_reel_audio(
     db.commit()
     db.refresh(remix)
     return _to_reel_detail(db, remix, current_user.id)
+
+
+@reels_router.post("/{reel_id}/save", response_model=schemas.MessageResponse)
+def save_reel(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_reel_or_404(db, reel_id)
+    _save_target(db, current_user.id, models.SavedItemType.reel, reel_id)
+    return schemas.MessageResponse(message="Reel saved")
+
+
+@reels_router.delete("/{reel_id}/save", response_model=schemas.MessageResponse)
+def unsave_reel(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _unsave_target(db, current_user.id, models.SavedItemType.reel, reel_id)
+    return schemas.MessageResponse(message="Reel unsaved")

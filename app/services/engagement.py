@@ -58,15 +58,23 @@ def shares_count(db: Session, content_type: models.ShareContentType, content_id:
     )
 
 
-def is_saved_by(db: Session, user_id: int | None, post_id: int) -> bool:
+def is_saved_by(
+    db: Session,
+    user_id: int | None,
+    target_id: int,
+    target_type: "models.SavedItemType" = None,
+) -> bool:
     if user_id is None:
         return False
+    if target_type is None:
+        target_type = models.SavedItemType.post
 
     return (
-        db.query(models.SavedPost)
+        db.query(models.SavedItem)
         .filter(
-            models.SavedPost.user_id == user_id,
-            models.SavedPost.post_id == post_id,
+            models.SavedItem.user_id == user_id,
+            models.SavedItem.target_type == target_type,
+            models.SavedItem.target_id == target_id,
         )
         .first()
         is not None
