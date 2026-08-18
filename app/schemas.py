@@ -292,10 +292,18 @@ class UserProfileOut(BaseModel):
 
 class UserProfileUpdate(BaseModel):
     """PUT /api/users/:id — every field optional so callers can patch just what changed."""
+    username: str | None = Field(
+        default=None, description="Unique username, 3-30 characters (letters, numbers, '.', '_')"
+    )
     full_name: str | None = Field(default=None, max_length=100)
     bio: str | None = Field(default=None, max_length=150)
     gender: Gender | None = None
     is_private: bool | None = None
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str | None) -> str | None:
+        return _validate_username_format(v) if v is not None else v
 
     @field_validator("full_name")
     @classmethod

@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
-from app.services.media_service import save_upload_file
+from app.services.media_service import delete_media_file, save_upload_file
 from app.routers.content_routes import _to_post_detail
 
 router = APIRouter(tags=["users"])
@@ -62,6 +62,19 @@ def update_user_profile(
         )
 
     updates = payload.model_dump(exclude_unset=True)
+
+    if "username" in updates and updates["username"] != current_user.username:
+        taken = (
+            db.query(models.User)
+            .filter(models.User.username == updates["username"], models.User.id != current_user.id)
+            .first()
+            is not None
+        )
+        if taken:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="Username is already taken"
+            )
+
     for field, value in updates.items():
         setattr(current_user, field, value)
 
@@ -83,12 +96,37 @@ def upload_avatar(
             detail="You can only update your own avatar",
         )
 
+    old_url = current_user.avatar_url
     url, _kind = save_upload_file(file, "avatars", allow_video=False)
 
     current_user.avatar_url = url
     db.commit()
+    if old_url:
+        delete_media_file(old_url)
 
     return schemas.AvatarUploadResponse(message="Avatar updated", avatar_url=url)
+
+
+@router.delete("/api/users/{user_id}/avatar", response_model=schemas.MessageResponse)
+def delete_avatar(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Removes the avatar, reverting to no profile photo (Instagram's 'Remove Current Photo')."""
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only update your own avatar",
+        )
+
+    old_url = current_user.avatar_url
+    current_user.avatar_url = None
+    db.commit()
+    if old_url:
+        delete_media_file(old_url)
+
+    return schemas.MessageResponse(message="Avatar removed")
 
 
 @router.get("/api/users/{user_id}/posts", response_model=schemas.PaginatedPostDetailResponse)
