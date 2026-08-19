@@ -55,9 +55,10 @@ def _to_post_detail(
     detail.comments_count = engagement.comments_count(db, post.id)
     detail.share_count = engagement.shares_count(db, models.ShareContentType.post, post.id)
     detail.hashtags = _extract_hashtags(post.caption)
-    detail.is_liked = engagement.is_liked_by(
+    detail.like_id = engagement.get_like_id(
         db, viewer_id, models.LikeTargetType.post, post.id
     )
+    detail.is_liked = detail.like_id is not None
     detail.is_saved = engagement.is_saved_by(
         db, viewer_id, post.id, models.SavedItemType.post
     )
@@ -144,9 +145,8 @@ def _to_reel_detail(
 ) -> schemas.ReelDetailOut:
     detail = schemas.ReelDetailOut.model_validate(reel)
     detail.likes_count = engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
-    detail.is_liked = engagement.is_liked_by(
-        db, viewer_id, models.LikeTargetType.reel, reel.id
-    )
+    detail.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.reel, reel.id)
+    detail.is_liked = detail.like_id is not None
     detail.is_saved = engagement.is_saved_by(
         db, viewer_id, reel.id, models.SavedItemType.reel
     )
@@ -456,6 +456,27 @@ def create_reel(
 
 # NOTE: /feed and /trending must stay registered before /{reel_id} for the
 # same route-ordering reason as posts above.
+
+@reels_router.get("/home", response_model=schemas.PaginatedReelDetailResponse)
+def get_reels_home_feed(
+    limit: int = Query(10, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Reels from people the current user follows, plus their own — the
+    reel-equivalent of GET /api/posts/feed, for surfacing a user's reel on
+    the Home page. GET /api/reels/feed (below) stays as the global,
+    Explore-style reel feed — this is the follows-scoped one.
+    """
+    author_ids = _following_ids(db, current_user.id) + [current_user.id]
+    query = db.query(models.Reel).filter(models.Reel.user_id.in_(author_ids))
+    total = query.count()
+    reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
+    items = [_to_reel_detail(db, r, current_user.id) for r in reels]
+    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
+
 
 @reels_router.get("/feed", response_model=schemas.PaginatedReelDetailResponse)
 def get_reels_feed(

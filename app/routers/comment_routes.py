@@ -4,6 +4,7 @@ can all be liked through the same /api/likes endpoints — see models.Like).
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models, schemas
@@ -36,9 +37,8 @@ def _to_comment_out(
     out = schemas.CommentOut.model_validate(comment)
     out.likes_count = engagement.likes_count(db, models.LikeTargetType.comment, comment.id)
     out.replies_count = engagement.replies_count(db, comment.id)
-    out.is_liked = engagement.is_liked_by(
-        db, viewer_id, models.LikeTargetType.comment, comment.id
-    )
+    out.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.comment, comment.id)
+    out.is_liked = out.like_id is not None
     return out
 
 
@@ -236,8 +236,26 @@ def like_target(
             target_id=payload.target_id,
         )
         db.add(existing)
-        db.commit()
-        db.refresh(existing)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two near-simultaneous taps (e.g. a rapid double-tap-to-like)
+            # both passed the check above and both tried to insert — the
+            # unique constraint on (user_id, target_type, target_id) caught
+            # the second one. Not an error from the client's point of view;
+            # fall through to the row the other request just created.
+            db.rollback()
+            existing = (
+                db.query(models.Like)
+                .filter(
+                    models.Like.user_id == current_user.id,
+                    models.Like.target_type == payload.target_type,
+                    models.Like.target_id == payload.target_id,
+                )
+                .first()
+            )
+        else:
+            db.refresh(existing)
 
     count = engagement.likes_count(db, payload.target_type, payload.target_id)
     return schemas.LikeActionResponse(message="Liked", like=existing, likes_count=count)
@@ -260,6 +278,36 @@ def unlike(
 
     db.delete(like)
     db.commit()
+    return schemas.MessageResponse(message="Unliked")
+
+
+@router.delete("/api/likes", response_model=schemas.MessageResponse)
+def unlike_target(
+    target_type: models.LikeTargetType = Query(...),
+    target_id: int = Query(..., gt=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Unlike by (target_type, target_id) instead of like_id — a post/reel/
+    comment's `is_liked: true` doesn't come with its like_id attached, so a
+    client showing a filled-in heart on a feed item had no id to call
+    DELETE /api/likes/{like_id} with. This is the endpoint for that case;
+    /api/likes/{like_id} is kept for callers that do have the id.
+    """
+    like = (
+        db.query(models.Like)
+        .filter(
+            models.Like.user_id == current_user.id,
+            models.Like.target_type == target_type,
+            models.Like.target_id == target_id,
+        )
+        .first()
+    )
+    if like is not None:
+        db.delete(like)
+        db.commit()
+
     return schemas.MessageResponse(message="Unliked")
 
 

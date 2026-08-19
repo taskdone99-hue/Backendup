@@ -9,11 +9,15 @@ S3 `put_object` call and return the resulting object URL/CDN URL instead —
 callers only care about getting a URL back, so nothing else needs to change.
 """
 
+import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile, status
+
+logger = logging.getLogger("media_service")
 
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
 
@@ -68,6 +72,7 @@ def save_upload_file(
     target_path = target_dir / filename
 
     size = 0
+    write_started = time.perf_counter()
     with open(target_path, "wb") as out:
         while chunk := file.file.read(1024 * 1024):
             size += len(chunk)
@@ -79,10 +84,25 @@ def save_upload_file(
                     detail=f"File too large — max {max_bytes // (1024 * 1024)}MB",
                 )
             out.write(chunk)
+    write_seconds = time.perf_counter() - write_started
 
     if size == 0:
         target_path.unlink(missing_ok=True)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file")
+
+    # By the time we get here, the ASGI server has already fully received
+    # the upload from the client (FastAPI parses the whole multipart body
+    # into `file` before this function is ever called) — so write_seconds
+    # below is purely local disk I/O, not client upload time. If a slow
+    # upload keeps showing up in reports, compare this number against the
+    # client-observed request duration: a big gap between them points at
+    # network transfer (client<->server) or reverse-proxy buffering, not
+    # anything happening in this function.
+    if size > 20 * 1024 * 1024 or write_seconds > 2:
+        logger.info(
+            "save_upload_file: %s (%.1f MB) written to disk in %.2fs (%s)",
+            filename, size / (1024 * 1024), write_seconds, subfolder,
+        )
 
     return _public_url(f"{subfolder}/{filename}"), kind
 

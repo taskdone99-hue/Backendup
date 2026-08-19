@@ -442,6 +442,12 @@ class PaginatedWatchHistoryResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    # All-time totals across every valid session (not just this page) —
+    # same numbers as GET /api/watch/stats -> total, included here too so a
+    # profile screen can get the paginated list and the all-time total in
+    # one call instead of two.
+    total_watch_seconds: int = 0
+    total_reels_watched: int = 0
     items: list[WatchHistoryItem]
 
 
@@ -624,6 +630,7 @@ class PostDetailOut(PostOut):
     # to key off if/when carousel posts are added.
     media_count: int = 1
     is_liked: bool = False
+    like_id: int | None = None
     is_saved: bool = False
     music: MusicOut | None = None
     location: LocationOut | None = None
@@ -738,6 +745,7 @@ class ReelDetailOut(ReelOut):
     remixed_from_id: int | None = None
     likes_count: int = 0
     is_liked: bool = False
+    like_id: int | None = None
     is_saved: bool = False
 
 
@@ -845,6 +853,7 @@ class CommentOut(BaseModel):
     likes_count: int = 0
     replies_count: int = 0
     is_liked: bool = False
+    like_id: int | None = None
 
     class Config:
         from_attributes = True

@@ -173,7 +173,15 @@ def get_watch_history(
         )
         for row in rows
     ]
-    return schemas.PaginatedWatchHistoryResponse(total=total, limit=limit, offset=offset, items=items)
+    all_time = _period_stats(db, current_user.id, None)
+    return schemas.PaginatedWatchHistoryResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        total_watch_seconds=all_time.watch_seconds,
+        total_reels_watched=all_time.reels_watched,
+        items=items,
+    )
 
 
 def _period_stats(db: Session, user_id: int, since: datetime | None) -> schemas.WatchPeriodStats:

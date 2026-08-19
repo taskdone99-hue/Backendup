@@ -39,6 +39,30 @@ def is_liked_by(
     )
 
 
+def get_like_id(
+    db: Session,
+    user_id: int | None,
+    target_type: models.LikeTargetType,
+    target_id: int,
+) -> int | None:
+    """Returns the viewer's own Like.id for this target, or None if they
+    haven't liked it — lets a response include the id a client would need
+    to call DELETE /api/likes/{like_id} without a separate lookup."""
+    if user_id is None:
+        return None
+
+    like = (
+        db.query(models.Like.id)
+        .filter(
+            models.Like.target_type == target_type,
+            models.Like.target_id == target_id,
+            models.Like.user_id == user_id,
+        )
+        .first()
+    )
+    return like[0] if like else None
+
+
 def comments_count(db: Session, post_id: int) -> int:
     return (
         db.query(models.Comment)
