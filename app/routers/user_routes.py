@@ -166,6 +166,46 @@ def get_user_reels(
     return schemas.PaginatedReelsResponse(total=total, limit=limit, offset=offset, items=items)
 
 
+@router.get(
+    "/api/users/{user_id}/saved/reels", response_model=schemas.PaginatedReelDetailResponse
+)
+def get_saved_reels(
+    user_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Flat list of the logged-in user's saved reels — same response shape as
+    GET /api/users/:id/reels (their own posted reels), so a profile screen
+    can render both with the same reel-grid component. For the mixed
+    all/posts/reels/audio/series view, use GET /api/users/:id/saved instead.
+    """
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own saved reels",
+        )
+
+    from app.routers.content_routes import _to_reel_detail
+
+    query = (
+        db.query(models.Reel, models.SavedItem.created_at)
+        .join(
+            models.SavedItem,
+            (models.SavedItem.target_type == models.SavedItemType.reel)
+            & (models.SavedItem.target_id == models.Reel.id),
+        )
+        .filter(models.SavedItem.user_id == user_id)
+    )
+    total = query.count()
+    rows = query.order_by(models.SavedItem.created_at.desc()).offset(offset).limit(limit).all()
+
+    items = [_to_reel_detail(db, reel, current_user.id) for reel, _saved_at in rows]
+    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
+
+
 @router.get("/api/users/{user_id}/saved", response_model=schemas.PaginatedSavedResponse)
 def get_saved_posts(
     user_id: int,

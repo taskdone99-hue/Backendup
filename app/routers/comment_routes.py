@@ -113,13 +113,6 @@ def reply_to_comment(
     current_user: models.User = Depends(get_current_user),
 ):
     parent = _get_comment_or_404(db, comment_id)
-    if parent.parent_id is not None:
-        # Keep replies one level deep, matching get_comments (which only
-        # returns top-level comments) and the delete cleanup logic.
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Can't reply to a reply — reply to the top-level comment instead",
-        )
     reply = models.Comment(
         post_id=parent.post_id,
         user_id=current_user.id,
@@ -175,33 +168,33 @@ def delete_comment(
             status_code=status.HTTP_403_FORBIDDEN, detail="You can only delete your own comments"
         )
 
-    # Replies are meant to be one level deep (see get_comments), but
-    # reply_to_comment doesn't actually enforce that — it accepts any
-    # comment_id, including a reply's id — so a reply-to-a-reply can exist
-    # in the data even though the API never surfaces it. If we only delete
-    # direct children here, a grandchild like that is left behind pointing
-    # at a parent_id that no longer exists, and MySQL's FK constraint on
-    # comments.parent_id rejects the DELETE with a 500. So walk the whole
-    # subtree, however deep it actually goes, not just one level.
-    all_ids = [comment_id]
-    frontier = [comment_id]
-    while frontier:
-        child_ids = [
-            row[0]
-            for row in db.query(models.Comment.id)
-            .filter(models.Comment.parent_id.in_(frontier))
-            .all()
-        ]
-        if not child_ids:
-            break
-        all_ids.extend(child_ids)
-        frontier = child_ids
+    # Replies are one level deep in this API (see get_comments), so a
+    # comment's children are exactly the rows with parent_id == comment.id.
+    reply_ids = [
+        row[0]
+        for row in db.query(models.Comment.id)
+        .filter(models.Comment.parent_id == comment_id)
+        .all()
+    ]
+    all_ids = [comment_id] + reply_ids
 
     db.query(models.Like).filter(
         models.Like.target_type == models.LikeTargetType.comment,
         models.Like.target_id.in_(all_ids),
     ).delete(synchronize_session=False)
-    db.query(models.Comment).filter(models.Comment.id.in_(all_ids)).delete(
+
+    # Replies first, parent second — two statements, not one combined
+    # `id IN (...)` delete. parent_id is a self-referencing FK with no
+    # ON DELETE CASCADE, so on MySQL/InnoDB a single multi-row DELETE that
+    # includes both a comment and its own reply can fail with a foreign key
+    # constraint violation depending on row-deletion order within that
+    # statement. Deleting children before the parent, as separate
+    # statements, sidesteps that ordering issue entirely.
+    if reply_ids:
+        db.query(models.Comment).filter(models.Comment.id.in_(reply_ids)).delete(
+            synchronize_session=False
+        )
+    db.query(models.Comment).filter(models.Comment.id == comment_id).delete(
         synchronize_session=False
     )
     db.commit()
