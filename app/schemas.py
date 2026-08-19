@@ -19,6 +19,7 @@ from app.models import (
     PaymentStatus,
     SavedItemType,
     ShareContentType,
+    AccountType,
 )
 
 PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
@@ -284,6 +285,10 @@ class UserProfileOut(BaseModel):
     is_private: bool
     is_phone_verified: bool
     is_email_verified: bool
+    account_type: AccountType = AccountType.personal
+    business_name: str | None = None
+    business_category: str | None = None
+    business_description: str | None = None
     created_at: datetime
 
     class Config:
@@ -299,6 +304,10 @@ class UserProfileUpdate(BaseModel):
     bio: str | None = Field(default=None, max_length=150)
     gender: Gender | None = None
     is_private: bool | None = None
+    account_type: AccountType | None = None
+    business_name: str | None = Field(default=None, max_length=100)
+    business_category: str | None = Field(default=None, max_length=100)
+    business_description: str | None = Field(default=None, max_length=500)
 
     @field_validator("username")
     @classmethod
@@ -1157,6 +1166,7 @@ class MessageOut(BaseModel):
     sender_id: int
     content: str
     reply_to_story_id: int | None = None
+    is_auto_message: bool = False
     created_at: datetime
 
     class Config:
@@ -1186,6 +1196,19 @@ class ConversationOut(BaseModel):
     participants: list[ChatParticipantOut]
     last_message: MessageOut | None = None
     unread_count: int = 0
+    # Only meaningful from POST /api/chat/conversations: whether this call
+    # just created the 1:1 thread (vs. returning an existing one), and — if
+    # so — the auto-intro DM that was sent on B's behalf. Both are None on
+    # every other endpoint that returns a ConversationOut (GET /conversations
+    # etc), since they're only relevant at the moment of creation.
+    is_new_conversation: bool | None = None
+    profile_message: "ProfileMessageOut | None" = None
+
+
+class ProfileMessageOut(BaseModel):
+    message: str
+    profile_id: int
+    account_type: AccountType
 
 
 class ConversationsResponse(BaseModel):

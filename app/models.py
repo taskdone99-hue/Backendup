@@ -102,6 +102,13 @@ class DevicePlatform(str, enum.Enum):
     web = "web"
 
 
+class AccountType(str, enum.Enum):
+    """Personal vs. business profile — drives the auto-intro DM sent the
+    first time someone messages this user (see chat_routes.create_conversation)."""
+    personal = "personal"
+    business = "business"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -123,6 +130,13 @@ class User(Base):
     is_phone_verified = Column(Boolean, default=False, nullable=False)
     is_email_verified = Column(Boolean, default=False, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    # Business-profile fields — only meaningful when account_type is
+    # business. business_name/business_category surface on the profile;
+    # business_description feeds the auto-intro DM's body text.
+    account_type = Column(Enum(AccountType), default=AccountType.personal, nullable=False)
+    business_name = Column(String(100), nullable=True)
+    business_category = Column(String(100), nullable=True)
+    business_description = Column(String(500), nullable=True)
     # Per-user chat display-font preference — PUT /api/chat/settings/font.
     # Nullable/free-form on purpose: the client owns the list of valid font
     # names, same way it owns theme names, so the API doesn't hardcode one.
@@ -808,6 +822,10 @@ class Message(Base):
     reply_to_story_id = Column(
         Integer, ForeignKey("stories.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # True for the one-time auto-intro DM sent on a brand-new 1:1
+    # conversation (see chat_routes.create_conversation) — lets a client
+    # style/skip it differently from a message the sender actually typed.
+    is_auto_message = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")

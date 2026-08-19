@@ -100,6 +100,24 @@ def _to_conversation_out(
     )
 
 
+def _build_intro_message(other_user: models.User) -> str:
+    """The one-time auto-DM sent (as if from `other_user`) the first time
+    someone starts a 1:1 conversation with them."""
+    if other_user.account_type == models.AccountType.business:
+        name = other_user.business_name or other_user.full_name or other_user.username
+        text = f"Hi! \U0001F44B Welcome to {name}."
+        if other_user.business_description:
+            text += f" {other_user.business_description}"
+        text += " Check out our profile to learn more."
+        return text
+
+    display_name = other_user.full_name or other_user.username
+    return (
+        f"Hi! \U0001F44B You're messaging {display_name}. "
+        "Check out my profile to know more about me."
+    )
+
+
 # ==========================================================================
 # Conversations
 # ==========================================================================
@@ -131,7 +149,10 @@ def create_conversation(
     is_group = len(other_ids) > 1
 
     # For a 1:1 chat, reuse an existing conversation between the same two
-    # people instead of creating a duplicate thread every time.
+    # people instead of creating a duplicate thread every time. Finding one
+    # here IS the "have they ever messaged before?" check — if a thread
+    # already exists (even an empty one), the intro DM has already had its
+    # chance to go out, so it never fires twice.
     if not is_group:
         other_id = other_ids[0]
         my_conversation_ids = select(models.ConversationParticipant.conversation_id).where(
@@ -148,7 +169,10 @@ def create_conversation(
         for conv in candidates:
             participant_ids = {p.user_id for p in conv.participants}
             if participant_ids == {current_user.id, other_id}:
-                return _to_conversation_out(db, conv, viewer_id=current_user.id)
+                out = _to_conversation_out(db, conv, viewer_id=current_user.id)
+                out.is_new_conversation = False
+                out.profile_message = None
+                return out
 
     conversation = models.Conversation(is_group=is_group, title=payload.title if is_group else None)
     db.add(conversation)
@@ -158,9 +182,32 @@ def create_conversation(
     for uid in all_participant_ids:
         db.add(models.ConversationParticipant(conversation_id=conversation.id, user_id=uid))
 
+    profile_message_out = None
+    if not is_group:
+        # Brand-new 1:1 thread — send the other person's auto-intro DM,
+        # as if it came from them, before either side has typed anything.
+        other_user = others[0]
+        intro_text = _build_intro_message(other_user)
+        intro = models.Message(
+            conversation_id=conversation.id,
+            sender_id=other_user.id,
+            content=intro_text,
+            is_auto_message=True,
+        )
+        db.add(intro)
+        profile_message_out = schemas.ProfileMessageOut(
+            message=intro_text,
+            profile_id=other_user.id,
+            account_type=other_user.account_type,
+        )
+
     db.commit()
     db.refresh(conversation)
-    return _to_conversation_out(db, conversation, viewer_id=current_user.id)
+
+    out = _to_conversation_out(db, conversation, viewer_id=current_user.id)
+    out.is_new_conversation = True
+    out.profile_message = profile_message_out
+    return out
 
 
 @router.get("/conversations", response_model=schemas.ConversationsResponse)
