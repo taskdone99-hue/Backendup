@@ -10,7 +10,7 @@ app has a single video-content type).
 import re
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -439,15 +439,34 @@ def unsave_post(
 def create_reel(
     file: UploadFile,
     caption: str | None = Form(default=None),
+    thumbnail: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """
+    `thumbnail` is optional — send a poster-frame image alongside the video
+    in the same multipart request and it's saved as thumbnail_url on
+    creation. If omitted, thumbnail_url stays null until a client calls
+    POST /api/videos/{id}/thumbnail separately (that endpoint still works
+    the same as before — this is just a more convenient one-request path).
+    """
     url, kind = save_upload_file(file, "reels", allow_video=True)
     if kind != "video":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Reels must be a video file"
         )
-    reel = models.Reel(user_id=current_user.id, caption=caption, video_url=url)
+
+    thumbnail_url = None
+    if thumbnail is not None and thumbnail.filename:
+        thumbnail_url, thumb_kind = save_upload_file(thumbnail, "thumbnails", allow_video=False)
+        if thumb_kind != "image":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Thumbnail must be an image file"
+            )
+
+    reel = models.Reel(
+        user_id=current_user.id, caption=caption, video_url=url, thumbnail_url=thumbnail_url
+    )
     db.add(reel)
     db.commit()
     db.refresh(reel)

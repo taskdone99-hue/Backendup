@@ -14,6 +14,7 @@ from app.routers import (
     content_routes,
     watch_routes,
     comment_routes,
+    video_routes,
     highlight_routes,
     saved_routes,
     share_routes,
@@ -94,6 +95,7 @@ app.include_router(content_routes.router)
 app.include_router(content_routes.reels_router)
 app.include_router(watch_routes.router)
 app.include_router(comment_routes.router)
+app.include_router(video_routes.router)
 app.include_router(highlight_routes.router)
 app.include_router(saved_routes.router)
 app.include_router(share_routes.router)
