@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
-from app.services.media_service import delete_media_file, save_upload_file
+from app.services.media_service import delete_media_file, generate_video_thumbnail, save_upload_file
 from app.services import engagement
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
@@ -445,10 +445,14 @@ def create_reel(
 ):
     """
     `thumbnail` is optional — send a poster-frame image alongside the video
-    in the same multipart request and it's saved as thumbnail_url on
-    creation. If omitted, thumbnail_url stays null until a client calls
-    POST /api/videos/{id}/thumbnail separately (that endpoint still works
-    the same as before — this is just a more convenient one-request path).
+    in the same multipart request and it's used as thumbnail_url as-is.
+    If you don't send one, the backend automatically extracts a frame from
+    the uploaded video itself (via ffmpeg) and uses that instead — you
+    don't need to generate or upload a thumbnail on the frontend at all
+    unless you want to override the auto-generated one. If ffmpeg isn't
+    available on the server or the video can't be read, thumbnail_url
+    just comes back null (never blocks the reel from being created); you
+    can still call POST /api/videos/{id}/thumbnail afterward to attach one.
     """
     url, kind = save_upload_file(file, "reels", allow_video=True)
     if kind != "video":
@@ -463,6 +467,8 @@ def create_reel(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Thumbnail must be an image file"
             )
+    else:
+        thumbnail_url = generate_video_thumbnail(url)
 
     reel = models.Reel(
         user_id=current_user.id, caption=caption, video_url=url, thumbnail_url=thumbnail_url

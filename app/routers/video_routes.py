@@ -24,7 +24,7 @@ from app import models, schemas
 from app.auth import get_current_user
 from app.database import get_db
 from app.services import engagement
-from app.services.media_service import save_upload_file
+from app.services.media_service import generate_video_thumbnail, save_upload_file
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
@@ -65,7 +65,12 @@ def upload_video(
     if kind != "video":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be a video")
 
-    video = models.Reel(user_id=current_user.id, title=title, caption=caption, video_url=url)
+    thumbnail_url = generate_video_thumbnail(url)
+
+    video = models.Reel(
+        user_id=current_user.id, title=title, caption=caption, video_url=url,
+        thumbnail_url=thumbnail_url,
+    )
     db.add(video)
     db.commit()
     db.refresh(video)

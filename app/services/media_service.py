@@ -11,6 +11,7 @@ callers only care about getting a URL back, so nothing else needs to change.
 
 import logging
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -107,14 +108,88 @@ def save_upload_file(
     return _public_url(f"{subfolder}/{filename}"), kind
 
 
-def delete_media_file(public_url: str) -> None:
-    """Best-effort delete of a previously saved file, given the URL save_upload_file returned."""
+def _local_path_from_url(public_url: str) -> Path | None:
+    """Reverses _public_url — maps a saved file's public URL back to its
+    on-disk path under STATIC_ROOT."""
     marker = "/static/"
     idx = public_url.find(marker)
     if idx == -1:
-        return
+        return None
     relative = public_url[idx + len(marker):]
-    path = STATIC_ROOT / relative
+    return STATIC_ROOT / relative
+
+
+def generate_video_thumbnail(video_public_url: str, subfolder: str = "thumbnails") -> str | None:
+    """
+    Extracts a frame from an already-saved video (via the `ffmpeg` binary)
+    and saves it as a JPEG thumbnail, so the frontend doesn't have to
+    generate or upload one itself.
+
+    Returns the new thumbnail's public URL, or None if generation fails for
+    any reason — ffmpeg not installed on this server, a corrupt/unreadable
+    video, a video shorter than the grab point, etc. A missing thumbnail
+    should never fail the reel upload itself; the caller just gets
+    thumbnail_url: null and can fall back to attaching one later via
+    POST /api/videos/{id}/thumbnail.
+
+    Requires the `ffmpeg` binary on PATH — install with:
+        sudo apt-get install -y ffmpeg
+    """
+    video_path = _local_path_from_url(video_public_url)
+    if video_path is None or not video_path.exists():
+        return None
+
+    target_dir = STATIC_ROOT / subfolder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    thumb_path = target_dir / f"{uuid.uuid4().hex}.jpg"
+
+    # Grab the frame at 1s in (skips an all-black opening frame on most
+    # clips); -vf scale caps thumbnail width at 480px, keeping aspect ratio.
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", "00:00:01.000",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-vf", "scale=480:-2",
+        str(thumb_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("Thumbnail generation unavailable/failed for %s: %s", video_path.name, e)
+        return None
+
+    if result.returncode != 0 or not thumb_path.exists():
+        # Common cause: video is shorter than 1s, so the seek lands past
+        # the last frame. Retry grabbing frame 0 instead of giving up.
+        cmd_fallback = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-frames:v", "1",
+            "-vf", "scale=480:-2",
+            str(thumb_path),
+        ]
+        try:
+            result = subprocess.run(cmd_fallback, capture_output=True, timeout=20)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.warning("Thumbnail fallback failed for %s: %s", video_path.name, e)
+            return None
+
+        if result.returncode != 0 or not thumb_path.exists():
+            logger.warning(
+                "ffmpeg thumbnail generation failed for %s: %s",
+                video_path.name, result.stderr.decode(errors="ignore")[-500:],
+            )
+            return None
+
+    return _public_url(f"{subfolder}/{thumb_path.name}")
+
+
+def delete_media_file(public_url: str) -> None:
+    """Best-effort delete of a previously saved file, given the URL save_upload_file returned."""
+    path = _local_path_from_url(public_url)
+    if path is None:
+        return
     try:
         path.unlink(missing_ok=True)
     except OSError:
