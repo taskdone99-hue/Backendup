@@ -333,6 +333,7 @@ class AvatarUploadResponse(BaseModel):
 class UserStatsOut(BaseModel):
     user_id: int
     posts_count: int
+    reels_count: int
     followers_count: int
     following_count: int
 
@@ -743,6 +744,7 @@ class LocationResponse(BaseModel):
 class ReelDetailOut(ReelOut):
     title: str | None = None
     remixed_from_id: int | None = None
+    author: UserSummaryOut | None = None
     likes_count: int = 0
     is_liked: bool = False
     like_id: int | None = None

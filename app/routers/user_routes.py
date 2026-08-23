@@ -240,6 +240,7 @@ def get_user_stats(user_id: int, db: Session = Depends(get_db)):
     _get_user_or_404(db, user_id)
 
     posts_count = db.query(models.Post).filter(models.Post.user_id == user_id).count()
+    reels_count = db.query(models.Reel).filter(models.Reel.user_id == user_id).count()
     followers_count = (
         db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
     )
@@ -250,6 +251,7 @@ def get_user_stats(user_id: int, db: Session = Depends(get_db)):
     return schemas.UserStatsOut(
         user_id=user_id,
         posts_count=posts_count,
+        reels_count=reels_count,
         followers_count=followers_count,
         following_count=following_count,
     )

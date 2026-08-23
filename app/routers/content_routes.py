@@ -144,6 +144,7 @@ def _to_reel_detail(
     db: Session, reel: models.Reel, viewer_id: int | None
 ) -> schemas.ReelDetailOut:
     detail = schemas.ReelDetailOut.model_validate(reel)
+    detail.author = schemas.UserSummaryOut.model_validate(reel.user)
     detail.likes_count = engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
     detail.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.reel, reel.id)
     detail.is_liked = detail.like_id is not None

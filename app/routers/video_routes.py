@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.auth import get_current_user
 from app.database import get_db
-from app.services import engagement
 from app.services.media_service import generate_video_thumbnail, save_upload_file
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
@@ -42,15 +41,7 @@ def _get_owned_video_or_404(
     return video
 
 
-def _to_reel_detail(
-    db: Session, reel: models.Reel, viewer_id: int | None
-) -> schemas.ReelDetailOut:
-    detail = schemas.ReelDetailOut.model_validate(reel)
-    detail.likes_count = engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
-    detail.is_liked = engagement.is_liked_by(
-        db, viewer_id, models.LikeTargetType.reel, reel.id
-    )
-    return detail
+from app.routers.content_routes import _to_reel_detail
 
 
 @router.post("/upload", response_model=schemas.ReelDetailOut, status_code=status.HTTP_201_CREATED)
