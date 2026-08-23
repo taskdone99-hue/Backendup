@@ -666,6 +666,26 @@ def delete_reel(
         models.Like.target_id == reel_id,
     ).delete(synchronize_session=False)
 
+    # WatchSession.reel_id and SeriesReel.reel_id are real foreign keys
+    # with no ON DELETE CASCADE — deleting a reel that anyone has ever
+    # watched (very likely, since watch tracking is used throughout the
+    # app) or that's part of a Series would otherwise hit a foreign key
+    # violation on MySQL/InnoDB and 500. Clear them explicitly first, the
+    # same way Like is handled above.
+    db.query(models.WatchSession).filter(models.WatchSession.reel_id == reel_id).delete(
+        synchronize_session=False
+    )
+    db.query(models.SeriesReel).filter(models.SeriesReel.reel_id == reel_id).delete(
+        synchronize_session=False
+    )
+    # Audio.source_reel_id is nullable and only an optional "traced back
+    # to" reference — null it out rather than deleting the Audio row
+    # itself, since a bookmarked sound should survive its source reel
+    # being removed.
+    db.query(models.Audio).filter(models.Audio.source_reel_id == reel_id).update(
+        {models.Audio.source_reel_id: None}, synchronize_session=False
+    )
+
     video_url, thumbnail_url = reel.video_url, reel.thumbnail_url
     db.delete(reel)  # cascades collaborators + revenue splits via the ORM relationship
     db.commit()
