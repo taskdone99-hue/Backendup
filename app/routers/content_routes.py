@@ -185,17 +185,75 @@ def _following_ids(db: Session, user_id: int) -> list[int]:
 def create_post(
     file: UploadFile,
     caption: str | None = Form(default=None),
+    alt_text: str | None = Form(default=None),
+    ai_generated: bool = Form(default=False),
+    music_title: str | None = Form(default=None),
+    music_artist: str | None = Form(default=None),
+    music_url: str | None = Form(default=None),
+    music_start_seconds: int = Form(default=0),
+    location_name: str | None = Form(default=None),
+    location_latitude: float | None = Form(default=None),
+    location_longitude: float | None = Form(default=None),
+    tag_user_ids: str | None = Form(
+        default=None, description="Comma-separated user ids, e.g. '12,15,20'"
+    ),
+    member_user_ids: str | None = Form(
+        default=None, description="Comma-separated user ids, e.g. '12,15,20'"
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """
+    Everything a post can carry is settable at creation time now — music,
+    location, alt_text, ai_generated, tags, and collaborators/members — so
+    a client doesn't need a create-then-PUT round trip. All of these stay
+    optional and settable later too, either via PUT /api/posts/{id} (JSON)
+    or the individual post-details endpoints (/tags, /music, /location,
+    etc) if you'd rather set them one at a time or after the fact.
+    Hashtags aren't a separate field — they're parsed out of `caption`
+    automatically (see hashtags in the response).
+    tag_user_ids / member_user_ids are multipart form fields, so they're
+    plain comma-separated strings here rather than JSON arrays (multipart
+    can't carry nested types) — e.g. "12,15,20".
+    """
+    def _parse_ids(raw: str | None, field_name: str) -> list[int]:
+        if not raw or not raw.strip():
+            return []
+        try:
+            return [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must be comma-separated integers, e.g. '12,15,20'",
+            )
+
+    tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
+    member_ids = _parse_ids(member_user_ids, "member_user_ids")
+
     url, kind = save_upload_file(file, "posts", allow_video=True)
     post = models.Post(
         user_id=current_user.id,
         caption=caption,
         media_url=url,
         media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
+        alt_text=alt_text,
+        ai_generated=ai_generated,
+        music_title=music_title,
+        music_artist=music_artist,
+        music_url=music_url,
+        music_start_seconds=music_start_seconds if music_title or music_url else None,
+        location_name=location_name,
+        location_latitude=location_latitude,
+        location_longitude=location_longitude,
     )
     db.add(post)
+    db.flush()
+
+    if tag_ids:
+        _replace_post_tags(db, post, tag_ids)
+    if member_ids:
+        _replace_post_members(db, post, member_ids)
+
     db.commit()
     db.refresh(post)
     return _to_post_detail(db, post, current_user.id)
