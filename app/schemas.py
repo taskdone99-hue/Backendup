@@ -746,6 +746,7 @@ class ReelDetailOut(ReelOut):
     remixed_from_id: int | None = None
     author: UserSummaryOut | None = None
     likes_count: int = 0
+    comments_count: int = 0
     is_liked: bool = False
     like_id: int | None = None
     is_saved: bool = False
@@ -847,7 +848,8 @@ class CommentCreate(BaseModel):
 
 class CommentOut(BaseModel):
     id: int
-    post_id: int
+    post_id: int | None = None
+    reel_id: int | None = None
     user_id: int
     parent_id: int | None
     content: str

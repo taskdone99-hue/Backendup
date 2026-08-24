@@ -239,8 +239,13 @@ def get_saved_posts(
 def get_user_stats(user_id: int, db: Session = Depends(get_db)):
     _get_user_or_404(db, user_id)
 
-    posts_count = db.query(models.Post).filter(models.Post.user_id == user_id).count()
+    normal_posts_count = db.query(models.Post).filter(models.Post.user_id == user_id).count()
     reels_count = db.query(models.Reel).filter(models.Reel.user_id == user_id).count()
+    # posts_count is total content — normal posts + reels — matching how a
+    # profile's post count is usually shown on Instagram (reels count
+    # toward the grid total too). reels_count stays as just reels, for
+    # whatever surface shows that separately (e.g. a Reels tab count).
+    posts_count = normal_posts_count + reels_count
     followers_count = (
         db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
     )

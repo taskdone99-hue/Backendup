@@ -571,7 +571,9 @@ class Comment(Base):
     __tablename__ = "comments"
 
     id = Column(Integer, primary_key=True, index=True)
-    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    # Exactly one of post_id / reel_id is set.
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=True, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id"), nullable=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True, index=True)
     content = Column(String(2200), nullable=False)

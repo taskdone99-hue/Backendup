@@ -148,6 +148,7 @@ def _to_reel_detail(
     detail.likes_count = engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
     detail.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.reel, reel.id)
     detail.is_liked = detail.like_id is not None
+    detail.comments_count = engagement.comments_count(db, reel_id=reel.id)
     detail.is_saved = engagement.is_saved_by(
         db, viewer_id, reel.id, models.SavedItemType.reel
     )
@@ -665,6 +666,23 @@ def delete_reel(
         models.Like.target_type == models.LikeTargetType.reel,
         models.Like.target_id == reel_id,
     ).delete(synchronize_session=False)
+
+    # Remove reel comments and their comment likes before deleting the reel.
+    reel_comment_ids = [
+        row[0] for row in db.query(models.Comment.id)
+        .filter(models.Comment.reel_id == reel_id).all()
+    ]
+    if reel_comment_ids:
+        db.query(models.Like).filter(
+            models.Like.target_type == models.LikeTargetType.comment,
+            models.Like.target_id.in_(reel_comment_ids),
+        ).delete(synchronize_session=False)
+        db.query(models.Comment).filter(
+            models.Comment.parent_id.in_(reel_comment_ids)
+        ).delete(synchronize_session=False)
+        db.query(models.Comment).filter(
+            models.Comment.id.in_(reel_comment_ids)
+        ).delete(synchronize_session=False)
 
     # WatchSession.reel_id and SeriesReel.reel_id are real foreign keys
     # with no ON DELETE CASCADE — deleting a reel that anyone has ever

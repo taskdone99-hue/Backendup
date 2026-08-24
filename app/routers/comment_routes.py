@@ -24,6 +24,13 @@ def _get_post_or_404(db: Session, post_id: int) -> models.Post:
     return post
 
 
+def _get_reel_or_404(db: Session, reel_id: int) -> models.Reel:
+    reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
+    if reel is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reel not found")
+    return reel
+
+
 def _get_comment_or_404(db: Session, comment_id: int) -> models.Comment:
     comment = db.query(models.Comment).filter(models.Comment.id == comment_id).first()
     if comment is None:
@@ -102,6 +109,45 @@ def get_comments(
 
 
 @router.post(
+    "/api/reels/{reel_id}/comments",
+    response_model=schemas.CommentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_reel_comment(
+    reel_id: int,
+    payload: schemas.CommentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_reel_or_404(db, reel_id)
+    comment = models.Comment(reel_id=reel_id, user_id=current_user.id, content=payload.content)
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return _to_comment_out(db, comment, current_user.id)
+
+
+@router.get("/api/reels/{reel_id}/comments", response_model=schemas.PaginatedCommentsResponse)
+def get_reel_comments(
+    reel_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
+    _get_reel_or_404(db, reel_id)
+    query = db.query(models.Comment).filter(
+        models.Comment.reel_id == reel_id,
+        models.Comment.parent_id.is_(None),
+    )
+    total = query.count()
+    comments = query.order_by(models.Comment.created_at.asc()).offset(offset).limit(limit).all()
+    viewer_id = current_user.id if current_user else None
+    items = [_to_comment_out(db, c, viewer_id) for c in comments]
+    return schemas.PaginatedCommentsResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+@router.post(
     "/api/comments/{comment_id}/reply",
     response_model=schemas.CommentOut,
     status_code=status.HTTP_201_CREATED,
@@ -113,8 +159,12 @@ def reply_to_comment(
     current_user: models.User = Depends(get_current_user),
 ):
     parent = _get_comment_or_404(db, comment_id)
+    if parent.parent_id is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Replies can only be made to top-level comments")
     reply = models.Comment(
         post_id=parent.post_id,
+        reel_id=parent.reel_id,
         user_id=current_user.id,
         parent_id=parent.id,
         content=payload.content,
@@ -123,6 +173,23 @@ def reply_to_comment(
     db.commit()
     db.refresh(reply)
     return _to_comment_out(db, reply, current_user.id)
+
+
+@router.get("/api/comments/{comment_id}/replies", response_model=schemas.PaginatedCommentsResponse)
+def get_comment_replies(
+    comment_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
+    _get_comment_or_404(db, comment_id)
+    query = db.query(models.Comment).filter(models.Comment.parent_id == comment_id)
+    total = query.count()
+    replies = query.order_by(models.Comment.created_at.asc()).offset(offset).limit(limit).all()
+    viewer_id = current_user.id if current_user else None
+    items = [_to_comment_out(db, c, viewer_id) for c in replies]
+    return schemas.PaginatedCommentsResponse(total=total, limit=limit, offset=offset, items=items)
 
 
 @router.post("/api/comments/{comment_id}/like", response_model=schemas.LikeActionResponse)
@@ -348,4 +415,37 @@ def get_post_likes(
             )
         items.append(summary)
 
+    return schemas.PaginatedLikesResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+@router.get("/api/reels/{reel_id}/likes", response_model=schemas.PaginatedLikesResponse)
+def get_reel_likes(
+    reel_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
+    _get_reel_or_404(db, reel_id)
+    query = (
+        db.query(models.User)
+        .join(models.Like, models.Like.user_id == models.User.id)
+        .filter(
+            models.Like.target_type == models.LikeTargetType.reel,
+            models.Like.target_id == reel_id,
+        )
+        .order_by(models.Like.created_at.desc())
+    )
+    total = query.count()
+    users = query.offset(offset).limit(limit).all()
+    viewer_id = current_user.id if current_user else None
+    items = []
+    for user in users:
+        summary = schemas.UserSummaryOut.model_validate(user)
+        if viewer_id is not None and viewer_id != user.id:
+            summary.is_following = db.query(models.Follow).filter(
+                models.Follow.follower_id == viewer_id,
+                models.Follow.following_id == user.id,
+            ).first() is not None
+        items.append(summary)
     return schemas.PaginatedLikesResponse(total=total, limit=limit, offset=offset, items=items)

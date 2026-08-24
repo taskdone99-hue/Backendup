@@ -63,12 +63,11 @@ def get_like_id(
     return like[0] if like else None
 
 
-def comments_count(db: Session, post_id: int) -> int:
-    return (
-        db.query(models.Comment)
-        .filter(models.Comment.post_id == post_id)
-        .count()
-    )
+def comments_count(db: Session, post_id: int | None = None, reel_id: int | None = None) -> int:
+    query = db.query(models.Comment)
+    if reel_id is not None:
+        return query.filter(models.Comment.reel_id == reel_id).count()
+    return query.filter(models.Comment.post_id == post_id).count()
 
 
 def shares_count(db: Session, content_type: models.ShareContentType, content_id: int) -> int:
