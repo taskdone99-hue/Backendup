@@ -149,21 +149,26 @@ def get_user_posts(
     return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
 
-@router.get("/api/users/{user_id}/reels", response_model=schemas.PaginatedReelsResponse)
+@router.get("/api/users/{user_id}/reels", response_model=schemas.PaginatedReelDetailResponse)
 def get_user_reels(
     user_id: int,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
 ):
     _get_user_or_404(db, user_id)
 
+    from app.routers.content_routes import _to_reel_detail
+
     query = db.query(models.Reel).filter(models.Reel.user_id == user_id)
     total = query.count()
-    items = (
+    reels = (
         query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
     )
-    return schemas.PaginatedReelsResponse(total=total, limit=limit, offset=offset, items=items)
+    viewer_id = current_user.id if current_user else None
+    items = [_to_reel_detail(db, r, viewer_id) for r in reels]
+    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
 
 @router.get(

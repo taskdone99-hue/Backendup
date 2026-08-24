@@ -851,6 +851,7 @@ class CommentOut(BaseModel):
     post_id: int | None = None
     reel_id: int | None = None
     user_id: int
+    author: UserSummaryOut | None = None
     parent_id: int | None
     content: str
     created_at: datetime

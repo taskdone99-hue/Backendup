@@ -562,10 +562,11 @@ class SavedCollectionItem(Base):
 
 class Comment(Base):
     """
-    Comments live on posts only (per the API spec). `parent_id` set means
-    this row is a reply — replies are one level deep, matching how
-    POST /api/comments/:id/reply and GET /api/posts/:postId/comments (which
-    only returns top-level comments) are implemented.
+    Comments live on posts or reels — exactly one of post_id/reel_id is set
+    per row. `parent_id` set means this row is a reply — replies are one
+    level deep, matching how POST /api/comments/:id/reply and
+    GET /api/posts/:postId/comments / GET /api/reels/:reelId/comments
+    (which only return top-level comments) are implemented.
     """
 
     __tablename__ = "comments"
