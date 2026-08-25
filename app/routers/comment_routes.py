@@ -42,7 +42,8 @@ def _to_comment_out(
     db: Session, comment: models.Comment, viewer_id: int | None
 ) -> schemas.CommentOut:
     out = schemas.CommentOut.model_validate(comment)
-    out.likes_count = engagement.likes_count(db, models.LikeTargetType.comment, comment.id)
+    out.author = schemas.UserSummaryOut.model_validate(comment.user)
+    out.likes_count = engagement.likes_count(db, models.LikeTargetType.comment, comment.id  )
     out.replies_count = engagement.replies_count(db, comment.id)
     out.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.comment, comment.id)
     out.is_liked = out.like_id is not None
