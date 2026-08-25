@@ -42,7 +42,6 @@ def _to_comment_out(
     db: Session, comment: models.Comment, viewer_id: int | None
 ) -> schemas.CommentOut:
     out = schemas.CommentOut.model_validate(comment)
-    out.author = schemas.UserSummaryOut.model_validate(comment.user)
     out.likes_count = engagement.likes_count(db, models.LikeTargetType.comment, comment.id)
     out.replies_count = engagement.replies_count(db, comment.id)
     out.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.comment, comment.id)
@@ -99,7 +98,7 @@ def get_comments(
     POST /api/comments/:id/reply's replies — one level deep, no nested pagination.
     """
     _get_post_or_404(db, post_id)
-    query = db.query(models.Comment).options(joinedload(models.Comment.user)).filter(
+    query = db.query(models.Comment).filter(
         models.Comment.post_id == post_id, models.Comment.parent_id.is_(None)
     )
     total = query.count()
@@ -137,7 +136,7 @@ def get_reel_comments(
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
     _get_reel_or_404(db, reel_id)
-    query = db.query(models.Comment).options(joinedload(models.Comment.user)).filter(
+    query = db.query(models.Comment).filter(
         models.Comment.reel_id == reel_id,
         models.Comment.parent_id.is_(None),
     )
@@ -185,9 +184,7 @@ def get_comment_replies(
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
     _get_comment_or_404(db, comment_id)
-    query = db.query(models.Comment).options(joinedload(models.Comment.user)).filter(
-        models.Comment.parent_id == comment_id
-    )
+    query = db.query(models.Comment).filter(models.Comment.parent_id == comment_id)
     total = query.count()
     replies = query.order_by(models.Comment.created_at.asc()).offset(offset).limit(limit).all()
     viewer_id = current_user.id if current_user else None
@@ -223,9 +220,7 @@ def like_comment(
         db.refresh(existing)
 
     count = engagement.likes_count(db, models.LikeTargetType.comment, comment_id)
-    like_out = schemas.LikeOut.model_validate(existing)
-    like_out.user = schemas.UserSummaryOut.model_validate(existing.user)
-    return schemas.LikeActionResponse(message="Comment liked", like=like_out, likes_count=count)
+    return schemas.LikeActionResponse(message="Comment liked", like=existing, likes_count=count)
 
 
 @router.delete("/api/comments/{comment_id}", response_model=schemas.MessageResponse)
@@ -330,9 +325,7 @@ def like_target(
             db.refresh(existing)
 
     count = engagement.likes_count(db, payload.target_type, payload.target_id)
-    like_out = schemas.LikeOut.model_validate(existing)
-    like_out.user = schemas.UserSummaryOut.model_validate(existing.user)
-    return schemas.LikeActionResponse(message="Liked", like=like_out, likes_count=count)
+    return schemas.LikeActionResponse(message="Liked", like=existing, likes_count=count)
 
 
 @router.delete("/api/likes/{like_id}", response_model=schemas.MessageResponse)

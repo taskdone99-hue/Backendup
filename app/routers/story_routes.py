@@ -3,7 +3,11 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
+<<<<<<< HEAD
 from sqlalchemy.orm import Session, joinedload
+=======
+from sqlalchemy.orm import Session
+>>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
 
 from app.database import get_db
 from app import models, schemas
@@ -18,14 +22,21 @@ STORY_LIFETIME_HOURS = int(os.getenv("STORY_LIFETIME_HOURS", "24"))
 
 def _active_story_query(db: Session):
     now = datetime.now(timezone.utc)
+<<<<<<< HEAD
     return db.query(models.Story).options(joinedload(models.Story.user)).filter(
         models.Story.expires_at > now
     )
+=======
+    return db.query(models.Story).filter(models.Story.expires_at > now)
+>>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
 
 
 def _to_story_out(story: models.Story, viewer_id: int | None) -> schemas.StoryOut:
     out = schemas.StoryOut.model_validate(story)
+<<<<<<< HEAD
     out.owner = schemas.UserSummaryOut.model_validate(story.user)
+=======
+>>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
     out.views_count = len(story.views)
     out.reactions_count = len(story.reactions)
     if viewer_id is not None:
@@ -277,7 +288,10 @@ def get_story_viewers(
 
     views = (
         db.query(models.StoryView)
+<<<<<<< HEAD
         .options(joinedload(models.StoryView.viewer))
+=======
+>>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
         .filter(models.StoryView.story_id == story_id)
         .order_by(models.StoryView.viewed_at.desc())
         .all()
@@ -285,9 +299,13 @@ def get_story_viewers(
     items = [
         schemas.StoryViewerOut(
             id=v.viewer.id,
+<<<<<<< HEAD
             user_id=v.viewer.id,
             username=v.viewer.username,
             full_name=v.viewer.full_name,
+=======
+            username=v.viewer.username,
+>>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
             avatar_url=v.viewer.avatar_url,
             viewed_at=v.viewed_at,
         )
