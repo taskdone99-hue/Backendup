@@ -50,7 +50,8 @@ def _to_post_detail(
     db: Session, post: models.Post, viewer_id: int | None
 ) -> schemas.PostDetailOut:
     detail = schemas.PostDetailOut.model_validate(post)
-    detail.author = schemas.UserSummaryOut.model_validate(post.user)
+    detail.user = schemas.UserSummaryOut.model_validate(post.user)
+    detail.author = detail.user
     detail.likes_count = engagement.likes_count(db, models.LikeTargetType.post, post.id)
     detail.comments_count = engagement.comments_count(db, post.id)
     detail.share_count = engagement.shares_count(db, models.ShareContentType.post, post.id)
@@ -144,7 +145,8 @@ def _to_reel_detail(
     db: Session, reel: models.Reel, viewer_id: int | None
 ) -> schemas.ReelDetailOut:
     detail = schemas.ReelDetailOut.model_validate(reel)
-    detail.author = schemas.UserSummaryOut.model_validate(reel.user)
+    detail.user = schemas.UserSummaryOut.model_validate(reel.user)
+    detail.author = detail.user
     detail.likes_count = engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
     detail.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.reel, reel.id)
     detail.is_liked = detail.like_id is not None

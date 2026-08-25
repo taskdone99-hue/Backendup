@@ -469,9 +469,8 @@ class WatchStatsResponse(BaseModel):
 class StoryOut(BaseModel):
     id: int
     user_id: int
-
-    owner: UserSummaryOut | None = None
-
+    user: UserSummaryOut | None = None
+    owner: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     media_url: str
     media_type: MediaType
     caption: str | None
@@ -503,11 +502,9 @@ class MyStoriesResponse(BaseModel):
 
 class StoryViewerOut(BaseModel):
     id: int
-
     user_id: int
     username: str
     full_name: str | None = None
-    username: str
     avatar_url: str | None
     viewed_at: datetime
 
@@ -627,7 +624,8 @@ class LocationOut(BaseModel):
 
 
 class PostDetailOut(PostOut):
-    author: UserSummaryOut | None = None
+    user: UserSummaryOut | None = None
+    author: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     likes_count: int = 0
     comments_count: int = 0
     share_count: int = 0
@@ -751,7 +749,8 @@ class LocationResponse(BaseModel):
 class ReelDetailOut(ReelOut):
     title: str | None = None
     remixed_from_id: int | None = None
-    author: UserSummaryOut | None = None
+    user: UserSummaryOut | None = None
+    author: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     likes_count: int = 0
     comments_count: int = 0
     is_liked: bool = False
@@ -858,7 +857,8 @@ class CommentOut(BaseModel):
     post_id: int | None = None
     reel_id: int | None = None
     user_id: int
-    author: UserSummaryOut | None = None
+    user: UserSummaryOut | None = None
+    author: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     parent_id: int | None
     content: str
     created_at: datetime
@@ -888,7 +888,6 @@ class LikeCreate(BaseModel):
 class LikeOut(BaseModel):
     id: int
     user_id: int
-
     user: UserSummaryOut | None = None
     target_type: LikeTargetType
     target_id: int

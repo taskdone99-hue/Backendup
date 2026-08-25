@@ -3,11 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
-
 from sqlalchemy.orm import Session, joinedload
-
-from sqlalchemy.orm import Session
-
 
 from app.database import get_db
 from app import models, schemas
@@ -22,21 +18,15 @@ STORY_LIFETIME_HOURS = int(os.getenv("STORY_LIFETIME_HOURS", "24"))
 
 def _active_story_query(db: Session):
     now = datetime.now(timezone.utc)
-
     return db.query(models.Story).options(joinedload(models.Story.user)).filter(
         models.Story.expires_at > now
     )
 
-    return db.query(models.Story).filter(models.Story.expires_at > now)
-
-
 
 def _to_story_out(story: models.Story, viewer_id: int | None) -> schemas.StoryOut:
     out = schemas.StoryOut.model_validate(story)
-
-    out.owner = schemas.UserSummaryOut.model_validate(story.user)
-
-
+    out.user = schemas.UserSummaryOut.model_validate(story.user)
+    out.owner = out.user
     out.views_count = len(story.views)
     out.reactions_count = len(story.reactions)
     if viewer_id is not None:
@@ -288,9 +278,7 @@ def get_story_viewers(
 
     views = (
         db.query(models.StoryView)
-
         .options(joinedload(models.StoryView.viewer))
-
         .filter(models.StoryView.story_id == story_id)
         .order_by(models.StoryView.viewed_at.desc())
         .all()
