@@ -469,10 +469,9 @@ class WatchStatsResponse(BaseModel):
 class StoryOut(BaseModel):
     id: int
     user_id: int
-<<<<<<< HEAD
+
     owner: UserSummaryOut | None = None
-=======
->>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
+
     media_url: str
     media_type: MediaType
     caption: str | None
@@ -504,13 +503,11 @@ class MyStoriesResponse(BaseModel):
 
 class StoryViewerOut(BaseModel):
     id: int
-<<<<<<< HEAD
+
     user_id: int
     username: str
     full_name: str | None = None
-=======
     username: str
->>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
     avatar_url: str | None
     viewed_at: datetime
 
@@ -891,10 +888,8 @@ class LikeCreate(BaseModel):
 class LikeOut(BaseModel):
     id: int
     user_id: int
-<<<<<<< HEAD
+
     user: UserSummaryOut | None = None
-=======
->>>>>>> e32cd7300adebf21ca6b94f1fa14fa3ac80c7368
     target_type: LikeTargetType
     target_id: int
     created_at: datetime
