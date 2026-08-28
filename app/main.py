@@ -5,6 +5,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.database import Base, engine
 from app.routers import (
@@ -68,6 +69,22 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={"message": clean_msg(first["msg"])},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """
+    Every `raise HTTPException(status_code=..., detail="...")` across the app
+    (404 not found, 400 bad request, 403 forbidden, etc.) normally produces
+    FastAPI's default body {"detail": "..."}. This overrides that so every
+    endpoint returns the same simple shape instead: {"message": "..."}.
+    Status code and any headers set on the exception are preserved as-is.
+    """
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail},
+        headers=getattr(exc, "headers", None),
     )
 
 
