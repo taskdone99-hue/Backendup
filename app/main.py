@@ -53,9 +53,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     """
     Replaces FastAPI's default {"detail": [...]} validation error body with a
     simpler shape the frontend can read directly, e.g.:
-        {"success": false, "field": "identifier", "message": "..."}
-    Only the first error is surfaced; if the request had multiple invalid
-    fields, the rest are still available in `errors` for debugging.
+        {"message": "..."}
+    Only the first error is surfaced (if the request had multiple invalid
+    fields, only the first one is reported).
     """
     def clean_msg(msg: str) -> str:
         # Pydantic prefixes messages raised from @field_validator with
@@ -63,26 +63,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         prefix = "Value error, "
         return msg[len(prefix):] if msg.startswith(prefix) else msg
 
-    def field_name(loc) -> str:
-        # loc is usually ("body", "identifier") — drop "body"/"query"/etc. and
-        # join the rest in case of nested fields.
-        parts = [str(p) for p in loc if p not in ("body", "query", "path")]
-        return ".".join(parts) if parts else ""
-
-    errors = exc.errors()
-    first = errors[0]
+    first = exc.errors()[0]
 
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={
-            "success": False,
-            "field": field_name(first["loc"]),
-            "message": clean_msg(first["msg"]),
-            "errors": [
-                {"field": field_name(e["loc"]), "message": clean_msg(e["msg"])}
-                for e in errors
-            ],
-        },
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"message": clean_msg(first["msg"])},
     )
 
 
