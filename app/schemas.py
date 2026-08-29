@@ -25,6 +25,11 @@ from app.models import (
 PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
 # Matches Instagram's own minimum signup age.
 MIN_SIGNUP_AGE_YEARS = int(os.getenv("MIN_SIGNUP_AGE_YEARS", "13"))
+# Region assumed for phone numbers submitted without a country code / '+'
+# prefix (e.g. "9876543210" instead of "+919876543210"). Numbers that DO
+# include a country code still work exactly as before — this is only a
+# fallback for numbers that don't.
+DEFAULT_PHONE_REGION = os.getenv("DEFAULT_PHONE_REGION", "IN")
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # Letters, numbers, periods, and underscores only; must start and end with a
@@ -34,13 +39,16 @@ _USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._]{1,28}[A-Za-z0-9])?$")
 
 
 def _normalize_phone(value: str) -> str:
-    """Validate and normalize a phone number to E.164 format (e.g. +919876543210)."""
+    """
+    Validate and normalize a phone number to E.164 format (e.g. +919876543210).
+    A country code is optional: if the number is given as a bare local
+    number (no leading '+'), it's assumed to belong to DEFAULT_PHONE_REGION.
+    A number that does include a country code/'+' is parsed as-is either way.
+    """
     try:
-        parsed = phonenumbers.parse(value, None)
+        parsed = phonenumbers.parse(value, DEFAULT_PHONE_REGION)
     except phonenumbers.NumberParseException:
-        raise ValueError(
-    "Please include your country code, e.g. +91 for India, +1 for the US, etc."
-)
+        raise ValueError("This does not look like a valid phone number")
     if not phonenumbers.is_valid_number(parsed):
         raise ValueError("This does not look like a valid phone number")
 
