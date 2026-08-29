@@ -11,7 +11,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -180,6 +180,37 @@ def _following_ids(db: Session, user_id: int) -> list[int]:
     ]
 
 
+def _visible_authors_clause(db: Session, viewer_id: int | None):
+    """
+    Filter clause for discovery-style feeds (explore, global reels feed,
+    trending) that queries across all accounts rather than a specific
+    profile: excludes content from private accounts unless the viewer is
+    the author themselves or already follows them. Requires the query to
+    be joined to models.User on the content's user_id first, e.g.:
+        query.join(models.User, models.Post.user_id == models.User.id)
+             .filter(_visible_authors_clause(db, viewer_id))
+    """
+    if viewer_id is None:
+        return models.User.is_private == False
+    return or_(
+        models.User.is_private == False,
+        models.User.id == viewer_id,
+        models.User.id.in_(_following_ids(db, viewer_id)),
+    )
+
+
+def _require_author_visible(db: Session, author: models.User, viewer_id: int | None) -> None:
+    """Same rule as _visible_authors_clause, but for a single already-fetched
+    item (a specific post/reel by id) rather than a list query."""
+    if not author.is_private:
+        return
+    if viewer_id is not None and (
+        viewer_id == author.id or author.id in _following_ids(db, viewer_id)
+    ):
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account is private")
+
+
 # ==========================================================================
 # Posts
 # ==========================================================================
@@ -290,13 +321,14 @@ def get_explore_feed(
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
     """Posts from accounts the current user doesn't already follow (all posts, if logged out)."""
-    query = db.query(models.Post)
+    viewer_id = current_user.id if current_user else None
+    query = db.query(models.Post).join(models.User, models.Post.user_id == models.User.id)
+    query = query.filter(_visible_authors_clause(db, viewer_id))
     if current_user is not None:
         excluded_ids = _following_ids(db, current_user.id) + [current_user.id]
         query = query.filter(models.Post.user_id.notin_(excluded_ids))
     total = query.count()
     posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
-    viewer_id = current_user.id if current_user else None
     items = [_to_post_detail(db, p, viewer_id) for p in posts]
     return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
@@ -308,7 +340,9 @@ def get_post(
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
     post = _get_post_or_404(db, post_id)
-    return _to_post_detail(db, post, current_user.id if current_user else None)
+    viewer_id = current_user.id if current_user else None
+    _require_author_visible(db, post.user, viewer_id)
+    return _to_post_detail(db, post, viewer_id)
 
 
 @router.put("/{post_id}", response_model=schemas.PostDetailOut)
@@ -577,10 +611,11 @@ def get_reels_feed(
     the same pagination style used everywhere else in this API — so the
     client advances `offset` by `limit` each time it scrolls to the next page.
     """
-    query = db.query(models.Reel)
+    viewer_id = current_user.id if current_user else None
+    query = db.query(models.Reel).join(models.User, models.Reel.user_id == models.User.id)
+    query = query.filter(_visible_authors_clause(db, viewer_id))
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
-    viewer_id = current_user.id if current_user else None
     items = [_to_reel_detail(db, r, viewer_id) for r in reels]
     return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
@@ -627,17 +662,20 @@ def get_trending_reels(
 
     score = func.coalesce(likes_subq.c.like_score, 0) + func.coalesce(watch_subq.c.watch_score, 0)
 
+    viewer_id = current_user.id if current_user else None
+
     query = (
         db.query(models.Reel, score.label("score"))
+        .join(models.User, models.Reel.user_id == models.User.id)
         .outerjoin(likes_subq, models.Reel.id == likes_subq.c.reel_id)
         .outerjoin(watch_subq, models.Reel.id == watch_subq.c.reel_id)
         .filter(score > 0)
+        .filter(_visible_authors_clause(db, viewer_id))
         .order_by(score.desc(), models.Reel.created_at.desc())
     )
 
     total = query.count()
     rows = query.offset(offset).limit(limit).all()
-    viewer_id = current_user.id if current_user else None
     items = [_to_reel_detail(db, reel, viewer_id) for reel, _score in rows]
     return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
@@ -649,7 +687,9 @@ def get_reel(
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
     reel = _get_reel_or_404(db, reel_id)
-    return _to_reel_detail(db, reel, current_user.id if current_user else None)
+    viewer_id = current_user.id if current_user else None
+    _require_author_visible(db, reel.user, viewer_id)
+    return _to_reel_detail(db, reel, viewer_id)
 
 
 @reels_router.delete("/{reel_id}", response_model=schemas.MessageResponse)

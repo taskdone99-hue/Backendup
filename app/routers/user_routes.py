@@ -31,6 +31,27 @@ def _is_following(db: Session, follower_id: int, following_id: int) -> bool:
     )
 
 
+def _require_content_visible(db: Session, target: models.User, viewer_id: int | None) -> None:
+    """
+    Enforces account privacy for a target user's posts/reels/followers/
+    following lists. Public accounts (is_private=False) are visible to
+    everyone, including anonymous viewers. Private accounts are only
+    visible to the owner themselves or to users who already follow them
+    (follows are effective immediately in this app — see models.Follow).
+    Anyone else, including anonymous viewers, gets a 403.
+    """
+    if not target.is_private:
+        return
+    if viewer_id is not None and (
+        viewer_id == target.id or _is_following(db, viewer_id, target.id)
+    ):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="This account is private",
+    )
+
+
 def _to_summary(db: Session, user: models.User, viewer_id: int | None) -> schemas.UserSummaryOut:
     summary = schemas.UserSummaryOut.model_validate(user)
     if viewer_id is not None and viewer_id != user.id:
@@ -137,14 +158,15 @@ def get_user_posts(
     db: Session = Depends(get_db),
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    _get_user_or_404(db, user_id)
+    target = _get_user_or_404(db, user_id)
+    viewer_id = current_user.id if current_user else None
+    _require_content_visible(db, target, viewer_id)
 
     query = db.query(models.Post).filter(models.Post.user_id == user_id)
     total = query.count()
     posts = (
         query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
     )
-    viewer_id = current_user.id if current_user else None
     items = [_to_post_detail(db, p, viewer_id) for p in posts]
     return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
@@ -157,7 +179,9 @@ def get_user_reels(
     db: Session = Depends(get_db),
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    _get_user_or_404(db, user_id)
+    target = _get_user_or_404(db, user_id)
+    viewer_id = current_user.id if current_user else None
+    _require_content_visible(db, target, viewer_id)
 
     from app.routers.content_routes import _to_reel_detail
 
@@ -166,7 +190,6 @@ def get_user_reels(
     reels = (
         query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
     )
-    viewer_id = current_user.id if current_user else None
     items = [_to_reel_detail(db, r, viewer_id) for r in reels]
     return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
@@ -332,7 +355,9 @@ def get_followers(
     viewer: models.User | None = Depends(get_current_user_optional),
 ):
     """Users who follow :id."""
-    _get_user_or_404(db, user_id)
+    target = _get_user_or_404(db, user_id)
+    viewer_id = viewer.id if viewer else None
+    _require_content_visible(db, target, viewer_id)
 
     query = (
         db.query(models.User)
@@ -343,7 +368,7 @@ def get_followers(
     users = (
         query.order_by(models.Follow.created_at.desc()).offset(offset).limit(limit).all()
     )
-    items = [_to_summary(db, u, viewer.id if viewer else None) for u in users]
+    items = [_to_summary(db, u, viewer_id) for u in users]
     return schemas.PaginatedUsersResponse(total=total, limit=limit, offset=offset, items=items)
 
 
@@ -356,7 +381,9 @@ def get_following(
     viewer: models.User | None = Depends(get_current_user_optional),
 ):
     """Users that :id follows."""
-    _get_user_or_404(db, user_id)
+    target = _get_user_or_404(db, user_id)
+    viewer_id = viewer.id if viewer else None
+    _require_content_visible(db, target, viewer_id)
 
     query = (
         db.query(models.User)
@@ -367,7 +394,7 @@ def get_following(
     users = (
         query.order_by(models.Follow.created_at.desc()).offset(offset).limit(limit).all()
     )
-    items = [_to_summary(db, u, viewer.id if viewer else None) for u in users]
+    items = [_to_summary(db, u, viewer_id) for u in users]
     return schemas.PaginatedUsersResponse(total=total, limit=limit, offset=offset, items=items)
 
 
