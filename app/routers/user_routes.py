@@ -59,14 +59,45 @@ def _to_summary(db: Session, user: models.User, viewer_id: int | None) -> schema
     return summary
 
 
+def _content_counts(db: Session, user_id: int) -> tuple[int, int, int, int]:
+    """Returns (posts_count, reels_count, followers_count, following_count).
+    posts_count is total content — normal posts + reels — matching how a
+    profile's post count is usually shown on Instagram (reels count toward
+    the grid total too); reels_count stays as just reels, for whatever
+    surface shows that separately (e.g. a Reels tab count)."""
+    normal_posts_count = db.query(models.Post).filter(models.Post.user_id == user_id).count()
+    reels_count = db.query(models.Reel).filter(models.Reel.user_id == user_id).count()
+    posts_count = normal_posts_count + reels_count
+    followers_count = (
+        db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
+    )
+    following_count = (
+        db.query(models.Follow).filter(models.Follow.follower_id == user_id).count()
+    )
+    return posts_count, reels_count, followers_count, following_count
+
+
 # ==========================================================================
 # 2. User Profile
 # ==========================================================================
 
 @router.get("/api/users/{user_id}", response_model=schemas.UserProfileOut)
-def get_user_profile(user_id: int, db: Session = Depends(get_db)):
+def get_user_profile(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
     user = _get_user_or_404(db, user_id)
-    return user
+    profile = schemas.UserProfileOut.model_validate(user)
+    (
+        profile.posts_count,
+        profile.reels_count,
+        profile.followers_count,
+        profile.following_count,
+    ) = _content_counts(db, user_id)
+    if current_user is not None and current_user.id != user_id:
+        profile.is_following = _is_following(db, current_user.id, user_id)
+    return profile
 
 
 @router.put("/api/users/{user_id}", response_model=schemas.UserProfileOut)
@@ -267,19 +298,7 @@ def get_saved_posts(
 def get_user_stats(user_id: int, db: Session = Depends(get_db)):
     _get_user_or_404(db, user_id)
 
-    normal_posts_count = db.query(models.Post).filter(models.Post.user_id == user_id).count()
-    reels_count = db.query(models.Reel).filter(models.Reel.user_id == user_id).count()
-    # posts_count is total content — normal posts + reels — matching how a
-    # profile's post count is usually shown on Instagram (reels count
-    # toward the grid total too). reels_count stays as just reels, for
-    # whatever surface shows that separately (e.g. a Reels tab count).
-    posts_count = normal_posts_count + reels_count
-    followers_count = (
-        db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
-    )
-    following_count = (
-        db.query(models.Follow).filter(models.Follow.follower_id == user_id).count()
-    )
+    posts_count, reels_count, followers_count, following_count = _content_counts(db, user_id)
 
     return schemas.UserStatsOut(
         user_id=user_id,
