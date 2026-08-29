@@ -58,6 +58,8 @@ def _normalize_phone(value: str) -> str:
 def normalize_identifier(value: str) -> tuple[str, OTPChannel]:
     """Accepts an email address or a phone number and returns (normalized_value, channel)."""
     value = value.strip()
+    if not value:
+        raise ValueError("Please enter your email or phone number")
     if _EMAIL_RE.match(value):
         return value.lower(), OTPChannel.email
     return _normalize_phone(value), OTPChannel.phone
@@ -190,6 +192,8 @@ class LoginRequest(BaseModel):
     @classmethod
     def validate_identifier(cls, v: str) -> str:
         v = v.strip()
+        if not v:
+            raise ValueError("Please enter your email, phone number, or username")
 
         # Email
         if _EMAIL_RE.match(v):
@@ -297,6 +301,11 @@ class UserProfileOut(BaseModel):
     business_name: str | None = None
     business_category: str | None = None
     business_description: str | None = None
+    posts_count: int = 0
+    reels_count: int = 0
+    followers_count: int = 0
+    following_count: int = 0
+    is_following: bool = False
     created_at: datetime
 
     class Config:
