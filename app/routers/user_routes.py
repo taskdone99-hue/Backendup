@@ -5,12 +5,43 @@ from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.services.media_service import delete_media_file, save_upload_file
+from app.services.push_service import send_push
 from app.routers.content_routes import _to_post_detail
 
 router = APIRouter(tags=["users"])
 
 
 # ---- internal helpers ----
+
+def _notify_user(
+    db: Session,
+    *,
+    user_id: int,
+    actor: models.User,
+    notif_type: models.NotificationType,
+    message: str,
+    target_type: str,
+    target_id: int,
+) -> None:
+    """Best-effort notification + push. Same shape as story_routes._notify_story_owner."""
+    if actor.id == user_id:
+        return
+
+    db.add(models.Notification(
+        user_id=user_id,
+        actor_id=actor.id,
+        type=notif_type,
+        message=message,
+        target_type=target_type,
+        target_id=target_id,
+    ))
+    db.commit()
+
+    tokens = db.query(models.DeviceToken.token).filter(models.DeviceToken.user_id == user_id).all()
+    token_list = [t[0] for t in tokens]
+    if token_list:
+        send_push(token_list, title=actor.username, body=message, data={"type": target_type})
+
 
 def _get_user_or_404(db: Session, user_id: int) -> models.User:
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -333,10 +364,55 @@ def follow_user(
         )
         .first()
     )
-    if existing is None:
-        db.add(models.Follow(follower_id=current_user.id, following_id=target.id))
-        db.commit()
+    if existing is not None:
+        return schemas.FollowStatusResponse(
+            message=f"Already following {target.username}", following=True
+        )
 
+    if target.is_private:
+        # Private account: sits pending until the target accepts it via
+        # POST /api/follow-requests/{id}/accept — see FollowRequest model.
+        existing_request = (
+            db.query(models.FollowRequest)
+            .filter(
+                models.FollowRequest.requester_id == current_user.id,
+                models.FollowRequest.target_id == target.id,
+            )
+            .first()
+        )
+        if existing_request is None:
+            follow_request = models.FollowRequest(
+                requester_id=current_user.id, target_id=target.id
+            )
+            db.add(follow_request)
+            db.commit()
+            db.refresh(follow_request)
+            _notify_user(
+                db,
+                user_id=target.id,
+                actor=current_user,
+                notif_type=models.NotificationType.follow_request,
+                message=f"{current_user.username} requested to follow you",
+                target_type="follow_request",
+                target_id=follow_request.id,
+            )
+        return schemas.FollowStatusResponse(
+            message=f"Follow request sent to {target.username}",
+            following=False,
+            request_pending=True,
+        )
+
+    db.add(models.Follow(follower_id=current_user.id, following_id=target.id))
+    db.commit()
+    _notify_user(
+        db,
+        user_id=target.id,
+        actor=current_user,
+        notif_type=models.NotificationType.follow,
+        message=f"{current_user.username} started following you",
+        target_type="user",
+        target_id=current_user.id,
+    )
     return schemas.FollowStatusResponse(message=f"Now following {target.username}", following=True)
 
 
@@ -360,9 +436,117 @@ def unfollow_user(
         db.delete(existing)
         db.commit()
 
+    # Also cancels a pending request, if that's what "unfollow" meant here
+    # — matches Instagram's "Requested" button doubling as a cancel action.
+    pending = (
+        db.query(models.FollowRequest)
+        .filter(
+            models.FollowRequest.requester_id == current_user.id,
+            models.FollowRequest.target_id == target.id,
+        )
+        .first()
+    )
+    if pending is not None:
+        db.delete(pending)
+        db.commit()
+
     return schemas.FollowStatusResponse(
         message=f"Unfollowed {target.username}", following=False
     )
+
+
+@router.get("/api/follow-requests", response_model=schemas.FollowRequestsResponse)
+def get_follow_requests(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Pending requests from people who want to follow the current user."""
+    requests = (
+        db.query(models.FollowRequest)
+        .filter(models.FollowRequest.target_id == current_user.id)
+        .order_by(models.FollowRequest.created_at.desc())
+        .all()
+    )
+    items = [
+        schemas.FollowRequestOut(
+            id=r.id,
+            requester=schemas.UserSummaryOut.model_validate(r.requester),
+            created_at=r.created_at,
+        )
+        for r in requests
+    ]
+    return schemas.FollowRequestsResponse(items=items)
+
+
+def _get_follow_request_or_404(db: Session, request_id: int) -> models.FollowRequest:
+    req = db.query(models.FollowRequest).filter(models.FollowRequest.id == request_id).first()
+    if req is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Follow request not found"
+        )
+    return req
+
+
+@router.post("/api/follow-requests/{request_id}/accept", response_model=schemas.FollowStatusResponse)
+def accept_follow_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    req = _get_follow_request_or_404(db, request_id)
+    if req.target_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only respond to your own follow requests",
+        )
+
+    requester_id = req.requester_id
+    existing = (
+        db.query(models.Follow)
+        .filter(
+            models.Follow.follower_id == requester_id,
+            models.Follow.following_id == current_user.id,
+        )
+        .first()
+    )
+    if existing is None:
+        db.add(models.Follow(follower_id=requester_id, following_id=current_user.id))
+    db.delete(req)
+    db.commit()
+
+    requester = db.query(models.User).filter(models.User.id == requester_id).first()
+    if requester is not None:
+        _notify_user(
+            db,
+            user_id=requester_id,
+            actor=current_user,
+            notif_type=models.NotificationType.follow,
+            message=f"{current_user.username} accepted your follow request",
+            target_type="user",
+            target_id=current_user.id,
+        )
+
+    return schemas.FollowStatusResponse(message="Follow request accepted", following=True)
+
+
+@router.post("/api/follow-requests/{request_id}/reject", response_model=schemas.MessageResponse)
+def reject_follow_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Rejecting sends no notification to the requester — matches
+    Instagram's silent decline."""
+    req = _get_follow_request_or_404(db, request_id)
+    if req.target_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only respond to your own follow requests",
+        )
+
+    db.delete(req)
+    db.commit()
+    return schemas.MessageResponse(message="Follow request rejected")
 
 
 @router.get("/api/users/{user_id}/followers", response_model=schemas.PaginatedUsersResponse)

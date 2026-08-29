@@ -372,6 +372,23 @@ class UserSummaryOut(BaseModel):
 class FollowStatusResponse(BaseModel):
     message: str
     following: bool
+    # True when this created a pending request to a private account
+    # instead of an immediate follow — additive field, false in every
+    # case that behaves the way this endpoint always has.
+    request_pending: bool = False
+
+
+class FollowRequestOut(BaseModel):
+    id: int
+    requester: UserSummaryOut
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FollowRequestsResponse(BaseModel):
+    items: list[FollowRequestOut]
 
 
 class PaginatedUsersResponse(BaseModel):
@@ -487,7 +504,6 @@ class StoryOut(BaseModel):
     id: int
     user_id: int
     user: UserSummaryOut | None = None
-    owner: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     media_url: str
     media_type: MediaType
     caption: str | None
@@ -642,7 +658,6 @@ class LocationOut(BaseModel):
 
 class PostDetailOut(PostOut):
     user: UserSummaryOut | None = None
-    author: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     likes_count: int = 0
     comments_count: int = 0
     share_count: int = 0
@@ -767,7 +782,6 @@ class ReelDetailOut(ReelOut):
     title: str | None = None
     remixed_from_id: int | None = None
     user: UserSummaryOut | None = None
-    author: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     likes_count: int = 0
     comments_count: int = 0
     is_liked: bool = False
@@ -875,7 +889,6 @@ class CommentOut(BaseModel):
     reel_id: int | None = None
     user_id: int
     user: UserSummaryOut | None = None
-    author: UserSummaryOut | None = None  # deprecated alias for `user`, kept for backward compatibility
     parent_id: int | None
     content: str
     created_at: datetime

@@ -43,7 +43,6 @@ def _to_comment_out(
 ) -> schemas.CommentOut:
     out = schemas.CommentOut.model_validate(comment)
     out.user = schemas.UserSummaryOut.model_validate(comment.user)
-    out.author = out.user
     out.likes_count = engagement.likes_count(db, models.LikeTargetType.comment, comment.id)
     out.replies_count = engagement.replies_count(db, comment.id)
     out.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.comment, comment.id)

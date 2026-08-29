@@ -26,7 +26,6 @@ def _active_story_query(db: Session):
 def _to_story_out(story: models.Story, viewer_id: int | None) -> schemas.StoryOut:
     out = schemas.StoryOut.model_validate(story)
     out.user = schemas.UserSummaryOut.model_validate(story.user)
-    out.owner = out.user
     out.views_count = len(story.views)
     out.reactions_count = len(story.reactions)
     if viewer_id is not None:

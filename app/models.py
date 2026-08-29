@@ -66,6 +66,7 @@ class NotificationType(str, enum.Enum):
     like = "like"
     comment = "comment"
     follow = "follow"
+    follow_request = "follow_request"
     mention = "mention"
     share = "share"
     message = "message"
@@ -212,8 +213,10 @@ class RefreshToken(Base):
 
 class Follow(Base):
     """
-    A directed edge: `follower_id` follows `following_id`. No approval step
-    for private accounts is modeled here — follows are effective immediately.
+    A directed edge: `follower_id` follows `following_id`. For a private
+    account, this row only gets created once the target accepts the
+    corresponding FollowRequest below — a public account still goes
+    straight to a Follow row with no approval step, same as before.
     """
 
     __tablename__ = "follows"
@@ -228,6 +231,28 @@ class Follow(Base):
 
     follower = relationship("User", foreign_keys=[follower_id])
     following = relationship("User", foreign_keys=[following_id])
+
+
+class FollowRequest(Base):
+    """
+    A pending follow request to a private account. Only pending requests
+    are stored here — accepting one deletes the row and creates the real
+    Follow row instead; rejecting just deletes the row. There's
+    deliberately no `status` column: a row existing at all means pending.
+    """
+
+    __tablename__ = "follow_requests"
+    __table_args__ = (
+        UniqueConstraint("requester_id", "target_id", name="uq_follow_request_pair"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    target_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    requester = relationship("User", foreign_keys=[requester_id])
+    target = relationship("User", foreign_keys=[target_id])
 
 
 class Post(Base):
