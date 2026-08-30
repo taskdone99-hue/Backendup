@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -60,6 +61,27 @@ def _conversation_participant_ids(db: Session, conversation_id: int) -> list[int
     return [r[0] for r in rows]
 
 
+def _to_message_out(db: Session, message: models.Message) -> schemas.MessageOut:
+    out = schemas.MessageOut.model_validate(message)
+    if message.is_deleted:
+        out.content = "This message was deleted"
+
+    out.reactions = [
+        schemas.MessageReactionOut(user_id=r.user_id, emoji=r.emoji) for r in message.reactions
+    ]
+
+    # status: "sent" (default) until every recipient's row clears each bar.
+    recipient_statuses = (
+        db.query(models.MessageStatus).filter(models.MessageStatus.message_id == message.id).all()
+    )
+    if recipient_statuses:
+        if all(s.read_at is not None for s in recipient_statuses):
+            out.status = "read"
+        elif all(s.delivered_at is not None for s in recipient_statuses):
+            out.status = "delivered"
+    return out
+
+
 def _to_conversation_out(
     db: Session, conversation: models.Conversation, viewer_id: int | None = None
 ) -> schemas.ConversationOut:
@@ -95,7 +117,7 @@ def _to_conversation_out(
         title=conversation.title,
         created_at=conversation.created_at,
         participants=participants,
-        last_message=schemas.MessageOut.model_validate(last_message) if last_message else None,
+        last_message=_to_message_out(db, last_message) if last_message else None,
         unread_count=unread_count,
     )
 
@@ -234,6 +256,38 @@ def get_conversations(
     return schemas.ConversationsResponse(items=items)
 
 
+@router.delete("/conversations/{conversation_id}", response_model=schemas.MessageResponse)
+def delete_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Removes the conversation from the caller's own inbox — same as
+    WhatsApp/Instagram's "delete chat": the other participant(s) keep
+    their copy and their message history untouched. Implemented by
+    removing just the caller's ConversationParticipant row; once nobody
+    is left in a conversation, it (and its messages) are deleted outright.
+    """
+    _get_conversation_or_404(db, conversation_id)
+    my_participant = _get_participant_or_403(db, conversation_id, current_user.id)
+
+    db.delete(my_participant)
+    db.commit()
+
+    remaining = (
+        db.query(models.ConversationParticipant)
+        .filter(models.ConversationParticipant.conversation_id == conversation_id)
+        .count()
+    )
+    if remaining == 0:
+        conversation = _get_conversation_or_404(db, conversation_id)
+        db.delete(conversation)  # cascades messages, reactions, statuses
+        db.commit()
+
+    return schemas.MessageResponse(message="Conversation deleted")
+
+
 @router.get("/users/{user_id}/online", response_model=schemas.OnlineStatusOut)
 def get_online_status(
     user_id: int,
@@ -267,9 +321,31 @@ def get_messages(
     query = db.query(models.Message).filter(models.Message.conversation_id == conversation_id)
     total = query.count()
     # Most recent first, same convention as every other paginated feed here.
-    items = (
+    messages = (
         query.order_by(models.Message.created_at.desc()).offset(offset).limit(limit).all()
     )
+
+    # Fetching your messages counts as your device having received them —
+    # covers the case where you were offline when they were sent (send_message
+    # only marks delivered_at immediately for recipients who were online).
+    message_ids = [m.id for m in messages if m.sender_id != current_user.id]
+    if message_ids:
+        undelivered = (
+            db.query(models.MessageStatus)
+            .filter(
+                models.MessageStatus.message_id.in_(message_ids),
+                models.MessageStatus.user_id == current_user.id,
+                models.MessageStatus.delivered_at.is_(None),
+            )
+            .all()
+        )
+        if undelivered:
+            now = datetime.now(timezone.utc)
+            for s in undelivered:
+                s.delivered_at = now
+            db.commit()
+
+    items = [_to_message_out(db, m) for m in messages]
     return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
 
 
@@ -301,9 +377,22 @@ async def send_message(
     my_participant.last_read_message_id = message.id
     db.commit()
 
-    message_out = schemas.MessageOut.model_validate(message)
     participant_ids = _conversation_participant_ids(db, conversation_id)
     recipient_ids = [uid for uid in participant_ids if uid != current_user.id]
+
+    # One MessageStatus row per recipient — delivered immediately if
+    # they're online right now (the WS push below reaches them live),
+    # otherwise left null until they next fetch this conversation.
+    now = datetime.now(timezone.utc)
+    for uid in recipient_ids:
+        db.add(models.MessageStatus(
+            message_id=message.id,
+            user_id=uid,
+            delivered_at=now if manager.is_online(uid) else None,
+        ))
+    db.commit()
+
+    message_out = _to_message_out(db, message)
 
     # Live delivery to anyone with the chat open right now.
     await manager.send_to_users(
@@ -341,7 +430,7 @@ async def send_message(
             ))
         db.commit()
 
-    return message
+    return message_out
 
 
 @router.post("/conversations/{conversation_id}/read", response_model=schemas.MarkReadResponse)
@@ -365,6 +454,24 @@ async def mark_conversation_read(
         participant.last_read_message_id = latest.id
         db.commit()
 
+        now = datetime.now(timezone.utc)
+        statuses = (
+            db.query(models.MessageStatus)
+            .join(models.Message, models.Message.id == models.MessageStatus.message_id)
+            .filter(
+                models.Message.conversation_id == conversation_id,
+                models.MessageStatus.user_id == current_user.id,
+                models.MessageStatus.read_at.is_(None),
+            )
+            .all()
+        )
+        for s in statuses:
+            s.read_at = now
+            if s.delivered_at is None:
+                s.delivered_at = now  # reading implies it was delivered
+        if statuses:
+            db.commit()
+
     other_ids = [uid for uid in _conversation_participant_ids(db, conversation_id) if uid != current_user.id]
     await manager.send_to_users(
         other_ids,
@@ -379,6 +486,176 @@ async def mark_conversation_read(
     return schemas.MarkReadResponse(
         message="Marked as read", last_read_message_id=latest.id if latest else None
     )
+
+
+def _get_message_or_404(db: Session, message_id: int) -> models.Message:
+    message = db.query(models.Message).filter(models.Message.id == message_id).first()
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    return message
+
+
+@router.put("/messages/{message_id}", response_model=schemas.MessageOut)
+async def edit_message(
+    message_id: int,
+    payload: schemas.MessageEditRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = _get_message_or_404(db, message_id)
+    if message.sender_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only edit your own messages"
+        )
+    if message.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Can't edit a deleted message"
+        )
+
+    message.content = payload.content
+    message.edited_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(message)
+
+    message_out = _to_message_out(db, message)
+    other_ids = [
+        uid for uid in _conversation_participant_ids(db, message.conversation_id)
+        if uid != current_user.id
+    ]
+    await manager.send_to_users(
+        other_ids,
+        {
+            "type": "message_edited",
+            "conversation_id": message.conversation_id,
+            "message": message_out.model_dump(mode="json"),
+        },
+    )
+    return message_out
+
+
+@router.delete("/messages/{message_id}", response_model=schemas.MessageResponse)
+async def delete_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Soft delete — the row and its history stay (for moderation/audit),
+    but content is never returned again once deleted; see _to_message_out.
+    This deletes for everyone in the conversation, not just the caller."""
+    message = _get_message_or_404(db, message_id)
+    if message.sender_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only delete your own messages"
+        )
+
+    message.is_deleted = True
+    message.deleted_at = datetime.now(timezone.utc)
+    db.query(models.MessageReaction).filter(
+        models.MessageReaction.message_id == message_id
+    ).delete(synchronize_session=False)
+    db.commit()
+
+    other_ids = [
+        uid for uid in _conversation_participant_ids(db, message.conversation_id)
+        if uid != current_user.id
+    ]
+    await manager.send_to_users(
+        other_ids,
+        {
+            "type": "message_deleted",
+            "conversation_id": message.conversation_id,
+            "message_id": message_id,
+        },
+    )
+    return schemas.MessageResponse(message="Message deleted")
+
+
+@router.post("/messages/{message_id}/react", response_model=schemas.MessageOut)
+async def react_to_message(
+    message_id: int,
+    payload: schemas.MessageReactionCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = _get_message_or_404(db, message_id)
+    _require_participant(db, message.conversation_id, current_user.id)
+    if message.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Can't react to a deleted message"
+        )
+
+    existing = (
+        db.query(models.MessageReaction)
+        .filter(
+            models.MessageReaction.message_id == message_id,
+            models.MessageReaction.user_id == current_user.id,
+        )
+        .first()
+    )
+    if existing is not None:
+        existing.emoji = payload.emoji
+    else:
+        db.add(models.MessageReaction(
+            message_id=message_id, user_id=current_user.id, emoji=payload.emoji
+        ))
+    db.commit()
+    db.refresh(message)
+
+    message_out = _to_message_out(db, message)
+    other_ids = [
+        uid for uid in _conversation_participant_ids(db, message.conversation_id)
+        if uid != current_user.id
+    ]
+    await manager.send_to_users(
+        other_ids,
+        {
+            "type": "message_reaction",
+            "conversation_id": message.conversation_id,
+            "message_id": message_id,
+            "user_id": current_user.id,
+            "emoji": payload.emoji,
+        },
+    )
+    return message_out
+
+
+@router.delete("/messages/{message_id}/react", response_model=schemas.MessageOut)
+async def remove_message_reaction(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = _get_message_or_404(db, message_id)
+    _require_participant(db, message.conversation_id, current_user.id)
+
+    existing = (
+        db.query(models.MessageReaction)
+        .filter(
+            models.MessageReaction.message_id == message_id,
+            models.MessageReaction.user_id == current_user.id,
+        )
+        .first()
+    )
+    if existing is not None:
+        db.delete(existing)
+        db.commit()
+        db.refresh(message)
+
+        other_ids = [
+            uid for uid in _conversation_participant_ids(db, message.conversation_id)
+            if uid != current_user.id
+        ]
+        await manager.send_to_users(
+            other_ids,
+            {
+                "type": "message_reaction_removed",
+                "conversation_id": message.conversation_id,
+                "message_id": message_id,
+                "user_id": current_user.id,
+            },
+        )
+
+    return _to_message_out(db, message)
 
 
 # ==========================================================================
