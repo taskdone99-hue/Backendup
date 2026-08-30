@@ -1212,6 +1212,38 @@ class MessageCreate(BaseModel):
         return v
 
 
+class MessageEditRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2200)
+
+    @field_validator("content")
+    @classmethod
+    def strip_content(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Message can't be empty")
+        return v
+
+
+class MessageReactionCreate(BaseModel):
+    emoji: str = Field(..., min_length=1, max_length=16)
+
+    @field_validator("emoji")
+    @classmethod
+    def strip_emoji(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Reaction can't be empty")
+        return v
+
+
+class MessageReactionOut(BaseModel):
+    user_id: int
+    emoji: str
+
+    class Config:
+        from_attributes = True
+
+
 class MessageOut(BaseModel):
     id: int
     conversation_id: int
@@ -1219,6 +1251,13 @@ class MessageOut(BaseModel):
     content: str
     reply_to_story_id: int | None = None
     is_auto_message: bool = False
+    edited_at: datetime | None = None
+    is_deleted: bool = False
+    reactions: list[MessageReactionOut] = []
+    # "sent" | "delivered" | "read" — see models.MessageStatus. Always
+    # "sent" from the sender's own point of view isn't tracked separately;
+    # this reflects the furthest state any recipient has reached.
+    status: str = "sent"
     created_at: datetime
 
     class Config:

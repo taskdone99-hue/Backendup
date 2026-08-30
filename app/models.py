@@ -854,10 +854,68 @@ class Message(Base):
     # conversation (see chat_routes.create_conversation) — lets a client
     # style/skip it differently from a message the sender actually typed.
     is_auto_message = Column(Boolean, default=False, nullable=False)
+    edited_at = Column(DateTime(timezone=True), nullable=True)
+    # Soft delete — the row (and its history) stays for moderation/audit,
+    # but the API never returns `content` once this is set; see
+    # chat_routes._to_message_out. Keeps other participants' message
+    # ordering/reply context intact instead of leaving a hole.
+    is_deleted = Column(Boolean, default=False, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")
     sender = relationship("User", foreign_keys=[sender_id])
+    reactions = relationship(
+        "MessageReaction", back_populates="message", cascade="all, delete-orphan"
+    )
+    statuses = relationship(
+        "MessageStatus", back_populates="message", cascade="all, delete-orphan"
+    )
+
+
+class MessageReaction(Base):
+    """A single emoji reaction from `user_id` on `message_id` — one per
+    (message, user); re-tapping replaces the emoji, same convention as
+    StoryReaction."""
+
+    __tablename__ = "message_reactions"
+    __table_args__ = (
+        UniqueConstraint("message_id", "user_id", name="uq_message_reaction"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    emoji = Column(String(16), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    message = relationship("Message", back_populates="reactions")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class MessageStatus(Base):
+    """
+    Per-recipient delivery/read tracking for one message — one row per
+    (message, recipient). Powers the sent/delivered/read indicator:
+    a message with no rows yet (or none delivered) is "sent"; once every
+    recipient's row has delivered_at it's "delivered"; once every
+    recipient's row has read_at it's "read". The sender doesn't get a row
+    for their own message.
+    """
+
+    __tablename__ = "message_statuses"
+    __table_args__ = (
+        UniqueConstraint("message_id", "user_id", name="uq_message_status"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+
+    message = relationship("Message", back_populates="statuses")
+    user = relationship("User", foreign_keys=[user_id])
 
 
 # ==========================================================================
