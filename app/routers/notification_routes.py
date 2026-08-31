@@ -51,6 +51,32 @@ def mark_notification_read(
     return schemas.NotificationReadResponse(message="Notification marked as read", notification=notification)
 
 
+@router.delete("/{notification_id}", response_model=schemas.MessageResponse)
+def delete_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    notification = (
+        db.query(models.Notification)
+        .filter(models.Notification.id == notification_id)
+        .first()
+    )
+    if notification is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found"
+        )
+    if notification.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own notifications",
+        )
+
+    db.delete(notification)
+    db.commit()
+    return schemas.MessageResponse(message="Notification deleted successfully")
+
+
 @router.post("/device-token", response_model=schemas.DeviceTokenResponse, status_code=status.HTTP_201_CREATED)
 def register_device_token(
     payload: schemas.DeviceTokenRequest,
