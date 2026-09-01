@@ -128,6 +128,16 @@ def get_user_profile(
     ) = _content_counts(db, user_id)
     if current_user is not None and current_user.id != user_id:
         profile.is_following = _is_following(db, current_user.id, user_id)
+        profile.is_followed_by = _is_following(db, user_id, current_user.id)
+        profile.request_pending = (
+            db.query(models.FollowRequest)
+            .filter(
+                models.FollowRequest.requester_id == current_user.id,
+                models.FollowRequest.target_id == user_id,
+            )
+            .first()
+            is not None
+        )
     return profile
 
 

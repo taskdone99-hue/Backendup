@@ -306,6 +306,10 @@ class UserProfileOut(BaseModel):
     followers_count: int = 0
     following_count: int = 0
     is_following: bool = False
+    # Both only meaningful relative to the logged-in viewer (false/false for
+    # an anonymous request, or when viewing your own profile).
+    is_followed_by: bool = False  # this user follows the viewer back
+    request_pending: bool = False  # viewer has a follow request awaiting this user's response
     created_at: datetime
 
     class Config:
