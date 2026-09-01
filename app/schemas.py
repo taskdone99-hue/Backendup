@@ -366,6 +366,11 @@ class UserSummaryOut(BaseModel):
     full_name: str | None
     avatar_url: str | None
     is_following: bool = False
+    # Only populated where the caller needs the reverse direction too (e.g.
+    # the follow-requests inbox, for Follow/Follow-Back/Following states).
+    # Defaults to False everywhere else — unchanged behavior for existing
+    # callers of this shape.
+    is_followed_by: bool = False
 
     class Config:
         from_attributes = True

@@ -477,14 +477,21 @@ def get_follow_requests(
         .order_by(models.FollowRequest.created_at.desc())
         .all()
     )
-    items = [
-        schemas.FollowRequestOut(
-            id=r.id,
-            requester=schemas.UserSummaryOut.model_validate(r.requester),
-            created_at=r.created_at,
+    items = []
+    for r in requests:
+        requester_summary = schemas.UserSummaryOut.model_validate(r.requester)
+        # Independent lookups, both directions — is_following (viewer ->
+        # requester) and is_followed_by (requester -> viewer) — so the
+        # frontend can tell Follow / Follow Back / Following apart.
+        requester_summary.is_following = _is_following(db, current_user.id, r.requester_id)
+        requester_summary.is_followed_by = _is_following(db, r.requester_id, current_user.id)
+        items.append(
+            schemas.FollowRequestOut(
+                id=r.id,
+                requester=requester_summary,
+                created_at=r.created_at,
+            )
         )
-        for r in requests
-    ]
     return schemas.FollowRequestsResponse(items=items)
 
 

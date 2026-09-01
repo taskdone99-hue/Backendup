@@ -449,6 +449,99 @@ r = check("GET /api/notifications (shape unchanged)", client.get(
 body = r.json()
 assert set(("total", "unread_count", "limit", "offset", "items")).issubset(body.keys())
 
+# 28. Home Feed — public users' posts appear without following (Prasanna/user 22 case)
+prasanna = models.User(username="prasanna", full_name="Prasanna", is_phone_verified=True)
+public_stranger = models.User(username="public_stranger_22", full_name="Public Stranger", is_phone_verified=True)
+db.add_all([prasanna, public_stranger])
+db.commit()
+db.refresh(prasanna)
+db.refresh(public_stranger)
+token_prasanna = create_access_token({"sub": str(prasanna.id)})
+h_prasanna = {"Authorization": f"Bearer {token_prasanna}"}
+
+public_post = models.Post(
+    user_id=public_stranger.id, caption="public post", media_url="/static/pub22.jpg",
+    media_type=models.MediaType.image,
+)
+db.add(public_post)
+db.commit()
+db.refresh(public_post)
+
+# Prasanna does NOT follow public_stranger
+r = check("GET /api/users/{id} (prasanna viewing public_stranger, not following)", client.get(
+    f"/api/users/{public_stranger.id}", headers=h_prasanna
+), 200)
+assert r.json()["is_following"] is False
+
+r = check("GET /api/posts/feed (public user's post visible without follow)", client.get(
+    "/api/posts/feed", headers=h_prasanna
+), 200)
+feed_body = r.json()
+feed_post_ids = {item["id"] for item in feed_body["items"]}
+assert public_post.id in feed_post_ids, "public user's post missing from home feed for a non-follower"
+print("  home feed (prasanna, no follow) includes public post:", public_post.id in feed_post_ids)
+
+# Private, non-followed account's post must NOT appear in the home feed
+r = check("GET /api/posts/feed (private, non-follower excludes private post)", client.get(
+    "/api/posts/feed", headers=h_prasanna
+), 200)
+feed_post_ids = {item["id"] for item in r.json()["items"]}
+assert priv_post.id not in feed_post_ids, "private user's post leaked into home feed for a non-follower"
+
+# Own posts and followed users' posts still show up (u2/rahul follows u1/anjali)
+r = check("GET /api/posts/feed (u2: own + followed still visible)", client.get(
+    "/api/posts/feed", headers=h2
+), 200)
+u2_feed_ids = {item["id"] for item in r.json()["items"]}
+assert post.id in u2_feed_ids, "u1's post (followed by u2) missing from u2's home feed"
+
+# A pending follow request must NOT grant home-feed access to a private account's posts
+r = check("POST /api/follow/{id} (prasanna -> u_private) -> request_pending", client.post(
+    f"/api/follow/{u_private.id}", headers=h_prasanna
+), 200)
+assert r.json()["request_pending"] is True
+r = check("GET /api/posts/feed (pending request still excludes private post)", client.get(
+    "/api/posts/feed", headers=h_prasanna
+), 200)
+feed_post_ids = {item["id"] for item in r.json()["items"]}
+assert priv_post.id not in feed_post_ids, "private post leaked into home feed despite only a pending follow request"
+
+# Response shape (pagination/counts) unchanged
+assert set(("total", "limit", "offset", "items")).issubset(feed_body.keys())
+
+# 29. Follow Requests — is_following / is_followed_by returned independently
+# One-way: prasanna -> u_private is pending; u_private does not follow prasanna back.
+r = check("GET /api/follow-requests (u_private, one-way case)", client.get(
+    "/api/follow-requests", headers=h_priv
+), 200)
+reqs = r.json()["items"]
+prasanna_req = next(item for item in reqs if item["requester"]["username"] == "prasanna")
+assert prasanna_req["requester"]["is_following"] is False  # u_private doesn't follow prasanna
+assert prasanna_req["requester"]["is_followed_by"] is False  # prasanna's request is still pending, not an actual follow
+print("  follow-request (one-way):", prasanna_req["requester"])
+
+# Follow-Back case: u_private already follows prasanna (mutual-follow direction check)
+client.post(f"/api/follow/{prasanna.id}", headers=h_priv)
+r = check("GET /api/follow-requests (u_private, follow-back case)", client.get(
+    "/api/follow-requests", headers=h_priv
+), 200)
+reqs = r.json()["items"]
+prasanna_req = next(item for item in reqs if item["requester"]["username"] == "prasanna")
+assert prasanna_req["requester"]["is_following"] is True  # u_private now follows prasanna -> "Follow Back" UI
+assert prasanna_req["requester"]["is_followed_by"] is False  # prasanna's follow of u_private is still just a pending request
+print("  follow-request (follow-back):", prasanna_req["requester"])
+client.delete(f"/api/follow/{prasanna.id}", headers=h_priv)  # reset
+
+# 30. Profile API — is_following/is_followed_by/request_pending stay independent
+r = check("GET /api/users/{id} (prasanna viewing u_private, pending + mutual check)", client.get(
+    f"/api/users/{u_private.id}", headers=h_prasanna
+), 200)
+prof = r.json()
+assert prof["is_following"] is False
+assert prof["is_followed_by"] is False
+assert prof["request_pending"] is True
+print("  profile (prasanna -> u_private, pending):", {k: prof[k] for k in ("is_following", "is_followed_by", "request_pending")})
+
 print()
 print("=" * 60)
 all_pass = all(ok for _, _, ok in results)

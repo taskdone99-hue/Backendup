@@ -302,9 +302,14 @@ def get_home_feed(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Posts from people the current user follows, plus their own, newest first."""
-    author_ids = _following_ids(db, current_user.id) + [current_user.id]
-    query = db.query(models.Post).filter(models.Post.user_id.in_(author_ids))
+    """
+    Posts from public accounts, people the current user follows, and their
+    own posts — newest first. A private account's posts only show up here
+    once the viewer is an approved follower (a pending FollowRequest does
+    not count — see _visible_authors_clause / models.FollowRequest).
+    """
+    query = db.query(models.Post).join(models.User, models.Post.user_id == models.User.id)
+    query = query.filter(_visible_authors_clause(db, current_user.id))
     total = query.count()
     posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_post_detail(db, p, current_user.id) for p in posts]
