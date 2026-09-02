@@ -542,6 +542,110 @@ assert prof["is_followed_by"] is False
 assert prof["request_pending"] is True
 print("  profile (prasanna -> u_private, pending):", {k: prof[k] for k in ("is_following", "is_followed_by", "request_pending")})
 
+# 31. Notifications WebSocket — real-time delivery
+# Connect as u1 (anjali); u3 (noavatar) follows u1 over REST while the socket
+# is open, and the "connected" + "notification" events must arrive live.
+with client.websocket_connect(f"/api/notifications/ws?token={token1}") as ws:
+    connected_evt = ws.receive_json()
+    ok = connected_evt.get("type") == "connected" and "unread_count" in connected_evt
+    results.append(("WS /api/notifications/ws -> connected event", "n/a", ok))
+    print(f"{'PASS' if ok else 'FAIL'} | WS connected event -> {connected_evt}")
+
+    client.delete(f"/api/follow/{u1.id}", headers=h3)  # in case u3 already follows u1
+    r = client.post(f"/api/follow/{u1.id}", headers=h3)  # triggers notify_user -> WS push
+    assert r.status_code == 200
+
+    notif_evt = ws.receive_json()
+    ok = (
+        notif_evt.get("type") == "notification"
+        and notif_evt["notification"]["type"] == "follow"
+        and notif_evt["notification"]["actor_id"] == u3.id
+        and "noavatar" in notif_evt["notification"]["message"]
+    )
+    results.append(("WS /api/notifications/ws -> live notification push", "n/a", ok))
+    print(f"{'PASS' if ok else 'FAIL'} | WS live notification -> {notif_evt}")
+
+    # Same shape as a GET /api/notifications item
+    assert set(notif_evt["notification"].keys()) == {
+        "id", "type", "actor_id", "message", "target_type", "target_id", "is_read", "created_at",
+    }, notif_evt["notification"]
+
+    ws.send_json({"type": "ping"})
+    pong = ws.receive_json()
+    ok = pong == {"type": "pong"}
+    results.append(("WS /api/notifications/ws -> ping/pong", "n/a", ok))
+    print(f"{'PASS' if ok else 'FAIL'} | WS ping/pong -> {pong}")
+
+# It was also persisted normally — GET /api/notifications is unaffected by the WS push
+r = check("GET /api/notifications (u1, after WS-delivered follow)", client.get(
+    "/api/notifications", headers=h1
+), 200)
+follow_notifs = [n for n in r.json()["items"] if n["type"] == "follow" and n["actor_id"] == u3.id]
+assert follow_notifs, "WS-delivered notification was not also persisted to the DB"
+
+# 31b. Dedicated regression test for the traced flow:
+# POST /api/follow/{user_id} -> notify_user() -> notification_manager.send_to_user()
+# User A connects to /api/notifications/ws; User B then sends User A a FOLLOW REQUEST
+# (User A's account is private, so this exercises the follow_request path, not the
+# plain-follow path already covered above). User A must receive the WS notification
+# event immediately -- no polling/sleeping, just the next message on the open socket --
+# and the notification must also be durably persisted via GET /api/notifications.
+user_a = models.User(username="user_a_wstest", full_name="User A", is_phone_verified=True, is_private=True)
+user_b = models.User(username="user_b_wstest", full_name="User B", is_phone_verified=True)
+db.add_all([user_a, user_b])
+db.commit()
+db.refresh(user_a)
+db.refresh(user_b)
+token_a = create_access_token({"sub": str(user_a.id)})
+token_b = create_access_token({"sub": str(user_b.id)})
+h_a = {"Authorization": f"Bearer {token_a}"}
+h_b = {"Authorization": f"Bearer {token_b}"}
+
+with client.websocket_connect(f"/api/notifications/ws?token={token_a}") as ws_a:
+    connected_evt = ws_a.receive_json()
+    ok = connected_evt.get("type") == "connected"
+    results.append(("WS User A connects to /api/notifications/ws", "n/a", ok))
+    print(f"{'PASS' if ok else 'FAIL'} | User A connected -> {connected_evt}")
+
+    # Trace point 1: POST /api/follow/{user_id} (User B -> User A, private account)
+    r = client.post(f"/api/follow/{user_a.id}", headers=h_b)
+    assert r.status_code == 200 and r.json()["request_pending"] is True, r.json()
+
+    # Trace point 2-4: notification_service.notify_user() creates the row, then
+    # pushes it via notification_manager -> the connection registered for User A's
+    # user_id. Assert User A receives it immediately on the already-open socket.
+    notif_evt = ws_a.receive_json()
+    ok = (
+        notif_evt.get("type") == "notification"
+        and notif_evt["notification"]["type"] == "follow_request"
+        and notif_evt["notification"]["actor_id"] == user_b.id
+        and "user_b_wstest" in notif_evt["notification"]["message"]
+    )
+    results.append(("WS User A receives live follow-request notification from User B", "n/a", ok))
+    print(f"{'PASS' if ok else 'FAIL'} | User A live notification -> {notif_evt}")
+    live_notification_id = notif_evt["notification"]["id"]
+
+# Trace point: verify DB persistence independently of the WebSocket delivery
+r = check("GET /api/notifications (User A, DB persistence check)", client.get(
+    "/api/notifications", headers=h_a
+), 200)
+persisted = [n for n in r.json()["items"] if n["id"] == live_notification_id]
+assert persisted, "notification delivered over WS was not found via GET /api/notifications"
+assert persisted[0]["type"] == "follow_request"
+assert persisted[0]["actor_id"] == user_b.id
+print("  persisted notification:", persisted[0])
+
+# Invalid/missing token -> connection closed with 4401
+try:
+    with client.websocket_connect("/api/notifications/ws?token=not-a-real-token") as ws:
+        ws.receive_json()
+    ws_auth_ok = False
+except Exception as e:
+    # starlette's test client raises WebSocketDisconnect with the close code
+    ws_auth_ok = getattr(e, "code", None) == 4401
+results.append(("WS /api/notifications/ws (bad token) -> closes 4401", "n/a", ws_auth_ok))
+print(f"{'PASS' if ws_auth_ok else 'FAIL'} | WS bad token close code check")
+
 print()
 print("=" * 60)
 all_pass = all(ok for _, _, ok in results)
