@@ -69,3 +69,9 @@ class ConnectionManager:
 
 # One shared instance for the whole process — imported by chat_routes.
 manager = ConnectionManager()
+
+# Separate registry for the notifications WebSocket (app/routers/notification_routes.py).
+# Kept distinct from `manager` above so a client can open just a notifications
+# socket without also opening (or being affected by) the chat socket, and
+# vice versa — connecting to one never registers a connection on the other.
+notification_manager = ConnectionManager()
