@@ -31,6 +31,16 @@ class ConnectionManager:
             self._connections.setdefault(user_id, []).append(websocket)
         return was_offline
 
+    async def register(self, user_id: int, websocket: WebSocket) -> None:
+        """Registers a socket that the caller has *already* accepted, without
+        calling accept() again. Use this when auth needs to happen after the
+        handshake instead of rejecting the handshake itself — see
+        notification_routes.notifications_websocket, where accepting first
+        avoids a real ASGI server (uvicorn) collapsing a pre-accept close()
+        into a generic HTTP 403 that discards the intended close code."""
+        async with self._lock:
+            self._connections.setdefault(user_id, []).append(websocket)
+
     async def disconnect(self, user_id: int, websocket: WebSocket) -> bool:
         """Unregisters the socket. Returns True if the user has no other
         open connections left (i.e. they just went offline)."""

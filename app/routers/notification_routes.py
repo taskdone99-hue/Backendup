@@ -1,9 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status,
+)
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app import models, schemas
-from app.auth import get_current_user
+from app.auth import get_current_user, get_user_from_raw_token
+from app.ws_manager import notification_manager
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 
@@ -111,3 +114,97 @@ def register_device_token(
     return schemas.DeviceTokenResponse(
         message="Device token registered", token=payload.token, platform=payload.platform
     )
+
+
+# ==========================================================================
+# WebSocket — real-time notification delivery
+# ==========================================================================
+#
+# Connect with:  ws(s)://<host>/api/notifications/ws?token=<access_token>
+#
+# Same access token you already use for REST calls — it travels as a query
+# parameter because the browser/mobile WebSocket APIs can't set a custom
+# Authorization header (same reason the chat socket at /api/chat/ws does
+# this). The connection is closed with code 4401 if the token is missing,
+# expired, or invalid.
+#
+# This socket is separate from the chat socket (/api/chat/ws) — connecting
+# to one doesn't register you on the other, and you can hold either or both
+# open at once.
+#
+# Client -> server messages (JSON):
+#   {"type": "ping"}
+#
+# Server -> client messages (JSON):
+#   {"type": "connected", "unread_count": 3}                     -- sent once, right after connecting
+#   {"type": "notification", "notification": {...NotificationOut}}   -- pushed the instant a new notification is created
+#   {"type": "pong"}
+#   {"type": "error", "detail": "..."}
+#
+# The `notification` object is exactly the same shape as an item in
+# GET /api/notifications' `items` list:
+#   {
+#     "id": 42,
+#     "type": "follow" | "follow_request" | "like" | "comment" | "mention" | "share" | "message" | "other",
+#     "actor_id": 7,
+#     "message": "prasanna started following you",
+#     "target_type": "user" | "story" | "follow_request" | ...,
+#     "target_id": 7,
+#     "is_read": false,
+#     "created_at": "2026-09-02T10:15:00"
+#   }
+#
+# This is purely additive delivery — the notification is always written to
+# the DB first (unchanged GET /api/notifications behavior), and an FCM push
+# is also sent to every registered device (see POST /device-token above and
+# app/services/push_service.py) so notifications still arrive when the app
+# is backgrounded or fully closed, i.e. not connected to this socket at all.
+
+@router.websocket("/ws")
+async def notifications_websocket(websocket: WebSocket, token: str = Query(...)):
+    # Accept the handshake *before* authenticating. Per the ASGI spec, if an
+    # app's first response is `websocket.close` (i.e. we reject before ever
+    # accepting), a real ASGI server is required to answer with a generic
+    # HTTP rejection — uvicorn sends a plain 403 and discards whatever close
+    # code we passed. That's what was producing a 403 at the handshake here:
+    # any early rejection (bad/expired token, or even a transient error
+    # while looking the token up) surfaced as 403 instead of a proper
+    # WebSocket close(4401) — and it also meant a valid connection was never
+    # guaranteed to make it past that same pre-accept window cleanly.
+    # Accepting unconditionally first, then closing with 4401 *after* the
+    # handshake if auth fails, makes both paths deterministic: valid tokens
+    # always connect and get "connected", invalid ones always get a real
+    # WebSocket close(4401) that every WS client can observe (never a 403).
+    await websocket.accept()
+    db = SessionLocal()
+    try:
+        user = get_user_from_raw_token(token, db)
+        if user is None:
+            await websocket.close(code=4401)
+            return
+
+        user_id = user.id
+        await notification_manager.register(user_id, websocket)
+
+        unread_count = (
+            db.query(models.Notification)
+            .filter(models.Notification.user_id == user_id, models.Notification.is_read.is_(False))
+            .count()
+        )
+        await websocket.send_json({"type": "connected", "unread_count": unread_count})
+
+        try:
+            while True:
+                data = await websocket.receive_json()
+                if data.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+                else:
+                    await websocket.send_json(
+                        {"type": "error", "detail": f"Unknown event type '{data.get('type')}'"}
+                    )
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await notification_manager.disconnect(user_id, websocket)
+    finally:
+        db.close()
