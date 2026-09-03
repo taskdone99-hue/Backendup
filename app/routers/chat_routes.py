@@ -11,7 +11,7 @@ from app.database import get_db, SessionLocal
 from app import models, schemas
 from app.auth import get_current_user, get_user_from_raw_token
 from app.ws_manager import manager
-from app.services.push_service import send_push
+from app.services.notification_service import notify_user
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -400,35 +400,31 @@ async def send_message(
         {"type": "message", "conversation_id": conversation_id, "message": message_out.model_dump(mode="json")},
     )
 
-    # Push notification for recipients who are NOT currently connected —
-    # they won't see the WebSocket event above, so this is how they find
-    # out. No-ops cleanly if FCM isn't configured (see push_service).
+    # Notification for recipients who are NOT currently connected to the
+    # chat socket — they won't see the "message" WS event above, so this is
+    # how they find out. Routed through notify_user() (the same fan-out
+    # used by follow/follow-request/story notifications) so it: (1) writes
+    # the Notification row, (2) pushes a live
+    # {"type":"notification","notification":{...}} event to their
+    # notifications-socket connection if they have one open, and (3) sends
+    # an FCM push to their devices. Previously this block only did (1) and
+    # (3) directly, which is why a recipient connected to
+    # /api/notifications/ws but not /api/chat/ws never got a live push for
+    # a new message — notify_user() closes that gap.
     offline_ids = [uid for uid in recipient_ids if not manager.is_online(uid)]
     if offline_ids:
-        tokens = (
-            db.query(models.DeviceToken.token)
-            .filter(models.DeviceToken.user_id.in_(offline_ids))
-            .all()
-        )
-        token_list = [t[0] for t in tokens]
-        if token_list:
-            preview = payload.content if len(payload.content) <= 80 else payload.content[:77] + "..."
-            send_push(
-                token_list,
-                title=current_user.username,
-                body=preview,
-                data={"type": "message", "conversation_id": str(conversation_id)},
-            )
+        preview = payload.content if len(payload.content) <= 80 else payload.content[:77] + "..."
         for uid in offline_ids:
-            db.add(models.Notification(
+            await notify_user(
+                db,
                 user_id=uid,
-                actor_id=current_user.id,
-                type=models.NotificationType.message,
+                actor=current_user,
+                notif_type=models.NotificationType.message,
                 message=f"{current_user.username} sent you a message",
                 target_type="conversation",
                 target_id=conversation_id,
-            ))
-        db.commit()
+                push_body=preview,
+            )
 
     return message_out
 

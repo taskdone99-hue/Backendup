@@ -38,9 +38,14 @@ async def notify_user(
     message: str,
     target_type: str,
     target_id: int,
+    push_body: str | None = None,
 ) -> models.Notification | None:
     """Create a notification for `user_id` and fan it out. No-op if the
-    actor is notifying themselves (e.g. can't follow-request yourself)."""
+    actor is notifying themselves (e.g. can't follow-request yourself).
+
+    `message` is used for the DB row and the WS payload. `push_body`, if
+    given, is used for the FCM push body instead (e.g. a message preview) —
+    defaults to `message` when omitted."""
     if actor.id == user_id:
         return None
 
@@ -80,7 +85,7 @@ async def notify_user(
                 send_push,
                 tokens,
                 title=actor.username,
-                body=message,
+                body=push_body or message,
                 data={
                     "type": notification.type.value,
                     "notification_id": str(notification.id),

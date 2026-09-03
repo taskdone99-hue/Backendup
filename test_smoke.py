@@ -635,6 +635,64 @@ assert persisted[0]["type"] == "follow_request"
 assert persisted[0]["actor_id"] == user_b.id
 print("  persisted notification:", persisted[0])
 
+# 31c. Chat-message notification -> notifications WebSocket.
+# This is the path that previously bypassed notify_user() (it built the
+# Notification row and FCM push directly in chat_routes.send_message),
+# so a recipient connected to /api/notifications/ws but NOT to
+# /api/chat/ws never got a live push for a new message. User A is
+# connected to the notifications socket ONLY (never opens /api/chat/ws),
+# User B sends them a chat message over REST, and User A must receive
+# the live {"type":"notification","notification":{"type":"message",...}}
+# event -- not just a bump in unread_count.
+r = check("POST /api/chat/conversations (User B -> User A)", client.post(
+    "/api/chat/conversations", headers=h_b, json={"participant_ids": [user_a.id]}
+), 201)
+conversation_id = r.json()["id"]
+
+r = check("GET /api/notifications (User A, unread_count before message)", client.get(
+    "/api/notifications", headers=h_a
+), 200)
+unread_before = r.json()["unread_count"]
+
+with client.websocket_connect(f"/api/notifications/ws?token={token_a}") as ws_a:
+    connected_evt = ws_a.receive_json()
+    assert connected_evt["type"] == "connected"
+
+    # User A is deliberately NOT connected to /api/chat/ws here -- that's
+    # the exact condition (offline_ids in send_message) that used to skip
+    # notification_manager entirely.
+    r = client.post(
+        f"/api/chat/conversations/{conversation_id}/messages",
+        headers=h_b,
+        json={"content": "hey User A, see this live?"},
+    )
+    assert r.status_code == 201, r.json()
+
+    notif_evt = ws_a.receive_json()
+    ok = (
+        notif_evt.get("type") == "notification"
+        and notif_evt["notification"]["type"] == "message"
+        and notif_evt["notification"]["actor_id"] == user_b.id
+        and notif_evt["notification"]["target_type"] == "conversation"
+        and notif_evt["notification"]["target_id"] == conversation_id
+    )
+    results.append(("WS User A receives live chat-message notification from User B", "n/a", ok))
+    print(f"{'PASS' if ok else 'FAIL'} | User A live chat-message notification -> {notif_evt}")
+    chat_notification_id = notif_evt["notification"]["id"]
+
+# Prove it's the *event*, not just a count bump: assert the exact row by id,
+# and separately assert unread_count actually moved (both must hold).
+r = check("GET /api/notifications (User A, chat-message DB persistence)", client.get(
+    "/api/notifications", headers=h_a
+), 200)
+body = r.json()
+persisted = [n for n in body["items"] if n["id"] == chat_notification_id]
+assert persisted, "chat-message notification delivered over WS was not found via GET /api/notifications"
+assert persisted[0]["type"] == "message"
+assert persisted[0]["actor_id"] == user_b.id
+assert body["unread_count"] == unread_before + 1
+print("  persisted chat-message notification:", persisted[0])
+
 # Invalid/missing token -> connection closed with 4401
 try:
     with client.websocket_connect("/api/notifications/ws?token=not-a-real-token") as ws:
