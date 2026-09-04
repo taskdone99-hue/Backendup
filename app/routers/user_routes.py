@@ -5,42 +5,13 @@ from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.services.media_service import delete_media_file, save_upload_file
-from app.services.push_service import send_push
+from app.services.notification_service import notify_user
 from app.routers.content_routes import _to_post_detail
 
 router = APIRouter(tags=["users"])
 
 
 # ---- internal helpers ----
-
-def _notify_user(
-    db: Session,
-    *,
-    user_id: int,
-    actor: models.User,
-    notif_type: models.NotificationType,
-    message: str,
-    target_type: str,
-    target_id: int,
-) -> None:
-    """Best-effort notification + push. Same shape as story_routes._notify_story_owner."""
-    if actor.id == user_id:
-        return
-
-    db.add(models.Notification(
-        user_id=user_id,
-        actor_id=actor.id,
-        type=notif_type,
-        message=message,
-        target_type=target_type,
-        target_id=target_id,
-    ))
-    db.commit()
-
-    tokens = db.query(models.DeviceToken.token).filter(models.DeviceToken.user_id == user_id).all()
-    token_list = [t[0] for t in tokens]
-    if token_list:
-        send_push(token_list, title=actor.username, body=message, data={"type": target_type})
 
 
 def _get_user_or_404(db: Session, user_id: int) -> models.User:
@@ -355,7 +326,7 @@ def get_user_stats(user_id: int, db: Session = Depends(get_db)):
 # ==========================================================================
 
 @router.post("/api/follow/{user_id}", response_model=schemas.FollowStatusResponse)
-def follow_user(
+async def follow_user(
     user_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -397,7 +368,7 @@ def follow_user(
             db.add(follow_request)
             db.commit()
             db.refresh(follow_request)
-            _notify_user(
+            await notify_user(
                 db,
                 user_id=target.id,
                 actor=current_user,
@@ -414,7 +385,7 @@ def follow_user(
 
     db.add(models.Follow(follower_id=current_user.id, following_id=target.id))
     db.commit()
-    _notify_user(
+    await notify_user(
         db,
         user_id=target.id,
         actor=current_user,
@@ -505,7 +476,7 @@ def _get_follow_request_or_404(db: Session, request_id: int) -> models.FollowReq
 
 
 @router.post("/api/follow-requests/{request_id}/accept", response_model=schemas.FollowStatusResponse)
-def accept_follow_request(
+async def accept_follow_request(
     request_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -533,7 +504,7 @@ def accept_follow_request(
 
     requester = db.query(models.User).filter(models.User.id == requester_id).first()
     if requester is not None:
-        _notify_user(
+        await notify_user(
             db,
             user_id=requester_id,
             actor=current_user,

@@ -314,6 +314,54 @@ r = check("POST /api/follow-requests/{id}/accept", client.post(
 ), 200)
 assert r.json()["following"] is True
 
+# Reject flow, on a fresh pair so it doesn't touch u2/u_private's now-accepted follow.
+u_reject_target = models.User(username="reject_target", full_name="Reject Target", is_phone_verified=True, is_private=True)
+u_reject_requester = models.User(username="reject_requester", full_name="Reject Requester", is_phone_verified=True)
+db.add_all([u_reject_target, u_reject_requester])
+db.commit()
+db.refresh(u_reject_target)
+db.refresh(u_reject_requester)
+token_reject_target = create_access_token({"sub": str(u_reject_target.id)})
+token_reject_requester = create_access_token({"sub": str(u_reject_requester.id)})
+h_reject_target = {"Authorization": f"Bearer {token_reject_target}"}
+h_reject_requester = {"Authorization": f"Bearer {token_reject_requester}"}
+
+r = check("POST /api/follow/{id} (for reject-flow test) -> request_pending", client.post(
+    f"/api/follow/{u_reject_target.id}", headers=h_reject_requester
+), 200)
+assert r.json()["request_pending"] is True
+
+r = check("GET /api/follow-requests (u_reject_target, before reject)", client.get(
+    "/api/follow-requests", headers=h_reject_target
+), 200)
+reject_pending = r.json()["items"]
+assert reject_pending and reject_pending[0]["requester"]["username"] == "reject_requester"
+reject_request_id = reject_pending[0]["id"]
+
+r = check("POST /api/follow-requests/{id}/reject", client.post(
+    f"/api/follow-requests/{reject_request_id}/reject", headers=h_reject_target
+), 200)
+assert r.json()["message"] == "Follow request rejected"
+
+# Rejected -> not a follower, and the request is gone from the pending list
+r = check("GET /api/follow-requests (u_reject_target, after reject) -> empty", client.get(
+    "/api/follow-requests", headers=h_reject_target
+), 200)
+assert r.json()["items"] == []
+r = check("GET /api/users/{id} (u_reject_requester -> u_reject_target, after reject)", client.get(
+    f"/api/users/{u_reject_target.id}", headers=h_reject_requester
+), 200)
+after_reject = r.json()
+assert after_reject["is_following"] is False
+assert after_reject["request_pending"] is False
+
+# Rejecting sends no notification to the requester -- matches Instagram's silent decline.
+r = check("GET /api/notifications (u_reject_requester, reject is silent)", client.get(
+    "/api/notifications", headers=h_reject_requester
+), 200)
+reject_notifs = [n for n in r.json()["items"] if n["actor_id"] == u_reject_target.id]
+assert not reject_notifs, "reject_follow_request must not notify the requester"
+
 # Now u2 is an actual follower and can see the private content
 r = check("GET /api/users/{id}/posts (private, follower) -> 200", client.get(
     f"/api/users/{u_private.id}/posts", headers=h2
