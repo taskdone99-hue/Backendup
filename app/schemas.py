@@ -127,6 +127,22 @@ class OTPResponse(BaseModel):
     debug_otp: str | None = None
 
 
+# ---- MSG91 OTP Widget verification ----
+
+class MSG91VerifyTokenRequest(BaseModel):
+    """
+    Sent by the frontend once the MSG91 OTP Widget has completed its own
+    client-side send-OTP/verify-OTP flow and returned a short-lived
+    access-token. The backend never sees the OTP itself — only this
+    token, which it exchanges with MSG91's verifyAccessToken API for the
+    verified phone number (or email) before issuing our own JWT.
+    """
+    access_token: str = Field(
+        min_length=1,
+        description="Access token returned by the MSG91 OTP Widget after client-side verification",
+    )
+
+
 # ---- Username availability ----
 
 class CheckUsernameRequest(BaseModel):

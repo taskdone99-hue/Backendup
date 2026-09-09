@@ -8,3 +8,4 @@ pydantic==2.9.2
 python-multipart==0.0.9
 phonenumbers==8.13.45
 bcrypt==4.2.0
+requests==2.32.3

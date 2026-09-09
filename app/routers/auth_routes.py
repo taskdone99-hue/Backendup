@@ -1,14 +1,13 @@
 import os
 import re
 
-from twilio.base.exceptions import TwilioRestException
-from twilio.rest import Client
 from fastapi import HTTPException
 import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.database import get_db
 from app import models, schemas
@@ -29,14 +28,14 @@ from app.auth import (
     OTP_RESEND_COOLDOWN_SECONDS,
     OTP_MAX_ATTEMPTS,
 )
-from app.services.sms_service import (
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN,
-    TWILIO_VERIFY_SERVICE_SID,
-    is_twilio_configured,
-    send_otp_sms,
-)
+from app.services.sms_service import send_otp_sms
 from app.services.email_service import send_otp_email, send_password_reset_email
+from app.services.msg91_service import (
+    verify_msg91_access_token,
+    MSG91ConfigError,
+    MSG91VerificationError,
+    MSG91APIError,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -182,6 +181,95 @@ def _issue_token_pair(db: Session, user: models.User) -> schemas.TokenResponse:
     return schemas.TokenResponse(
         access_token=access_token, refresh_token=refresh_token, user=user
     )
+
+
+def _finalize_verified_identifier(
+    db: Session, identifier: str, channel: OTPChannel
+) -> schemas.TokenResponse:
+    """
+    Shared find-or-create-user + issue-JWT logic for anything that has
+    already independently confirmed ownership of `identifier` (a local
+    OTP check, or MSG91's verifyAccessToken). Same behavior /verify-otp
+    has always had: an existing account for this identifier logs in;
+    otherwise a new account is created (from a matching PendingSignup if
+    /register was called first, or a placeholder-username account
+    otherwise), matching Instagram's passwordless-first-login pattern.
+    """
+    user = _get_user_by_identifier(db, identifier, channel)
+
+    if user is None:
+        pending = (
+            db.query(models.PendingSignup)
+            .filter(models.PendingSignup.identifier == identifier)
+            .first()
+        )
+
+        if pending is not None:
+            username = pending.username
+
+            if _username_taken(db, username):
+                username = _generate_placeholder_username(db, username)
+
+            user = models.User(
+                username=username,
+                hashed_password=pending.hashed_password,
+                date_of_birth=pending.date_of_birth,
+                gender=pending.gender,
+            )
+
+            db.delete(pending)
+
+        else:
+            user = models.User(
+                username=_generate_placeholder_username(db, identifier)
+            )
+
+        if channel == OTPChannel.email:
+            user.email = identifier
+        else:
+            user.phone_number = identifier
+
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Race condition: another request created this exact account
+            # (unique constraint on phone_number/email/username) between
+            # our lookup above and this commit — not a real failure, just
+            # two near-simultaneous verifications of the same identifier.
+            # Roll back and use whichever row won, instead of erroring out.
+            db.rollback()
+            user = _get_user_by_identifier(db, identifier, channel)
+            if user is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An account with this identifier already exists",
+                )
+        except SQLAlchemyError as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="A database error occurred — please try again shortly.",
+            ) from e
+        else:
+            db.refresh(user)
+
+    if channel == OTPChannel.email:
+        user.is_email_verified = True
+    else:
+        user.is_phone_verified = True
+
+    try:
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A database error occurred — please try again shortly.",
+        ) from e
+    db.refresh(user)
+
+    return _issue_token_pair(db, user)
 import random
 
 def _generate_username_suggestions(db: Session, base: str, count: int = 4) -> list[str]:
@@ -402,102 +490,69 @@ def verify_otp(
     payload: schemas.VerifyOTPRequest,
     db: Session = Depends(get_db)
 ):
+    """
+    Local-OTP-table verification (email always; phone for flows that
+    still use a locally issued code, e.g. forgot-password-by-phone).
+    Real phone login/signup now goes through the MSG91 OTP Widget and
+    POST /api/auth/verify-msg91-token instead — see that endpoint.
+    """
     identifier, channel = schemas.normalize_identifier(payload.identifier)
 
-    if channel == OTPChannel.phone and is_twilio_configured():
-        # Twilio Verify is authoritative for phone once configured — it
-        # generated and sent its own code (see sms_service.send_otp_sms),
-        # so it has to be the one that checks it too.
-        try:
-            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-            verification_check = (
-                client.verify.v2
-                .services(TWILIO_VERIFY_SERVICE_SID)
-                .verification_checks
-                .create(to=identifier, code=payload.otp)
-            )
-        except TwilioRestException as e:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Couldn't verify the code right now — please try again shortly.",
-            ) from e
+    _consume_otp(db, identifier, payload.purpose, payload.otp)
 
-        if verification_check.status != "approved":
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid or expired OTP"
-            )
+    return _finalize_verified_identifier(db, identifier, channel)
 
+
+# ---- MSG91 OTP Widget verification (phone login/signup) ----
+
+@router.post("/verify-msg91-token", response_model=schemas.TokenResponse)
+def verify_msg91_token(
+    payload: schemas.MSG91VerifyTokenRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Completes phone login/signup once the frontend's MSG91 OTP Widget has
+    already sent + verified the OTP client-side and handed us its
+    access-token. We independently confirm that token with MSG91's
+    verifyAccessToken API (server-to-server, using MSG91_AUTHKEY — never
+    exposed to the frontend) before trusting it for anything.
+    """
+    try:
+        raw_identifier = verify_msg91_access_token(payload.access_token)
+    except MSG91ConfigError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Phone verification is not configured",
+        ) from e
+    except MSG91VerificationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired access token",
+        ) from e
+    except MSG91APIError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Couldn't verify the code right now — please try again shortly.",
+        ) from e
+
+    # MSG91 typically reports a mobile number as digits with the country
+    # code but no leading '+' (e.g. "919876543210"); normalize_identifier's
+    # phone parsing needs the '+' to read that as country-code-included
+    # rather than a local number. Email contact points come back as-is.
+    if "@" in raw_identifier:
+        candidate = raw_identifier
     else:
-        # Email always uses this; phone falls back to it too when Twilio
-        # Verify isn't configured (local dev/demo — matches the console-log
-        # fallback in sms_service.send_otp_sms).
-        _consume_otp(
-            db,
-            identifier,
-            payload.purpose,
-            payload.otp
-        )
+        candidate = raw_identifier if raw_identifier.startswith("+") else f"+{raw_identifier}"
 
-    user = _get_user_by_identifier(
-        db,
-        identifier,
-        channel
-    )
+    try:
+        identifier, channel = schemas.normalize_identifier(candidate)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="MSG91 returned an unrecognized identifier",
+        ) from e
 
-    if user is None:
-        pending = (
-            db.query(models.PendingSignup)
-            .filter(
-                models.PendingSignup.identifier == identifier
-            )
-            .first()
-        )
-
-        if pending is not None:
-            username = pending.username
-
-            if _username_taken(db, username):
-                username = _generate_placeholder_username(
-                    db,
-                    username
-                )
-
-            user = models.User(
-                username=username,
-                hashed_password=pending.hashed_password,
-                date_of_birth=pending.date_of_birth,
-                gender=pending.gender,
-            )
-
-            db.delete(pending)
-
-        else:
-            user = models.User(
-                username=_generate_placeholder_username(
-                    db,
-                    identifier
-                )
-            )
-
-        if channel == OTPChannel.email:
-            user.email = identifier
-        else:
-            user.phone_number = identifier
-
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-    if channel == OTPChannel.email:
-        user.is_email_verified = True
-    else:
-        user.is_phone_verified = True
-
-    db.commit()
-    db.refresh(user)
-
-    return _issue_token_pair(db, user)
+    return _finalize_verified_identifier(db, identifier, channel)
 
 
 # ---- Current user ----
