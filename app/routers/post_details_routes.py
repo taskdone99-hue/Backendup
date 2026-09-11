@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user
+from app.services.location_service import find_or_create_location
 
 router = APIRouter(prefix="/api/posts", tags=["post-details"])
 
@@ -258,18 +259,18 @@ def set_location(
 ):
     post = _get_owned_post_or_404(db, post_id, current_user)
 
-    post.location_name = payload.name
-    post.location_latitude = payload.latitude
-    post.location_longitude = payload.longitude
+    location = find_or_create_location(
+        db, name=payload.name, latitude=payload.latitude, longitude=payload.longitude
+    )
+    post.location_name = location.name
+    post.location_latitude = location.latitude
+    post.location_longitude = location.longitude
+    post.location_id = location.id
     db.commit()
 
     return schemas.LocationResponse(
         message="Location added",
-        location=schemas.LocationOut(
-            name=post.location_name,
-            latitude=post.location_latitude,
-            longitude=post.location_longitude,
-        ),
+        location=schemas.LocationOut.model_validate(location),
     )
 
 
@@ -283,5 +284,6 @@ def remove_location(
     post.location_name = None
     post.location_latitude = None
     post.location_longitude = None
+    post.location_id = None
     db.commit()
     return schemas.MessageResponse(message="Location removed")

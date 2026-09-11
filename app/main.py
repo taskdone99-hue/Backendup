@@ -28,6 +28,8 @@ from app.routers import (
     discord_routes,
     ads_routes,
     config_routes,
+    location_routes,
+    monetization_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -111,6 +113,8 @@ app.include_router(payment_routes.router)
 app.include_router(discord_routes.router)
 app.include_router(ads_routes.router)
 app.include_router(config_routes.router)
+app.include_router(location_routes.router)
+app.include_router(monetization_routes.router)
 
 
 @app.get("/")

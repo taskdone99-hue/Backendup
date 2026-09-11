@@ -8,6 +8,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -276,6 +277,12 @@ class Post(Base):
     location_name = Column(String(150), nullable=True)
     location_latitude = Column(Float, nullable=True)
     location_longitude = Column(Float, nullable=True)
+    # Richer location record (address/city/state/country/place_id) — new,
+    # additive alongside the flat columns above, which stay populated too
+    # for any existing code path that still reads them directly. Nullable:
+    # a post can have no location, or (for posts created before this
+    # existed) only the flat columns and no Location row.
+    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
 
     # Accessibility text read out by screen readers — Instagram's "Alt text".
     alt_text = Column(String(1000), nullable=True)
@@ -287,6 +294,7 @@ class Post(Base):
     saves = relationship("SavedPost", back_populates="post", cascade="all, delete-orphan")
     tag_rows = relationship("PostTag", back_populates="post", cascade="all, delete-orphan")
     member_rows = relationship("PostMember", back_populates="post", cascade="all, delete-orphan")
+    location = relationship("Location", foreign_keys=[location_id])
 
 
 class PostTag(Base):
@@ -633,6 +641,44 @@ class Like(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+class Location(Base):
+    """
+    A reusable, shareable place — attached optionally to Posts and/or
+    Stories via location_id. Not user-location tracking: a row here only
+    ever exists because someone explicitly attached it to a piece of
+    content (via POST /api/locations or inline at post/story creation), and
+    no history of where a user has been is kept anywhere.
+
+    Multiple posts/stories can point at the same Location row — see
+    app.services.location_service.find_or_create_location, which dedupes by
+    place_id (when the client has one from a places provider) or by
+    name+coordinates (for manual entries), so "Charminar" tagged by 50
+    different posts is one row, not 50.
+    """
+
+    __tablename__ = "locations"
+    __table_args__ = (
+        Index("ix_locations_city", "city"),
+        Index("ix_locations_lat_lng", "latitude", "longitude"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(150), nullable=False, index=True)
+    address = Column(String(500), nullable=True)
+    city = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    country = Column(String(100), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    # Opaque id from an external places/geocoding provider (Google Places,
+    # Mapbox, etc), when the client has one — used to dedupe more reliably
+    # than name+coordinates. Nullable/free-form since this app doesn't
+    # require a specific provider.
+    place_id = Column(String(255), nullable=True, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class Story(Base):
     """
     Stories are ephemeral (default 24h). `expires_at` is set at creation time
@@ -652,10 +698,13 @@ class Story(Base):
     caption = Column(String(280), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    # New, additive — see Post.location_id for the same pattern/rationale.
+    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
 
     user = relationship("User", back_populates="stories")
     views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
     reactions = relationship("StoryReaction", back_populates="story", cascade="all, delete-orphan")
+    location = relationship("Location", foreign_keys=[location_id])
 
 
 class StoryView(Base):

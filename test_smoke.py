@@ -752,6 +752,312 @@ except Exception as e:
 results.append(("WS /api/notifications/ws (bad token) -> closes 4401", "n/a", ws_auth_ok))
 print(f"{'PASS' if ws_auth_ok else 'FAIL'} | WS bad token close code check")
 
+# ==========================================================================
+# LOCATION tests
+# ==========================================================================
+from datetime import datetime, timezone, timedelta
+
+loc_owner = models.User(username="loc_owner", full_name="Loc Owner", is_phone_verified=True)
+loc_private_owner = models.User(
+    username="loc_private_owner", full_name="Loc Private", is_phone_verified=True, is_private=True
+)
+loc_stranger = models.User(username="loc_stranger", full_name="Loc Stranger", is_phone_verified=True)
+db.add_all([loc_owner, loc_private_owner, loc_stranger])
+db.commit()
+db.refresh(loc_owner)
+db.refresh(loc_private_owner)
+db.refresh(loc_stranger)
+token_loc_owner = create_access_token({"sub": str(loc_owner.id)})
+token_loc_private = create_access_token({"sub": str(loc_private_owner.id)})
+token_loc_stranger = create_access_token({"sub": str(loc_stranger.id)})
+h_loc_owner = {"Authorization": f"Bearer {token_loc_owner}"}
+h_loc_private = {"Authorization": f"Bearer {token_loc_private}"}
+h_loc_stranger = {"Authorization": f"Bearer {token_loc_stranger}"}
+
+# 1. Create location
+r = check("POST /api/locations (create)", client.post(
+    "/api/locations", headers=h_loc_owner,
+    json={
+        "name": "Charminar", "address": "Hyderabad, Telangana, India",
+        "city": "Hyderabad", "state": "Telangana", "country": "India",
+        "latitude": 17.3616, "longitude": 78.4747,
+    },
+), 201)
+charminar = r.json()
+assert charminar["name"] == "Charminar" and charminar["city"] == "Hyderabad"
+charminar_id = charminar["id"]
+
+# 2. Get location
+r = check("GET /api/locations/{id}", client.get(f"/api/locations/{charminar_id}"), 200)
+assert r.json()["id"] == charminar_id and r.json()["latitude"] == 17.3616
+
+# 3. Search location
+r = check("GET /api/locations/search?q=Charminar", client.get(
+    "/api/locations/search", params={"q": "Charminar"}
+), 200)
+assert any(item["id"] == charminar_id for item in r.json()["items"])
+
+# 4. Invalid latitude
+r = check("POST /api/locations (invalid latitude) -> 400", client.post(
+    "/api/locations", headers=h_loc_owner,
+    json={"name": "Bad Lat", "latitude": 999, "longitude": 10},
+), 400)
+
+# 5. Invalid longitude
+r = check("POST /api/locations (invalid longitude) -> 400", client.post(
+    "/api/locations", headers=h_loc_owner,
+    json={"name": "Bad Lng", "latitude": 10, "longitude": -999},
+), 400)
+
+# 6. Create post WITH location (multipart, location_id referencing the saved Charminar)
+r = check("POST /api/posts (with location_id)", client.post(
+    "/api/posts", headers=h_loc_owner,
+    data={"caption": "at charminar", "location_id": str(charminar_id)},
+    files={"file": ("p.jpg", b"fakeimgbytes", "image/jpeg")},
+), 201)
+post_with_loc = r.json()
+assert post_with_loc["location"] is not None
+assert post_with_loc["location"]["id"] == charminar_id
+assert post_with_loc["location"]["city"] == "Hyderabad"
+post_with_loc_id = post_with_loc["id"]
+
+# 7. Create post WITHOUT location
+r = check("POST /api/posts (without location)", client.post(
+    "/api/posts", headers=h_loc_owner,
+    data={"caption": "no location here"},
+    files={"file": ("p2.jpg", b"fakeimgbytes", "image/jpeg")},
+), 201)
+post_without_loc = r.json()
+assert post_without_loc["location"] is None
+
+# 8. Retrieve post with location (fresh GET, not just the create response)
+r = check("GET /api/posts/{id} (retrieve, has location)", client.get(
+    f"/api/posts/{post_with_loc_id}", headers=h_loc_owner
+), 200)
+assert r.json()["location"]["name"] == "Charminar"
+
+# 9. Create story WITH location
+r = check("POST /api/stories (with location_id)", client.post(
+    "/api/stories", headers=h_loc_owner,
+    data={"caption": "story at charminar", "location_id": str(charminar_id)},
+    files={"file": ("s.jpg", b"fakeimgbytes", "image/jpeg")},
+), 201)
+story_with_loc = r.json()
+assert story_with_loc["location"] is not None and story_with_loc["location"]["id"] == charminar_id
+story_with_loc_id = story_with_loc["id"]
+
+# 10. Create story WITHOUT location
+r = check("POST /api/stories (without location)", client.post(
+    "/api/stories", headers=h_loc_owner, data={"caption": "no location"},
+    files={"file": ("s2.jpg", b"fakeimgbytes", "image/jpeg")},
+), 201)
+assert r.json()["location"] is None
+
+# 11. Retrieve story with location -- via GET /api/stories/mine
+r = check("GET /api/stories/mine (retrieve, has location)", client.get(
+    "/api/stories/mine", headers=h_loc_owner
+), 200)
+mine_items = r.json()["items"]
+found = next((s for s in mine_items if s["id"] == story_with_loc_id), None)
+assert found is not None and found["location"]["name"] == "Charminar"
+
+# 12. Get posts for location
+r = check("GET /api/locations/{id}/posts", client.get(
+    f"/api/locations/{charminar_id}/posts", headers=h_loc_owner
+), 200)
+loc_post_ids = {p["id"] for p in r.json()["items"]}
+assert post_with_loc_id in loc_post_ids
+assert post_without_loc["id"] not in loc_post_ids
+
+# 13. Get stories for location
+r = check("GET /api/locations/{id}/stories", client.get(
+    f"/api/locations/{charminar_id}/stories", headers=h_loc_owner
+), 200)
+loc_story_ids = {s["id"] for s in r.json()["items"]}
+assert story_with_loc_id in loc_story_ids
+
+# 14 & 15. Private post cannot leak through location API / unauthorized user
+# blocked. loc_private_owner (private account) posts at the SAME location.
+r = client.post(
+    "/api/posts", headers=h_loc_private,
+    data={"caption": "private post at charminar", "location_id": str(charminar_id)},
+    files={"file": ("priv.jpg", b"fakeimgbytes", "image/jpeg")},
+)
+assert r.status_code == 201
+private_post_id = r.json()["id"]
+
+# loc_stranger does not follow loc_private_owner -> must not see the private post here
+r = check("GET /api/locations/{id}/posts (stranger, private post hidden)", client.get(
+    f"/api/locations/{charminar_id}/posts", headers=h_loc_stranger
+), 200)
+stranger_visible_ids = {p["id"] for p in r.json()["items"]}
+assert private_post_id not in stranger_visible_ids, "private post leaked through location API"
+
+# A pending follow request must NOT bypass this restriction either
+client.post(f"/api/follow/{loc_private_owner.id}", headers=h_loc_stranger)
+r = check("GET /api/locations/{id}/posts (pending follow request still hidden)", client.get(
+    f"/api/locations/{charminar_id}/posts", headers=h_loc_stranger
+), 200)
+stranger_visible_ids = {p["id"] for p in r.json()["items"]}
+assert private_post_id not in stranger_visible_ids, "pending follow request bypassed private-post restriction"
+
+# 16. Expired story is not returned
+expired_story = models.Story(
+    user_id=loc_owner.id, media_url="/static/expired.jpg", media_type=models.MediaType.image,
+    location_id=charminar_id, expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+)
+db.add(expired_story)
+db.commit()
+db.refresh(expired_story)
+r = check("GET /api/locations/{id}/stories (expired story excluded)", client.get(
+    f"/api/locations/{charminar_id}/stories", headers=h_loc_owner
+), 200)
+returned_story_ids = {s["id"] for s in r.json()["items"]}
+assert expired_story.id not in returned_story_ids, "expired story leaked through location API"
+
+# 17. Location search limits/pagination
+for i in range(5):
+    client.post("/api/locations", headers=h_loc_owner, json={"name": f"Pagination Spot {i}"})
+r = check("GET /api/locations/search (pagination, limit=2)", client.get(
+    "/api/locations/search", params={"q": "Pagination Spot", "limit": 2, "offset": 0}
+), 200)
+page1 = r.json()
+assert page1["limit"] == 2 and len(page1["items"]) == 2 and page1["total"] >= 5
+r = check("GET /api/locations/search (pagination, offset=2)", client.get(
+    "/api/locations/search", params={"q": "Pagination Spot", "limit": 2, "offset": 2}
+), 200)
+page2 = r.json()
+assert {i["id"] for i in page1["items"]}.isdisjoint({i["id"] for i in page2["items"]})
+
+
+# ==========================================================================
+# MONETIZATION tests
+# ==========================================================================
+
+def _make_watch_session(user, reel, watch_seconds, is_valid=True, started_ago_seconds=3600):
+    started = datetime.now(timezone.utc) - timedelta(seconds=started_ago_seconds)
+    ended = started + timedelta(seconds=watch_seconds)
+    session = models.WatchSession(
+        user_id=user.id, reel_id=reel.id, started_at=started, ended_at=ended,
+        watch_seconds=watch_seconds, active_owner_id=None, is_valid=is_valid,
+    )
+    db.add(session)
+    db.commit()
+    return session
+
+mon_user_zero = models.User(username="mon_zero", full_name="Mon Zero", is_phone_verified=True)
+mon_user_under = models.User(username="mon_under", full_name="Mon Under", is_phone_verified=True)
+mon_user_exact = models.User(username="mon_exact", full_name="Mon Exact", is_phone_verified=True)
+mon_user_over = models.User(username="mon_over", full_name="Mon Over", is_phone_verified=True)
+mon_user_dup = models.User(username="mon_dup", full_name="Mon Dup", is_phone_verified=True)
+mon_user_invalid = models.User(username="mon_invalid", full_name="Mon Invalid", is_phone_verified=True)
+db.add_all([mon_user_zero, mon_user_under, mon_user_exact, mon_user_over, mon_user_dup, mon_user_invalid])
+db.commit()
+for u in (mon_user_zero, mon_user_under, mon_user_exact, mon_user_over, mon_user_dup, mon_user_invalid):
+    db.refresh(u)
+
+mon_reel = models.Reel(user_id=loc_owner.id, caption="mon reel", video_url="/static/mon_reel.mp4")
+db.add(mon_reel)
+db.commit()
+db.refresh(mon_reel)
+
+def _mon_headers(user):
+    return {"Authorization": f"Bearer {create_access_token({'sub': str(user.id)})}"}
+
+# 18. 0 watch time -> OFF
+r = check("GET /api/monetization/status (0 seconds -> OFF)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_zero)
+), 200)
+body = r.json()
+assert body["monetization_enabled"] is False
+assert body["watch_time_seconds"] == 0
+assert body["required_watch_time_seconds"] == 7200
+assert body["remaining_seconds"] == 7200
+
+# 19. < 7200 -> OFF
+_make_watch_session(mon_user_under, mon_reel, 5400)
+r = check("GET /api/monetization/status (5400 seconds -> OFF)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_under)
+), 200)
+body = r.json()
+assert body["monetization_enabled"] is False
+assert body["watch_time_seconds"] == 5400
+# 22. Remaining time calculated correctly
+assert body["remaining_seconds"] == 1800
+
+# 20. exactly 7200 -> ON
+_make_watch_session(mon_user_exact, mon_reel, 7200)
+r = check("GET /api/monetization/status (exactly 7200 -> ON)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_exact)
+), 200)
+body = r.json()
+assert body["monetization_enabled"] is True
+assert body["watch_time_seconds"] == 7200
+assert body["remaining_seconds"] == 0
+
+# 21. > 7200 -> ON
+_make_watch_session(mon_user_over, mon_reel, 8500)
+r = check("GET /api/monetization/status (8500 -> ON)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_over)
+), 200)
+body = r.json()
+assert body["monetization_enabled"] is True
+assert body["watch_time_seconds"] == 8500
+assert body["remaining_seconds"] == 0
+
+# 23. Duplicate watch sessions are not double-counted (two separate,
+# legitimate sessions just sum normally -- "duplicate" here means the
+# server-side sum, not double-billing a single session twice).
+_make_watch_session(mon_user_dup, mon_reel, 3000, started_ago_seconds=7200)
+_make_watch_session(mon_user_dup, mon_reel, 3000, started_ago_seconds=3600)
+r = check("GET /api/monetization/status (two 3000s sessions -> 6000, not 12000)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_dup)
+), 200)
+body = r.json()
+assert body["watch_time_seconds"] == 6000
+
+# 24. Invalid watch session does not increase qualifying time
+_make_watch_session(mon_user_invalid, mon_reel, 1, is_valid=False)  # below MIN_VALID_WATCH_SECONDS
+_make_watch_session(mon_user_invalid, mon_reel, 100, is_valid=True)
+r = check("GET /api/monetization/status (invalid session excluded)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_invalid)
+), 200)
+body = r.json()
+assert body["watch_time_seconds"] == 100, "an is_valid=False session must not count toward watch time"
+
+# 25. Unauthenticated user cannot access monetization status
+r = check("GET /api/monetization/status (no auth) -> 403", client.get("/api/monetization/status"), 403)
+
+# 26. Client cannot directly enable monetization -- there is no field/endpoint
+# to set it; confirm the response schema has no settable "enabled" input by
+# re-fetching status unchanged after posting an (ignored) arbitrary body to
+# the same path via an unsupported method, and confirm GET is the only verb.
+r = client.post("/api/monetization/status", headers=_mon_headers(mon_user_zero), json={"monetization_enabled": True})
+check("POST /api/monetization/status (no such write endpoint) -> 405", r, 405)
+r = check("GET /api/monetization/status (still OFF after the POST attempt)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_zero)
+), 200)
+assert r.json()["monetization_enabled"] is False
+
+# 27. Existing Reel APIs continue working
+r = check("GET /api/reels/feed (existing API still works)", client.get(
+    "/api/reels/feed", headers=h1
+), 200)
+
+# 28. Existing watch-session functionality continues working
+r = check("POST /api/watch/start (existing API still works)", client.post(
+    "/api/watch/start", headers=h1, json={"reel_id": mon_reel.id}
+), 201)
+watch_session_id = r.json()["session_id"]
+r = check("POST /api/watch/end (existing API still works)", client.post(
+    "/api/watch/end", headers=h1, json={"session_id": watch_session_id}
+), 200)
+
+# 29. Existing membership/payment functionality continues working
+r = check("GET /api/membership/plans (existing API still works)", client.get(
+    "/api/membership/plans"
+), 200)
+
 print()
 print("=" * 60)
 all_pass = all(ok for _, _, ok in results)

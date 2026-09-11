@@ -523,6 +523,62 @@ class WatchStatsResponse(BaseModel):
     total: WatchPeriodStats
 
 
+class MonetizationStatusOut(BaseModel):
+    monetization_enabled: bool
+    watch_time_seconds: int
+    required_watch_time_seconds: int
+    remaining_seconds: int
+
+
+class LocationIn(BaseModel):
+    """Inline location payload for PUT /api/posts/:id's `location` field —
+    kept name-only + optional coordinates for backward compatibility with
+    existing callers of that endpoint. To attach a richer location (address,
+    city, state, country, place_id) use POST /api/locations first and pass
+    its id, or use the location_* fields on post/story creation."""
+    name: str = Field(..., max_length=150)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+
+
+class LocationCreate(BaseModel):
+    """POST /api/locations — create (or reuse, if it matches an existing
+    one) a saved location that can then be attached to posts/stories by id."""
+    name: str = Field(..., max_length=150)
+    address: str | None = Field(default=None, max_length=500)
+    city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    country: str | None = Field(default=None, max_length=100)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    place_id: str | None = Field(default=None, max_length=255)
+
+
+class LocationOut(BaseModel):
+    """Additive vs. the original (name/latitude/longitude only) shape —
+    id/address/city/state/country/place_id are new fields; every existing
+    consumer of the old shape still gets name/latitude/longitude unchanged."""
+    id: int | None = None
+    name: str
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    country: str | None = None
+    latitude: float | None
+    longitude: float | None
+    place_id: str | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedLocationSearchResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[LocationOut]
+
+
 # ---- Stories ----
 
 class StoryOut(BaseModel):
@@ -538,6 +594,7 @@ class StoryOut(BaseModel):
     viewed_by_me: bool = False
     reactions_count: int = 0
     my_reaction: str | None = None
+    location: LocationOut | None = None
 
     class Config:
         from_attributes = True
@@ -635,12 +692,6 @@ class MusicIn(BaseModel):
     start_seconds: int = Field(default=0, ge=0)
 
 
-class LocationIn(BaseModel):
-    name: str = Field(..., max_length=150)
-    latitude: float | None = None
-    longitude: float | None = None
-
-
 class PostUpdate(BaseModel):
     """
     PUT /api/posts/:id. Every field is optional and only touched if present
@@ -673,12 +724,6 @@ class MusicOut(BaseModel):
     artist: str | None
     audio_url: str
     start_seconds: int
-
-
-class LocationOut(BaseModel):
-    name: str
-    latitude: float | None
-    longitude: float | None
 
 
 class PostDetailOut(PostOut):

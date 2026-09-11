@@ -19,6 +19,7 @@ from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.services.media_service import delete_media_file, generate_video_thumbnail, save_upload_file
 from app.services import engagement
+from app.services.location_service import resolve_location_from_form, find_or_create_location
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 reels_router = APIRouter(prefix="/api/reels", tags=["reels"])
@@ -69,7 +70,12 @@ def _to_post_detail(
             audio_url=post.music_url,
             start_seconds=post.music_start_seconds or 0,
         )
-    if post.location_name:
+    if post.location_id and post.location is not None:
+        detail.location = schemas.LocationOut.model_validate(post.location)
+    elif post.location_name:
+        # Pre-Location-table posts (or ones only given flat fields) —
+        # same fallback shape as before, just with the new optional fields
+        # left null.
         detail.location = schemas.LocationOut(
             name=post.location_name,
             latitude=post.location_latitude,
@@ -226,6 +232,14 @@ def create_post(
     location_name: str | None = Form(default=None),
     location_latitude: float | None = Form(default=None),
     location_longitude: float | None = Form(default=None),
+    location_id: int | None = Form(
+        default=None, description="Attach an already-saved location (see POST /api/locations) by id"
+    ),
+    location_address: str | None = Form(default=None),
+    location_city: str | None = Form(default=None),
+    location_state: str | None = Form(default=None),
+    location_country: str | None = Form(default=None),
+    location_place_id: str | None = Form(default=None),
     tag_user_ids: str | None = Form(
         default=None, description="Comma-separated user ids, e.g. '12,15,20'"
     ),
@@ -262,6 +276,27 @@ def create_post(
     tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
     member_ids = _parse_ids(member_user_ids, "member_user_ids")
 
+    if location_latitude is not None and not (-90 <= location_latitude <= 90):
+        raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
+    if location_longitude is not None and not (-180 <= location_longitude <= 180):
+        raise HTTPException(status_code=400, detail="location_longitude must be between -180 and 180")
+
+    try:
+        location = resolve_location_from_form(
+            db,
+            location_id=location_id,
+            location_name=location_name,
+            location_address=location_address,
+            location_city=location_city,
+            location_state=location_state,
+            location_country=location_country,
+            location_latitude=location_latitude,
+            location_longitude=location_longitude,
+            location_place_id=location_place_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
     url, kind = save_upload_file(file, "posts", allow_video=True)
     post = models.Post(
         user_id=current_user.id,
@@ -274,9 +309,12 @@ def create_post(
         music_artist=music_artist,
         music_url=music_url,
         music_start_seconds=music_start_seconds if music_title or music_url else None,
-        location_name=location_name,
-        location_latitude=location_latitude,
-        location_longitude=location_longitude,
+        # Flat columns stay populated for any existing reader of them
+        # directly, alongside the richer Location row (location_id) below.
+        location_name=location.name if location else location_name,
+        location_latitude=location.latitude if location else location_latitude,
+        location_longitude=location.longitude if location else location_longitude,
+        location_id=location.id if location else None,
     )
     db.add(post)
     db.flush()
@@ -391,10 +429,18 @@ def update_post(
             post.location_name = None
             post.location_latitude = None
             post.location_longitude = None
+            post.location_id = None
         else:
-            post.location_name = location["name"]
-            post.location_latitude = location.get("latitude")
-            post.location_longitude = location.get("longitude")
+            loc_row = find_or_create_location(
+                db,
+                name=location["name"],
+                latitude=location.get("latitude"),
+                longitude=location.get("longitude"),
+            )
+            post.location_name = loc_row.name
+            post.location_latitude = loc_row.latitude
+            post.location_longitude = loc_row.longitude
+            post.location_id = loc_row.id
 
     if updates.get("tag_user_ids") is not None:
         _replace_post_tags(db, post, updates["tag_user_ids"])

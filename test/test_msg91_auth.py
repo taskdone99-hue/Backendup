@@ -34,7 +34,7 @@ from unittest.mock import patch
 import pytest
 
 # ---- environment must be set before importing any app module ----
-os.environ.setdefault("SECRET_KEY", "test-secret-key-for-msg91-tests")
+os.environ["SECRET_KEY"] = "test-secret-key-for-msg91-tests"
 os.environ.setdefault("DB_HOST", "localhost")
 os.environ.setdefault("DB_NAME", "test")
 os.environ.setdefault("DB_USER", "test")
@@ -51,6 +51,9 @@ from fastapi.testclient import TestClient
 from jose import jwt
 
 import app.database as database
+import app.auth as auth
+
+auth.SECRET_KEY = os.environ["SECRET_KEY"]
 
 # ---- isolated in-memory SQLite for every test run ----
 test_engine = create_engine(
@@ -341,10 +344,10 @@ def test_issued_access_token_is_a_valid_jwt_for_the_verified_user():
     body = r.json()
 
     payload = jwt.decode(
-        body["access_token"],
-        os.environ["SECRET_KEY"],
-        algorithms=["HS256"],
-    )
+    body["access_token"],
+    auth.SECRET_KEY,
+    algorithms=["HS256"],
+)
     assert payload["type"] == "access"
     assert int(payload["sub"]) == body["user"]["id"]
 
