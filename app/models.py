@@ -1092,6 +1092,141 @@ class DiscordLink(Base):
 
 
 # ==========================================================================
+# Creator monetization: earnings ledger, creator-to-creator collaboration
+# requests, and brand (paid-partnership) collaboration offers.
+#
+# Reuses everything that already existed for reel monetization/collab
+# instead of duplicating it:
+#   - Watch-time eligibility: WatchSession + monetization_service (unchanged)
+#   - Ad-hoc reel tagging + revenue split: ReelCollaborator/ReelRevenueShare
+#     (unchanged) — the CreatorCollaborationRequest below is the *proposal*
+#     workflow (invite -> accept/reject) that precedes tagging someone as a
+#     ReelCollaborator; it doesn't replace that table.
+# Nothing here alters an existing table/column, so create_all() picks these
+# up as brand-new tables with no migration needed for existing databases.
+# ==========================================================================
+
+class EarningSourceType(str, enum.Enum):
+    """What generated a CreatorEarning row."""
+    brand_collaboration = "brand_collaboration"
+    creator_collaboration = "creator_collaboration"
+    ad_revenue = "ad_revenue"
+    watch_time = "watch_time"
+    other = "other"
+
+
+class CreatorEarning(Base):
+    """
+    One ledger entry crediting a creator with an amount (smallest currency
+    unit, same convention as PaymentOrder.amount) from a specific source.
+    Rows are only ever inserted by the system in response to a real event
+    (a brand deal or creator-collab being accepted, etc.) — there is no
+    endpoint that lets a client credit itself directly.
+
+    `source_id` is an informal reference (like Like.target_id) into
+    whichever table `source_type` implies (brand_collaborations,
+    creator_collaboration_requests, ...), not a ForeignKey, since it can
+    point at different tables.
+    """
+
+    __tablename__ = "creator_earnings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    source_type = Column(Enum(EarningSourceType), nullable=False, index=True)
+    source_id = Column(Integer, nullable=True)
+    amount_cents = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default="INR")
+    description = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class CollaborationStatus(str, enum.Enum):
+    pending = "pending"
+    accepted = "accepted"
+    rejected = "rejected"
+    cancelled = "cancelled"
+
+
+class CreatorCollaborationRequest(Base):
+    """
+    A creator-to-creator collaboration *proposal* — the invite/accept step
+    that happens before (optionally) tagging someone as a ReelCollaborator.
+    `reel_id` is optional: a request can reference a specific existing reel
+    the requester owns ("collab with me on this reel") or stand alone as a
+    general collaboration proposal with no reel yet.
+
+    On acceptance (see app.services.collaboration_service), if `reel_id` is
+    set the partner is automatically added as a ReelCollaborator on that
+    reel (idempotent — reuses the existing table rather than duplicating
+    it), and if `proposed_amount_cents` is set a CreatorEarning row is
+    credited to the partner.
+    """
+
+    __tablename__ = "creator_collaboration_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    partner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id"), nullable=True, index=True)
+    message = Column(String(500), nullable=True)
+    # What the requester is offering the partner, if anything — a revenue
+    # share on the referenced reel's future ad revenue, and/or a flat
+    # one-time payout credited as a CreatorEarning on acceptance.
+    proposed_revenue_share_percentage = Column(Integer, nullable=True)
+    proposed_amount_cents = Column(Integer, nullable=True)
+    status = Column(Enum(CollaborationStatus), nullable=False, default=CollaborationStatus.pending, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    responded_at = Column(DateTime(timezone=True), nullable=True)
+
+    requester = relationship("User", foreign_keys=[requester_id])
+    partner = relationship("User", foreign_keys=[partner_id])
+    reel = relationship("Reel", foreign_keys=[reel_id])
+
+
+class BrandCollaborationStatus(str, enum.Enum):
+    pending = "pending"
+    accepted = "accepted"
+    rejected = "rejected"
+    completed = "completed"
+    cancelled = "cancelled"
+
+
+class BrandCollaboration(Base):
+    """
+    A brand's paid-partnership offer to a creator (Instagram's "Paid
+    partnership" / YouTube's brand deals). There's no separate authenticated
+    "brand" actor anywhere in this codebase (no Brand login/User subtype),
+    so an offer is created by whichever authenticated user is acting as the
+    brand's representative (typically a business account, see
+    User.account_type) and identifies the brand via brand_name/contact
+    fields rather than a foreign key to a brand-user row. The targeted
+    creator then accepts/declines like any other request in this module.
+    """
+
+    __tablename__ = "brand_collaborations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    brand_name = Column(String(150), nullable=False)
+    brand_contact_email = Column(String(255), nullable=True)
+    campaign_title = Column(String(150), nullable=False)
+    campaign_description = Column(String(1000), nullable=True)
+    offer_amount_cents = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default="INR")
+    deliverables = Column(String(1000), nullable=True)
+    status = Column(Enum(BrandCollaborationStatus), nullable=False, default=BrandCollaborationStatus.pending, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    responded_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_by = relationship("User", foreign_keys=[created_by_id])
+    creator = relationship("User", foreign_keys=[creator_id])
+
+
+# ==========================================================================
 # Ads
 # ==========================================================================
 

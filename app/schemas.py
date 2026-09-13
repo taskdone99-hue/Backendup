@@ -20,6 +20,9 @@ from app.models import (
     SavedItemType,
     ShareContentType,
     AccountType,
+    EarningSourceType,
+    CollaborationStatus,
+    BrandCollaborationStatus,
 )
 
 PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
@@ -1565,3 +1568,181 @@ class AdConfigResponse(BaseModel):
     ad_network: str | None
     test_mode: bool
     slots: list[AdSlotOut]
+
+
+# ==========================================================================
+# Creator earnings ledger
+# ==========================================================================
+
+class CreatorEarningOut(BaseModel):
+    id: int
+    source_type: EarningSourceType
+    source_id: int | None
+    amount_cents: int
+    currency: str
+    description: str | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedCreatorEarningsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    # All-time total across every ledger row (not just this page).
+    total_earnings_cents: int
+    currency: str
+    items: list[CreatorEarningOut]
+
+
+class CreatorEarningsSummaryOut(BaseModel):
+    total_earnings_cents: int
+    currency: str
+    by_source: dict[str, int]
+    monetization: MonetizationStatusOut
+
+
+# ==========================================================================
+# Creator-to-creator collaboration requests
+# ==========================================================================
+
+class CreatorCollaborationCreate(BaseModel):
+    partner_user_id: int = Field(..., gt=0)
+    # Optional: propose collaborating on a reel you already own. If set, the
+    # reel must belong to the requester.
+    reel_id: int | None = Field(default=None, gt=0)
+    message: str | None = Field(default=None, max_length=500)
+    proposed_revenue_share_percentage: int | None = Field(default=None, ge=0, le=100)
+    proposed_amount_cents: int | None = Field(default=None, ge=0)
+
+    @field_validator("message")
+    @classmethod
+    def strip_message(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
+class CreatorCollaborationOut(BaseModel):
+    id: int
+    requester: UserSummaryOut
+    partner: UserSummaryOut
+    reel_id: int | None
+    message: str | None
+    proposed_revenue_share_percentage: int | None
+    proposed_amount_cents: int | None
+    status: CollaborationStatus
+    created_at: datetime
+    responded_at: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedCreatorCollaborationResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[CreatorCollaborationOut]
+
+
+# ==========================================================================
+# Brand (paid-partnership) collaborations
+# ==========================================================================
+
+class BrandCollaborationCreate(BaseModel):
+    creator_user_id: int = Field(..., gt=0)
+    brand_name: str = Field(..., min_length=1, max_length=150)
+    brand_contact_email: str | None = Field(default=None, max_length=255)
+    campaign_title: str = Field(..., min_length=1, max_length=150)
+    campaign_description: str | None = Field(default=None, max_length=1000)
+    offer_amount_cents: int = Field(..., ge=0)
+    currency: str = Field(default="INR", max_length=10)
+    deliverables: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("brand_contact_email")
+    @classmethod
+    def validate_email(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not _EMAIL_RE.match(v):
+            raise ValueError("Invalid email address")
+        return v
+
+    @field_validator("brand_name", "campaign_title", "campaign_description", "deliverables")
+    @classmethod
+    def strip_text_fields(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
+class BrandCollaborationOut(BaseModel):
+    id: int
+    created_by: UserSummaryOut
+    creator: UserSummaryOut
+    brand_name: str
+    brand_contact_email: str | None
+    campaign_title: str
+    campaign_description: str | None
+    offer_amount_cents: int
+    currency: str
+    deliverables: str | None
+    status: BrandCollaborationStatus
+    created_at: datetime
+    responded_at: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedBrandCollaborationResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[BrandCollaborationOut]
+
+
+# ==========================================================================
+# Unified search
+# ==========================================================================
+
+class SearchUserOut(BaseModel):
+    id: int
+    username: str
+    full_name: str | None
+    avatar_url: str | None
+    is_private: bool
+    account_type: AccountType
+    is_following: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class SearchSongOut(BaseModel):
+    id: int
+    title: str
+    artist: str | None
+    audio_url: str
+
+    class Config:
+        from_attributes = True
+
+
+class SearchAllResult(BaseModel):
+    users: list[SearchUserOut]
+    songs: list[SearchSongOut]
+    locations: list[LocationOut]
+
+
+class PaginatedSearchUsersResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[SearchUserOut]
+
+
+class PaginatedSearchSongsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[SearchSongOut]
