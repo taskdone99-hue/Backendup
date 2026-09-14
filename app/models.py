@@ -295,6 +295,62 @@ class Post(Base):
     tag_rows = relationship("PostTag", back_populates="post", cascade="all, delete-orphan")
     member_rows = relationship("PostMember", back_populates="post", cascade="all, delete-orphan")
     location = relationship("Location", foreign_keys=[location_id])
+    media_items = relationship(
+        "PostMedia",
+        back_populates="post",
+        cascade="all, delete-orphan",
+        order_by="PostMedia.position",
+    )
+    hashtag_rows = relationship(
+        "PostHashtag", back_populates="post", cascade="all, delete-orphan"
+    )
+
+
+class PostMedia(Base):
+    """One item of a post's media carousel. `media_url`/`media_type` on Post
+    itself stay populated too (mirroring item 0) so any existing reader of
+    those flat columns keeps working unchanged — this table is purely
+    additive, for posts that carry more than one photo/video."""
+
+    __tablename__ = "post_media"
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    media_url = Column(String(500), nullable=False)
+    media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
+    position = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    post = relationship("Post", back_populates="media_items")
+
+
+class Hashtag(Base):
+    """A distinct #tag, deduped case-insensitively (stored lowercase).
+    Populated by parsing post captions on create/update — see
+    app/services/hashtag_service.py — rather than typed in directly."""
+
+    __tablename__ = "hashtags"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(140), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PostHashtag(Base):
+    """Join row linking a Post to a Hashtag parsed out of its caption."""
+
+    __tablename__ = "post_hashtags"
+    __table_args__ = (
+        UniqueConstraint("post_id", "hashtag_id", name="uq_post_hashtag"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    hashtag_id = Column(Integer, ForeignKey("hashtags.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    post = relationship("Post", back_populates="hashtag_rows")
+    hashtag = relationship("Hashtag")
 
 
 class PostTag(Base):

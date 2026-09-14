@@ -7,7 +7,6 @@ video_routes.py (it operates on the same Reel rows created here, since this
 app has a single video-content type).
 """
 
-import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
@@ -20,29 +19,10 @@ from app.auth import get_current_user, get_current_user_optional
 from app.services.media_service import delete_media_file, generate_video_thumbnail, save_upload_file
 from app.services import engagement
 from app.services.location_service import resolve_location_from_form, find_or_create_location
+from app.services.hashtag_service import extract_hashtags, sync_post_hashtags
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 reels_router = APIRouter(prefix="/api/reels", tags=["reels"])
-
-_HASHTAG_PATTERN = re.compile(r"#(\w+)")
-
-
-def _extract_hashtags(caption: str | None) -> list[str]:
-    """Pulls #tags out of a caption, de-duplicated, in first-seen order.
-
-    Captions are free text (there's no separate hashtags table), so this
-    is computed on read rather than stored — good enough for display, but
-    not queryable/filterable in the DB. If hashtag search/discovery is
-    ever needed, promote this into a real PostHashtag table populated on
-    post create/update instead.
-    """
-    if not caption:
-        return []
-    seen: dict[str, None] = {}
-    for match in _HASHTAG_PATTERN.finditer(caption):
-        tag = match.group(1)
-        seen.setdefault(tag, None)
-    return list(seen.keys())
 
 
 # ---- internal helpers ----
@@ -55,7 +35,20 @@ def _to_post_detail(
     detail.likes_count = engagement.likes_count(db, models.LikeTargetType.post, post.id)
     detail.comments_count = engagement.comments_count(db, post.id)
     detail.share_count = engagement.shares_count(db, models.ShareContentType.post, post.id)
-    detail.hashtags = _extract_hashtags(post.caption)
+    detail.hashtags = extract_hashtags(post.caption)
+    if post.media_items:
+        detail.media = [
+            schemas.MediaItemOut.model_validate(m) for m in post.media_items
+        ]
+    else:
+        # Legacy post created before the post_media table existed — synthesize
+        # a single-item list from the flat columns so `media` is never empty.
+        detail.media = [
+            schemas.MediaItemOut(
+                id=post.id, media_url=post.media_url, media_type=post.media_type, position=0
+            )
+        ]
+    detail.media_count = len(detail.media)
     detail.like_id = engagement.get_like_id(
         db, viewer_id, models.LikeTargetType.post, post.id
     )
@@ -221,7 +214,17 @@ def _require_author_visible(db: Session, author: models.User, viewer_id: int | N
 
 @router.post("", response_model=schemas.PostDetailOut, status_code=status.HTTP_201_CREATED)
 def create_post(
-    file: UploadFile,
+    file: UploadFile | None = File(
+        default=None,
+        description="Single-photo/video post. Keep using this field name for "
+        "existing single-upload clients — unchanged from before.",
+    ),
+    files: list[UploadFile] | None = File(
+        default=None,
+        description="Carousel post: send 2+ files under this field name "
+        "instead of `file` to attach multiple photos/videos to one post. "
+        "The response's `media` array lists all of them, in upload order.",
+    ),
     caption: str | None = Form(default=None),
     alt_text: str | None = Form(default=None),
     ai_generated: bool = Form(default=False),
@@ -257,7 +260,13 @@ def create_post(
     or the individual post-details endpoints (/tags, /music, /location,
     etc) if you'd rather set them one at a time or after the fact.
     Hashtags aren't a separate field — they're parsed out of `caption`
-    automatically (see hashtags in the response).
+    automatically (see hashtags in the response), and persisted so they're
+    browsable via GET /api/hashtags/{name}/posts and /api/hashtags/trending.
+    For media, send one file under `file` (unchanged, single-photo/video
+    post) or two-or-more under `files` (carousel post) — not both. The
+    response's `media` list has one entry per attached file, in order;
+    `media_url`/`media_type` keep mirroring the first item for any existing
+    client that only reads those flat fields.
     tag_user_ids / member_user_ids are multipart form fields, so they're
     plain comma-separated strings here rather than JSON arrays (multipart
     can't carry nested types) — e.g. "12,15,20".
@@ -272,6 +281,18 @@ def create_post(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"{field_name} must be comma-separated integers, e.g. '12,15,20'",
             )
+
+    # Accept either the original single-file field or the new multi-file
+    # one, but not neither/both — keeps the multipart contract unambiguous
+    # while leaving existing single-`file` clients untouched.
+    upload_files = [f for f in (files or []) if f is not None and f.filename]
+    if file is not None and file.filename:
+        upload_files = [file] + upload_files
+    if not upload_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Attach at least one file via `file` (single) or `files` (multiple)",
+        )
 
     tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
     member_ids = _parse_ids(member_user_ids, "member_user_ids")
@@ -297,12 +318,13 @@ def create_post(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    url, kind = save_upload_file(file, "posts", allow_video=True)
+    saved = [save_upload_file(f, "posts", allow_video=True) for f in upload_files]
+    first_url, first_kind = saved[0]
     post = models.Post(
         user_id=current_user.id,
         caption=caption,
-        media_url=url,
-        media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
+        media_url=first_url,
+        media_type=models.MediaType.video if first_kind == "video" else models.MediaType.image,
         alt_text=alt_text,
         ai_generated=ai_generated,
         music_title=music_title,
@@ -318,6 +340,16 @@ def create_post(
     )
     db.add(post)
     db.flush()
+
+    for position, (url, kind) in enumerate(saved):
+        db.add(models.PostMedia(
+            post_id=post.id,
+            media_url=url,
+            media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
+            position=position,
+        ))
+
+    sync_post_hashtags(db, post, caption)
 
     if tag_ids:
         _replace_post_tags(db, post, tag_ids)
@@ -358,19 +390,57 @@ def get_home_feed(
 def get_explore_feed(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    days: int = Query(30, ge=1, le=90, description="Engagement window used for ranking, in days"),
     db: Session = Depends(get_db),
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    """Posts from accounts the current user doesn't already follow (all posts, if logged out)."""
+    """Posts from accounts the current user doesn't already follow (all
+    posts, if logged out), ranked by recent engagement (likes + comments in
+    the trailing `days` window) rather than plain recency — same idea as
+    GET /api/reels/trending, just without the score>0 filter, so posts with
+    no engagement yet still show up (ordered after everything that has some,
+    newest first)."""
     viewer_id = current_user.id if current_user else None
-    query = db.query(models.Post).join(models.User, models.Post.user_id == models.User.id)
-    query = query.filter(_visible_authors_clause(db, viewer_id))
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    likes_subq = (
+        db.query(
+            models.Like.target_id.label("post_id"),
+            func.count(models.Like.id).label("like_score"),
+        )
+        .filter(
+            models.Like.target_type == models.LikeTargetType.post,
+            models.Like.created_at >= since,
+        )
+        .group_by(models.Like.target_id)
+        .subquery()
+    )
+    comments_subq = (
+        db.query(
+            models.Comment.post_id.label("post_id"),
+            func.count(models.Comment.id).label("comment_score"),
+        )
+        .filter(models.Comment.created_at >= since)
+        .group_by(models.Comment.post_id)
+        .subquery()
+    )
+    score = func.coalesce(likes_subq.c.like_score, 0) + func.coalesce(comments_subq.c.comment_score, 0)
+
+    query = (
+        db.query(models.Post, score.label("score"))
+        .join(models.User, models.Post.user_id == models.User.id)
+        .outerjoin(likes_subq, models.Post.id == likes_subq.c.post_id)
+        .outerjoin(comments_subq, models.Post.id == comments_subq.c.post_id)
+        .filter(_visible_authors_clause(db, viewer_id))
+    )
     if current_user is not None:
         excluded_ids = _following_ids(db, current_user.id) + [current_user.id]
         query = query.filter(models.Post.user_id.notin_(excluded_ids))
+    query = query.order_by(score.desc(), models.Post.created_at.desc())
+
     total = query.count()
-    posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
-    items = [_to_post_detail(db, p, viewer_id) for p in posts]
+    rows = query.offset(offset).limit(limit).all()
+    items = [_to_post_detail(db, p, viewer_id) for p, _score in rows]
     return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
 
@@ -403,6 +473,9 @@ def update_post(
 
     if "caption" in updates:
         post.caption = updates["caption"]
+        db.flush()  # post.id already exists (update, not create), but keep
+        # ordering explicit: hashtag sync reads/writes rows keyed on it.
+        sync_post_hashtags(db, post, post.caption)
 
     if "alt_text" in updates:
         post.alt_text = updates["alt_text"]
@@ -456,25 +529,55 @@ def update_post(
 @router.put("/{post_id}/media", response_model=schemas.PostDetailOut)
 def update_post_media(
     post_id: int,
-    file: UploadFile,
+    file: UploadFile | None = File(default=None, description="Replace with a single file (unchanged behavior)."),
+    files: list[UploadFile] | None = File(
+        default=None, description="Replace with 2+ files instead, for a carousel post."
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Replace a post's image/video. Separate from PUT /:id because this
-    needs multipart, not JSON."""
+    """Replace all of a post's media in one shot. Separate from PUT /:id
+    because this needs multipart, not JSON. Full replace, same as before:
+    whatever files are sent here become the post's entire media set —
+    anything previously attached is deleted (DB rows and files on disk)."""
     post = _get_post_or_404(db, post_id)
     if post.user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="You can only update your own posts"
         )
 
-    old_url = post.media_url
-    url, kind = save_upload_file(file, "posts", allow_video=True)
-    post.media_url = url
-    post.media_type = models.MediaType.video if kind == "video" else models.MediaType.image
+    upload_files = [f for f in (files or []) if f is not None and f.filename]
+    if file is not None and file.filename:
+        upload_files = [file] + upload_files
+    if not upload_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Attach at least one file via `file` (single) or `files` (multiple)",
+        )
+
+    old_urls = [post.media_url] + [m.media_url for m in post.media_items]
+    old_urls = list(dict.fromkeys(old_urls))  # de-dupe (media_items[0] often == media_url)
+
+    saved = [save_upload_file(f, "posts", allow_video=True) for f in upload_files]
+    first_url, first_kind = saved[0]
+    post.media_url = first_url
+    post.media_type = models.MediaType.video if first_kind == "video" else models.MediaType.image
+
+    for m in list(post.media_items):
+        db.delete(m)
+    db.flush()
+    for position, (url, kind) in enumerate(saved):
+        db.add(models.PostMedia(
+            post_id=post.id,
+            media_url=url,
+            media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
+            position=position,
+        ))
+
     db.commit()
     db.refresh(post)
-    delete_media_file(old_url)
+    for old_url in old_urls:
+        delete_media_file(old_url)
     return _to_post_detail(db, post, current_user.id)
 
 
@@ -512,10 +615,11 @@ def delete_post(
         models.Like.target_id == post_id,
     ).delete(synchronize_session=False)
 
-    media_url = post.media_url
-    db.delete(post)  # cascades saved_posts via the ORM relationship
+    media_urls = list(dict.fromkeys([post.media_url] + [m.media_url for m in post.media_items]))
+    db.delete(post)  # cascades saved_posts/media_items/hashtag_rows via the ORM relationship
     db.commit()
-    delete_media_file(media_url)
+    for url in media_urls:
+        delete_media_file(url)
     return schemas.MessageResponse(message="Post deleted")
 
 

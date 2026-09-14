@@ -729,16 +729,27 @@ class MusicOut(BaseModel):
     start_seconds: int
 
 
+class MediaItemOut(BaseModel):
+    """One item of a post's media carousel — see app/models.py PostMedia."""
+    id: int
+    media_url: str
+    media_type: MediaType
+    position: int = 0
+
+    class Config:
+        from_attributes = True
+
+
 class PostDetailOut(PostOut):
     user: UserSummaryOut | None = None
     likes_count: int = 0
     comments_count: int = 0
     share_count: int = 0
     hashtags: list[str] = []
-    # Number of media items attached to the post. Posts currently store a
-    # single `media_url` each (no carousel/multi-image support yet), so
-    # this is always 1 — included now so the frontend has a stable field
-    # to key off if/when carousel posts are added.
+    # All media attached to the post, in upload order. `media_url`/
+    # `media_type` above keep mirroring media[0] for any client that only
+    # reads the flat fields — this list is the additive, carousel-aware view.
+    media: list[MediaItemOut] = []
     media_count: int = 1
     is_liked: bool = False
     like_id: int | None = None
@@ -758,6 +769,29 @@ class PaginatedPostDetailResponse(BaseModel):
     limit: int
     offset: int
     items: list[PostDetailOut]
+
+
+# ---- Hashtags ----
+
+class HashtagOut(BaseModel):
+    """GET /api/hashtags/{name} — a hashtag plus how many posts carry it."""
+    name: str
+    posts_count: int
+
+
+class TrendingHashtagOut(BaseModel):
+    """One row of GET /api/hashtags/trending — a hashtag ranked by recent
+    post volume, alongside its all-time post count for context."""
+    name: str
+    posts_count: int
+    recent_posts_count: int
+
+
+class PaginatedTrendingHashtagsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[TrendingHashtagOut]
 
 
 # ---- Post details: tag people, add music, add location, add members ----
