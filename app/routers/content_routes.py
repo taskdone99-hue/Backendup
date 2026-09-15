@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
+from app.form_fields import OptionalFloatForm, OptionalIntForm
 from app.services.media_service import delete_media_file, generate_video_thumbnail, save_upload_file
 from app.services import engagement
 from app.services.location_service import resolve_location_from_form, find_or_create_location
@@ -698,11 +699,16 @@ def create_reel(
     caption: str | None = Form(default=None),
     thumbnail: UploadFile | None = File(default=None),
     location_name: str | None = Form(default=None),
-    location_latitude: float | None = Form(default=None),
-    location_longitude: float | None = Form(default=None),
-    location_id: int | None = Form(
-        default=None, description="Attach an already-saved location (see POST /api/locations) by id"
-    ),
+    location_latitude: OptionalFloatForm(
+        description="Optional. Leave unset (or blank) for no coordinates."
+    ) = None,
+    location_longitude: OptionalFloatForm(
+        description="Optional. Leave unset (or blank) for no coordinates."
+    ) = None,
+    location_id: OptionalIntForm(
+        description="Optional. Attach an already-saved location (see POST /api/locations) by id. "
+        "Leave unset (or blank) if you're not tagging an existing saved location."
+    ) = None,
     location_address: str | None = Form(default=None),
     location_city: str | None = Form(default=None),
     location_state: str | None = Form(default=None),

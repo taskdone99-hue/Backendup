@@ -222,3 +222,136 @@ def test_location_reels_endpoint_lists_tagged_reels(seeded_user):
 def test_location_reels_endpoint_404_for_unknown_location():
     resp = client.get("/api/locations/999999/reels")
     assert resp.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Optional multipart location fields: Swagger "Try it out" (and plain HTML
+# forms) send an unfilled optional field as an empty string "" rather than
+# omitting it. These fields must accept that the same as if they'd been
+# left out entirely, instead of a 422 "unable to parse string as a number"
+# error. See app/form_fields.py.
+# --------------------------------------------------------------------------
+
+def test_create_reel_without_location(seeded_user):
+    """1. Reel without location: no location_* fields sent at all."""
+    resp = client.post(
+        "/api/reels",
+        headers=_auth_headers(seeded_user),
+        data={"caption": "just a clip, no place"},
+        files={"file": _fake_video()},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["location"] is None
+    assert body["location_name"] is None
+
+
+def test_create_reel_with_location_id(seeded_user):
+    """2. Reel with location_id: attaches an existing saved location."""
+    seed = client.post(
+        "/api/reels",
+        headers=_auth_headers(seeded_user),
+        data={
+            "location_name": "Golkonda Fort",
+            "location_latitude": 17.3833,
+            "location_longitude": 78.4011,
+        },
+        files={"file": _fake_video()},
+    ).json()
+    loc_id = seed["location"]["id"]
+
+    resp = client.post(
+        "/api/reels",
+        headers=_auth_headers(seeded_user),
+        data={"caption": "back again", "location_id": loc_id},
+        files={"file": _fake_video()},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["location"]["id"] == loc_id
+    assert body["location"]["name"] == "Golkonda Fort"
+
+
+def test_create_reel_with_new_location_details(seeded_user):
+    """3. Reel with new location details: resolve/create via
+    location_name + coordinates + the other location_* fields."""
+    resp = client.post(
+        "/api/reels",
+        headers=_auth_headers(seeded_user),
+        data={
+            "caption": "new spot",
+            "location_name": "Ramoji Film City",
+            "location_address": "Anaspur Village",
+            "location_city": "Hyderabad",
+            "location_state": "Telangana",
+            "location_country": "India",
+            "location_latitude": 17.2543,
+            "location_longitude": 78.6808,
+        },
+        files={"file": _fake_video()},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["location"]["name"] == "Ramoji Film City"
+    assert body["location"]["city"] == "Hyderabad"
+    assert body["location"]["latitude"] == 17.2543
+    assert body["location"]["longitude"] == 78.6808
+
+
+def test_create_reel_empty_optional_location_fields_not_rejected(seeded_user):
+    """4. Empty-string optional location fields (what Swagger's "Try it
+    out" sends for blank fields) must not 400/422 — they're treated the
+    same as those fields being omitted entirely, so no location ends up
+    attached."""
+    resp = client.post(
+        "/api/reels",
+        headers=_auth_headers(seeded_user),
+        data={
+            "caption": "swagger blank fields",
+            "location_id": "",
+            "location_name": "",
+            "location_latitude": "",
+            "location_longitude": "",
+            "location_address": "",
+            "location_city": "",
+            "location_state": "",
+            "location_country": "",
+            "location_place_id": "",
+        },
+        files={"file": _fake_video()},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["location"] is None
+
+
+def test_create_reel_blank_coordinates_with_location_name_still_creates_location(seeded_user):
+    """Blank lat/long shouldn't block resolving a location from name alone
+    (coordinates stay unset on it, same as if the fields were omitted)."""
+    resp = client.post(
+        "/api/reels",
+        headers=_auth_headers(seeded_user),
+        data={
+            "location_name": "Some Unnamed Spot",
+            "location_latitude": "",
+            "location_longitude": "",
+            "location_id": "",
+        },
+        files={"file": _fake_video()},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["location"]["name"] == "Some Unnamed Spot"
+    assert body["location"]["latitude"] is None
+    assert body["location"]["longitude"] is None
+
+
+def test_create_reel_invalid_latitude_still_rejected_with_real_value(seeded_user):
+    """The empty-string fix must not loosen validation for an actual
+    out-of-range value — only blank input is treated as absent."""
+    resp = client.post(
+        "/api/reels",
+        headers=_auth_headers(seeded_user),
+        data={"location_name": "Nowhere", "location_latitude": "999"},
+        files={"file": _fake_video()},
+    )
+    assert resp.status_code == 400
