@@ -1,10 +1,10 @@
 """
-Location APIs — attach a place to a post/story, look it up, search saved
-locations, and browse content tagged at a location.
+Location APIs — attach a place to a post/story/reel, look it up, search
+saved locations, and browse content tagged at a location.
 
 Not user-location tracking: every Location row exists only because someone
-explicitly attached it to a post/story (or called POST /api/locations to
-save one for later) — see app/services/location_service.py.
+explicitly attached it to a post/story/reel (or called POST /api/locations
+to save one for later) — see app/services/location_service.py.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -18,7 +18,7 @@ from app.services.location_service import (
     get_location_or_404,
     search_locations,
 )
-from app.routers.content_routes import _visible_authors_clause, _to_post_detail
+from app.routers.content_routes import _visible_authors_clause, _to_post_detail, _to_reel_detail
 from app.routers.story_routes import _active_story_query, _to_story_out
 
 router = APIRouter(prefix="/api/locations", tags=["locations"])
@@ -105,6 +105,32 @@ def get_location_posts(
     posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_post_detail(db, p, viewer_id) for p in posts]
     return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+@router.get("/{location_id}/reels", response_model=schemas.PaginatedReelDetailResponse)
+def get_location_reels(
+    location_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
+    """Reels tagged at this location — same visibility rule as
+    GET /{location_id}/posts above."""
+    if get_location_or_404(db, location_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Location not found")
+
+    viewer_id = current_user.id if current_user else None
+    query = (
+        db.query(models.Reel)
+        .join(models.User, models.Reel.user_id == models.User.id)
+        .filter(models.Reel.location_id == location_id)
+        .filter(_visible_authors_clause(db, viewer_id))
+    )
+    total = query.count()
+    reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
+    items = [_to_reel_detail(db, r, viewer_id) for r in reels]
+    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
 
 @router.get("/{location_id}/stories", response_model=schemas.MyStoriesResponse)

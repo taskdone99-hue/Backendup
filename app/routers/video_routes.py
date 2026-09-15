@@ -24,6 +24,7 @@ from app import models, schemas
 from app.auth import get_current_user
 from app.database import get_db
 from app.services.media_service import generate_video_thumbnail, save_upload_file
+from app.services.location_service import find_or_create_location
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
@@ -95,6 +96,25 @@ def update_video_metadata(
         video.title = updates["title"]
     if "description" in updates:
         video.caption = updates["description"]
+
+    if "location" in updates:
+        location = updates["location"]
+        if location is None:
+            video.location_name = None
+            video.location_latitude = None
+            video.location_longitude = None
+            video.location_id = None
+        else:
+            loc_row = find_or_create_location(
+                db,
+                name=location["name"],
+                latitude=location.get("latitude"),
+                longitude=location.get("longitude"),
+            )
+            video.location_name = loc_row.name
+            video.location_latitude = loc_row.latitude
+            video.location_longitude = loc_row.longitude
+            video.location_id = loc_row.id
 
     db.commit()
     db.refresh(video)

@@ -894,6 +894,10 @@ class ReelDetailOut(ReelOut):
     is_liked: bool = False
     like_id: int | None = None
     is_saved: bool = False
+    location_name: str | None = None
+    location_latitude: float | None = None
+    location_longitude: float | None = None
+    location: LocationOut | None = None
 
 
 class PaginatedReelDetailResponse(BaseModel):
@@ -904,9 +908,13 @@ class PaginatedReelDetailResponse(BaseModel):
 
 
 class VideoMetadataUpdate(BaseModel):
-    """PUT /api/videos/:id/metadata — both fields optional so callers can patch just one."""
+    """PUT /api/videos/:id/metadata — every field optional so callers can patch just one.
+    `location` follows the same shape/semantics as PUT /api/posts/:id's `location`
+    field: omit to leave unchanged, send `null` to clear it, or a name(+coordinates)
+    object to set/replace it."""
     title: str | None = Field(default=None, max_length=150)
     description: str | None = Field(default=None, max_length=2200, description="Stored as the reel's caption")
+    location: LocationIn | None = None
 
     @field_validator("title")
     @classmethod

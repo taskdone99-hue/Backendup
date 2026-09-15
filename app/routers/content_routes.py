@@ -151,6 +151,14 @@ def _to_reel_detail(
     detail.is_saved = engagement.is_saved_by(
         db, viewer_id, reel.id, models.SavedItemType.reel
     )
+    if reel.location_id and reel.location is not None:
+        detail.location = schemas.LocationOut.model_validate(reel.location)
+    elif reel.location_name:
+        detail.location = schemas.LocationOut(
+            name=reel.location_name,
+            latitude=reel.location_latitude,
+            longitude=reel.location_longitude,
+        )
     return detail
 
 
@@ -689,6 +697,17 @@ def create_reel(
     file: UploadFile,
     caption: str | None = Form(default=None),
     thumbnail: UploadFile | None = File(default=None),
+    location_name: str | None = Form(default=None),
+    location_latitude: float | None = Form(default=None),
+    location_longitude: float | None = Form(default=None),
+    location_id: int | None = Form(
+        default=None, description="Attach an already-saved location (see POST /api/locations) by id"
+    ),
+    location_address: str | None = Form(default=None),
+    location_city: str | None = Form(default=None),
+    location_state: str | None = Form(default=None),
+    location_country: str | None = Form(default=None),
+    location_place_id: str | None = Form(default=None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -702,7 +721,33 @@ def create_reel(
     available on the server or the video can't be read, thumbnail_url
     just comes back null (never blocks the reel from being created); you
     can still call POST /api/videos/{id}/thumbnail afterward to attach one.
+
+    Location works the same as POST /api/posts: pass an existing
+    `location_id`, or `location_name`/the other `location_*` fields to
+    resolve-or-create one, or leave all of them unset for no location.
+    Changeable afterward too, via PUT /api/videos/{id}/metadata.
     """
+    if location_latitude is not None and not (-90 <= location_latitude <= 90):
+        raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
+    if location_longitude is not None and not (-180 <= location_longitude <= 180):
+        raise HTTPException(status_code=400, detail="location_longitude must be between -180 and 180")
+
+    try:
+        location = resolve_location_from_form(
+            db,
+            location_id=location_id,
+            location_name=location_name,
+            location_address=location_address,
+            location_city=location_city,
+            location_state=location_state,
+            location_country=location_country,
+            location_latitude=location_latitude,
+            location_longitude=location_longitude,
+            location_place_id=location_place_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
     url, kind = save_upload_file(file, "reels", allow_video=True)
     if kind != "video":
         raise HTTPException(
@@ -720,7 +765,14 @@ def create_reel(
         thumbnail_url = generate_video_thumbnail(url)
 
     reel = models.Reel(
-        user_id=current_user.id, caption=caption, video_url=url, thumbnail_url=thumbnail_url
+        user_id=current_user.id,
+        caption=caption,
+        video_url=url,
+        thumbnail_url=thumbnail_url,
+        location_name=location.name if location else location_name,
+        location_latitude=location.latitude if location else location_latitude,
+        location_longitude=location.longitude if location else location_longitude,
+        location_id=location.id if location else None,
     )
     db.add(reel)
     db.commit()

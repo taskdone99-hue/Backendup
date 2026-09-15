@@ -411,7 +411,16 @@ class Reel(Base):
     remixed_from_id = Column(Integer, nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Same shape as Post's location fields above — flat columns stay
+    # populated for simple readers, location_id points at the richer
+    # Location row when one was resolved/attached.
+    location_name = Column(String(150), nullable=True)
+    location_latitude = Column(Float, nullable=True)
+    location_longitude = Column(Float, nullable=True)
+    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
+
     user = relationship("User", back_populates="reels")
+    location = relationship("Location", foreign_keys=[location_id])
     collaborators = relationship(
         "ReelCollaborator", back_populates="reel", cascade="all, delete-orphan"
     )
