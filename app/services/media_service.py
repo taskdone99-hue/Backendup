@@ -25,9 +25,11 @@ STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
 # Keep uploads modest — these are avatars/posts/reels/stories, not raw video masters.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024   # 10 MB
 MAX_VIDEO_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_AUDIO_BYTES = 25 * 1024 * 1024   # 25 MB — voice notes, not music tracks
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
+ALLOWED_AUDIO_TYPES = {"audio/mpeg", "audio/mp4", "audio/aac", "audio/wav", "audio/webm", "audio/ogg"}
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
@@ -43,10 +45,13 @@ def save_upload_file(
     subfolder: str,
     *,
     allow_video: bool = False,
+    allow_audio: bool = False,
 ) -> tuple[str, str]:
     """
     Validates and saves an uploaded file. Returns (public_url, kind) where
-    kind is "image" or "video". Raises HTTPException(400) on anything invalid.
+    kind is "image", "video", or "audio" (only reachable when allow_audio=True
+    — used for DM voice notes, see chat_routes.send_media_message).
+    Raises HTTPException(400) on anything invalid.
     """
     content_type = (file.content_type or "").lower()
 
@@ -56,15 +61,22 @@ def save_upload_file(
     elif allow_video and content_type in ALLOWED_VIDEO_TYPES:
         kind = "video"
         max_bytes = MAX_VIDEO_BYTES
+    elif allow_audio and content_type in ALLOWED_AUDIO_TYPES:
+        kind = "audio"
+        max_bytes = MAX_AUDIO_BYTES
     else:
-        allowed = ALLOWED_IMAGE_TYPES | (ALLOWED_VIDEO_TYPES if allow_video else set())
+        allowed = (
+            ALLOWED_IMAGE_TYPES
+            | (ALLOWED_VIDEO_TYPES if allow_video else set())
+            | (ALLOWED_AUDIO_TYPES if allow_audio else set())
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file type '{content_type}'. Allowed: {', '.join(sorted(allowed))}",
         )
 
     ext = os.path.splitext(file.filename or "")[1].lower() or (
-        ".mp4" if kind == "video" else ".jpg"
+        ".mp4" if kind == "video" else ".m4a" if kind == "audio" else ".jpg"
     )
     filename = f"{uuid.uuid4().hex}{ext}"
 

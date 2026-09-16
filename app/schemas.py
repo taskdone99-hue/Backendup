@@ -598,6 +598,9 @@ class StoryOut(BaseModel):
     reactions_count: int = 0
     my_reaction: str | None = None
     location: LocationOut | None = None
+    mentions: "list[StoryMentionOut]" = []
+    poll: "StoryPollOut | None" = None
+    question: "StoryQuestionOut | None" = None
 
     class Config:
         from_attributes = True
@@ -1317,6 +1320,9 @@ class ConversationCreate(BaseModel):
 
 class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1, max_length=2200)
+    reply_to_message_id: int | None = Field(
+        default=None, gt=0, description="Reply to another message in this conversation"
+    )
 
     @field_validator("content")
     @classmethod
@@ -1363,7 +1369,11 @@ class MessageOut(BaseModel):
     id: int
     conversation_id: int
     sender_id: int
-    content: str
+    content: str | None
+    media_url: str | None = None
+    media_type: MediaType | None = None
+    reply_to_message_id: int | None = None
+    reply_to: "MessageRepliedToOut | None" = None
     reply_to_story_id: int | None = None
     is_auto_message: bool = False
     edited_at: datetime | None = None
@@ -1402,6 +1412,11 @@ class ConversationOut(BaseModel):
     participants: list[ChatParticipantOut]
     last_message: MessageOut | None = None
     unread_count: int = 0
+    # This viewer's own participant status — "pending" means the thread is
+    # sitting in their Message Requests until they accept/decline (see
+    # chat_routes.get_message_requests / accept_conversation).
+    status: str = "accepted"
+    is_muted: bool = False
     # Only meaningful from POST /api/chat/conversations: whether this call
     # just created the 1:1 thread (vs. returning an existing one), and — if
     # so — the auto-intro DM that was sent on B's behalf. Both are None on
@@ -1788,3 +1803,165 @@ class PaginatedSearchSongsResponse(BaseModel):
     limit: int
     offset: int
     items: list[SearchSongOut]
+
+
+# ---- Privacy: block / restrict / mute ----
+
+class BlockActionResponse(BaseModel):
+    message: str
+    is_blocked: bool
+
+
+class RestrictActionResponse(BaseModel):
+    message: str
+    is_restricted: bool
+
+
+class MuteRequest(BaseModel):
+    """POST /api/privacy/mute/:user_id — at least one of the two must be
+    true (both default true, matching tapping "Mute" in the app, which
+    mutes both by default)."""
+    mute_posts: bool = True
+    mute_stories: bool = True
+
+
+class MuteOut(BaseModel):
+    user: UserSummaryOut
+    mute_posts: bool
+    mute_stories: bool
+
+
+class MuteActionResponse(BaseModel):
+    message: str
+    mute_posts: bool
+    mute_stories: bool
+
+
+class PaginatedMutedUsersResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[MuteOut]
+
+
+# ---- Advanced stories: mentions / polls / questions ----
+
+class StoryMentionOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class StoryPollOptionIn(BaseModel):
+    text: str = Field(..., max_length=60)
+
+
+class StoryPollIn(BaseModel):
+    """Attach a poll sticker at story-creation time. Instagram's own poll
+    sticker is always exactly two options, so that's what's enforced here
+    (min_length=max_length=2) — see models.StoryPoll's docstring for why
+    the table itself doesn't hardcode that."""
+    question: str = Field(..., max_length=150)
+    options: list[StoryPollOptionIn] = Field(..., min_length=2, max_length=2)
+
+
+class StoryPollOptionOut(BaseModel):
+    id: int
+    text: str
+    votes_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class StoryPollOut(BaseModel):
+    id: int
+    question: str
+    options: list[StoryPollOptionOut]
+    total_votes: int = 0
+    my_vote_option_id: int | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class StoryPollVoteRequest(BaseModel):
+    option_id: int = Field(..., gt=0)
+
+
+class StoryQuestionIn(BaseModel):
+    """Attach a question sticker ("Ask me anything") at story-creation time."""
+    prompt: str = Field(..., max_length=150)
+
+
+class StoryQuestionResponseIn(BaseModel):
+    response_text: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator("response_text")
+    @classmethod
+    def strip_response(cls, v: str) -> str:
+        return v.strip()
+
+
+class StoryQuestionResponseOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    response_text: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class StoryQuestionOut(BaseModel):
+    id: int
+    prompt: str
+    responses_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class StoryQuestionResponsesResponse(BaseModel):
+    prompt: str
+    items: list[StoryQuestionResponseOut]
+
+
+# ---- Advanced DM: media messages, replies, message requests ----
+
+class MessageRepliedToOut(BaseModel):
+    """Compact preview of the message being replied to — enough to render
+    a reply-quote UI without a second fetch."""
+    id: int
+    sender_id: int
+    content: str | None
+    media_type: MediaType | None
+    is_deleted: bool
+
+    class Config:
+        from_attributes = True
+
+
+class MediaMessageResponse(BaseModel):
+    """Returned by POST /api/chat/conversations/:id/media — same shape as
+    MessageOut, kept as its own name since it's documented as a distinct
+    upload flow in the API reference; the schema itself doesn't diverge."""
+    id: int
+    conversation_id: int
+    sender_id: int
+    content: str | None
+    media_url: str | None
+    media_type: MediaType | None
+    reply_to_message_id: int | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationRequestActionResponse(BaseModel):
+    message: str
+    conversation_id: int

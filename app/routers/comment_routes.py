@@ -4,6 +4,7 @@ can all be liked through the same /api/likes endpoints — see models.Like).
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -11,11 +12,28 @@ from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.database import get_db
 from app.services import engagement
+from app.services.privacy_service import restricted_user_ids, is_blocked
 
 router = APIRouter(tags=["comments"])
 
 
 # ---- internal helpers ----
+
+def _restrict_filtered(query, owner_id: int, viewer_id: int | None, db: Session):
+    """Hides comments from anyone `owner_id` has restricted, from every
+    viewer except `owner_id` themselves and the restricted commenter (who
+    still sees their own comment) — real Instagram Restrict semantics: the
+    restricted user never finds out their comment is only visible to them
+    and the post/reel owner."""
+    if viewer_id == owner_id:
+        return query
+    restricted_ids = restricted_user_ids(db, owner_id)
+    if not restricted_ids:
+        return query
+    return query.filter(
+        or_(models.Comment.user_id.notin_(restricted_ids), models.Comment.user_id == viewer_id)
+    )
+
 
 def _get_post_or_404(db: Session, post_id: int) -> models.Post:
     post = db.query(models.Post).filter(models.Post.id == post_id).first()
@@ -77,7 +95,9 @@ def add_comment(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    _get_post_or_404(db, post_id)
+    post = _get_post_or_404(db, post_id)
+    if is_blocked(db, current_user.id, post.user_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not found")
     comment = models.Comment(post_id=post_id, user_id=current_user.id, content=payload.content)
     db.add(comment)
     db.commit()
@@ -98,13 +118,14 @@ def get_comments(
     the client whether there's a thread worth fetching via
     POST /api/comments/:id/reply's replies — one level deep, no nested pagination.
     """
-    _get_post_or_404(db, post_id)
     query = db.query(models.Comment).options(joinedload(models.Comment.user)).filter(
         models.Comment.post_id == post_id, models.Comment.parent_id.is_(None)
     )
+    viewer_id = current_user.id if current_user else None
+    post = _get_post_or_404(db, post_id)
+    query = _restrict_filtered(query, post.user_id, viewer_id, db)
     total = query.count()
     comments = query.order_by(models.Comment.created_at.asc()).offset(offset).limit(limit).all()
-    viewer_id = current_user.id if current_user else None
     items = [_to_comment_out(db, c, viewer_id) for c in comments]
     return schemas.PaginatedCommentsResponse(total=total, limit=limit, offset=offset, items=items)
 
@@ -120,7 +141,9 @@ def add_reel_comment(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    _get_reel_or_404(db, reel_id)
+    reel = _get_reel_or_404(db, reel_id)
+    if is_blocked(db, current_user.id, reel.user_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not found")
     comment = models.Comment(reel_id=reel_id, user_id=current_user.id, content=payload.content)
     db.add(comment)
     db.commit()
@@ -136,14 +159,15 @@ def get_reel_comments(
     db: Session = Depends(get_db),
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    _get_reel_or_404(db, reel_id)
     query = db.query(models.Comment).options(joinedload(models.Comment.user)).filter(
         models.Comment.reel_id == reel_id,
         models.Comment.parent_id.is_(None),
     )
+    viewer_id = current_user.id if current_user else None
+    reel = _get_reel_or_404(db, reel_id)
+    query = _restrict_filtered(query, reel.user_id, viewer_id, db)
     total = query.count()
     comments = query.order_by(models.Comment.created_at.asc()).offset(offset).limit(limit).all()
-    viewer_id = current_user.id if current_user else None
     items = [_to_comment_out(db, c, viewer_id) for c in comments]
     return schemas.PaginatedCommentsResponse(total=total, limit=limit, offset=offset, items=items)
 

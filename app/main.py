@@ -34,16 +34,21 @@ from app.routers import (
     brand_collaboration_routes,
     search_routes,
     hashtag_routes,
+    privacy_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
 # For an existing DB that already has a `users` table, also run
 # `python -m app.add_profile_columns` once to add the new profile columns —
 # create_all() only creates missing tables, it doesn't alter existing ones.
-# The post_media/hashtags/post_hashtags tables are brand new, so create_all()
-# does create them automatically — but for a DB with pre-existing posts, also
-# run `python -m app.backfill_post_media_and_hashtags` once afterward to
-# populate those tables for posts created before this update.
+# The post_media/hashtags/post_hashtags/user_blocks/user_restricts/user_mutes/
+# conversation_mutes/story_mentions/story_polls/story_poll_options/
+# story_poll_votes/story_questions/story_question_responses tables are all
+# brand new, so create_all() does create them automatically — but for a DB
+# with pre-existing data, also run these once each, afterward:
+#   python -m app.backfill_post_media_and_hashtags   (posts made before that update)
+#   python -m app.add_reel_location_columns          (adds location_* to the existing reels table)
+#   python -m app.add_dm_media_and_request_columns   (adds media/reply/request columns to messages + conversation_participants)
 Base.metadata.create_all(bind=engine)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -125,6 +130,7 @@ app.include_router(location_routes.router)
 app.include_router(monetization_routes.router)
 app.include_router(creator_collaboration_routes.router)
 app.include_router(brand_collaboration_routes.router)
+app.include_router(privacy_routes.router)
 app.include_router(search_routes.router)
 app.include_router(hashtag_routes.router)
 

@@ -11,6 +11,8 @@ from app.auth import get_current_user
 from app.services.media_service import delete_media_file, save_upload_file
 from app.services.push_service import send_push
 from app.services.location_service import resolve_location_from_form
+from app.services import story_extras_service
+from app.services.privacy_service import blocked_user_ids, muted_user_ids, is_blocked
 
 
 router = APIRouter(prefix="/api/stories", tags=["stories"])
@@ -30,6 +32,11 @@ def _active_story_query(db: Session):
         .options(
             joinedload(models.Story.user),
             joinedload(models.Story.location),
+            joinedload(models.Story.mentions).joinedload(models.StoryMention.user),
+            joinedload(models.Story.poll).joinedload(models.StoryPoll.options).joinedload(
+                models.StoryPollOption.votes
+            ),
+            joinedload(models.Story.question).joinedload(models.StoryQuestion.responses),
         )
         .filter(models.Story.expires_at > now)
     )
@@ -83,6 +90,17 @@ def _to_story_out(
 
     if story.location_id and story.location is not None:
         out.location = schemas.LocationOut.model_validate(story.location)
+
+    out.mentions = [
+        schemas.StoryMentionOut(
+            id=m.id, user=schemas.UserSummaryOut.model_validate(m.user), created_at=m.created_at
+        )
+        for m in story.mentions
+    ]
+    if story.poll is not None:
+        out.poll = story_extras_service.to_poll_out(story.poll, viewer_id)
+    if story.question is not None:
+        out.question = story_extras_service.to_question_out(story.question)
 
     if viewer_id is not None:
         out.viewed_by_me = any(
@@ -285,6 +303,16 @@ def create_story(
 
     location_place_id: str | None = Form(default=None),
 
+    mention_user_ids: str | None = Form(
+        default=None, description="Comma-separated user ids to tag, e.g. '12,15'"
+    ),
+    poll_question: str | None = Form(default=None),
+    poll_option_1: str | None = Form(default=None),
+    poll_option_2: str | None = Form(default=None),
+    question_prompt: str | None = Form(
+        default=None, description="Adds an 'Ask me anything'-style question sticker"
+    ),
+
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -341,6 +369,34 @@ def create_story(
                     "between -180 and 180"
                 ),
             )
+
+    # ---------------------------------------------------------------
+    # Parse mentions / poll
+    # ---------------------------------------------------------------
+
+    parsed_mention_ids: list[int] = []
+    if mention_user_ids and mention_user_ids.strip():
+        try:
+            parsed_mention_ids = [
+                int(x.strip()) for x in mention_user_ids.split(",") if x.strip()
+            ]
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="mention_user_ids must be comma-separated integers, e.g. '12,15'",
+            )
+        existing_count = (
+            db.query(models.User.id).filter(models.User.id.in_(parsed_mention_ids)).count()
+        )
+        if existing_count != len(set(parsed_mention_ids)):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or more mentioned users not found")
+
+    poll_options = [o.strip() for o in (poll_option_1, poll_option_2) if o and o.strip()]
+    if poll_question and len(poll_options) != 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A poll needs poll_question plus exactly two options (poll_option_1, poll_option_2)",
+        )
 
     # ---------------------------------------------------------------
     # Resolve / create location
@@ -403,8 +459,29 @@ def create_story(
     )
 
     db.add(story)
+    db.flush()
+
+    if parsed_mention_ids:
+        story_extras_service.attach_mentions(db, story, parsed_mention_ids)
+    if poll_question and len(poll_options) == 2:
+        story_extras_service.attach_poll(db, story, poll_question, poll_options)
+    if question_prompt and question_prompt.strip():
+        story_extras_service.attach_question(db, story, question_prompt.strip())
+
     db.commit()
     db.refresh(story)
+
+    for mentioned_id in parsed_mention_ids:
+        mentioned_user = db.query(models.User).filter(models.User.id == mentioned_id).first()
+        if mentioned_user is not None:
+            _notify_story_owner(
+                db,
+                owner_id=mentioned_id,
+                actor=current_user,
+                notif_type=models.NotificationType.mention,
+                message=f"{current_user.username} mentioned you in their story",
+                story_id=story.id,
+            )
 
     # Load relationships before serialization
     story = (
@@ -447,6 +524,9 @@ def get_story_feed(
             .all()
         )
     ]
+
+    muted_ids = set(muted_user_ids(db, current_user.id, for_stories=True))
+    following_ids = [uid for uid in following_ids if uid not in muted_ids]
 
     if not following_ids:
         return schemas.StoryFeedResponse(
@@ -988,3 +1068,112 @@ def reply_to_story(
     )
 
     return message
+
+
+# -------------------------------------------------------------------
+# Poll / Question stickers
+# -------------------------------------------------------------------
+
+@router.post("/{story_id}/poll/vote", response_model=schemas.StoryPollOut)
+def vote_story_poll(
+    story_id: int,
+    payload: schemas.StoryPollVoteRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Casts (or changes) this viewer's vote. One vote per user per poll —
+    voting again with a different option_id just moves it."""
+    story = _get_active_story_or_404(db, story_id)
+    if story.poll is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This story has no poll")
+
+    option = next((o for o in story.poll.options if o.id == payload.option_id), None)
+    if option is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Poll option not found")
+
+    existing_vote = (
+        db.query(models.StoryPollVote)
+        .filter(
+            models.StoryPollVote.poll_id == story.poll.id,
+            models.StoryPollVote.user_id == current_user.id,
+        )
+        .first()
+    )
+    if existing_vote is not None:
+        existing_vote.option_id = option.id
+    else:
+        db.add(models.StoryPollVote(poll_id=story.poll.id, option_id=option.id, user_id=current_user.id))
+    db.commit()
+
+    story = _get_active_story_or_404(db, story_id)
+    return story_extras_service.to_poll_out(story.poll, current_user.id)
+
+
+@router.post(
+    "/{story_id}/question/respond",
+    response_model=schemas.StoryQuestionResponseOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def respond_to_story_question(
+    story_id: int,
+    payload: schemas.StoryQuestionResponseIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    story = _get_active_story_or_404(db, story_id)
+    if story.question is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This story has no question")
+    if is_blocked(db, current_user.id, story.user_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Story not found")
+
+    response = models.StoryQuestionResponse(
+        question_id=story.question.id, user_id=current_user.id, response_text=payload.response_text
+    )
+    db.add(response)
+    db.commit()
+    db.refresh(response)
+
+    _notify_story_owner(
+        db,
+        owner_id=story.user_id,
+        actor=current_user,
+        notif_type=models.NotificationType.other,
+        message=f"{current_user.username} answered your question: {payload.response_text[:80]}",
+        story_id=story.id,
+    )
+    return schemas.StoryQuestionResponseOut(
+        id=response.id,
+        user=schemas.UserSummaryOut.model_validate(current_user),
+        response_text=response.response_text,
+        created_at=response.created_at,
+    )
+
+
+@router.get(
+    "/{story_id}/question/responses",
+    response_model=schemas.StoryQuestionResponsesResponse,
+)
+def get_story_question_responses(
+    story_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Story-owner only — same as Instagram, where question-sticker
+    answers are private to the poster, not shown publicly like poll votes."""
+    story = _get_active_story_or_404(db, story_id)
+    _require_own_story(story, current_user)
+    if story.question is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This story has no question")
+
+    return schemas.StoryQuestionResponsesResponse(
+        prompt=story.question.prompt,
+        items=[
+            schemas.StoryQuestionResponseOut(
+                id=r.id,
+                user=schemas.UserSummaryOut.model_validate(r.user),
+                response_text=r.response_text,
+                created_at=r.created_at,
+            )
+            for r in sorted(story.question.responses, key=lambda r: r.created_at)
+        ],
+    )

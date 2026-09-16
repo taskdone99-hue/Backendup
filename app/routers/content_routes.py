@@ -10,7 +10,7 @@ app has a single video-content type).
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -21,6 +21,7 @@ from app.services.media_service import delete_media_file, generate_video_thumbna
 from app.services import engagement
 from app.services.location_service import resolve_location_from_form, find_or_create_location
 from app.services.hashtag_service import extract_hashtags, sync_post_hashtags
+from app.services.privacy_service import blocked_user_ids, muted_user_ids, is_blocked
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 reels_router = APIRouter(prefix="/api/reels", tags=["reels"])
@@ -191,23 +192,36 @@ def _visible_authors_clause(db: Session, viewer_id: int | None):
     Filter clause for discovery-style feeds (explore, global reels feed,
     trending) that queries across all accounts rather than a specific
     profile: excludes content from private accounts unless the viewer is
-    the author themselves or already follows them. Requires the query to
-    be joined to models.User on the content's user_id first, e.g.:
+    the author themselves or already follows them, AND excludes content
+    from anyone blocked in either direction (see
+    app/services/privacy_service.blocked_user_ids) — block is a full,
+    symmetric exclusion, unlike mute, which only touches follows-scoped
+    feeds (see get_home_feed / get_reels_home_feed below). Requires the
+    query to be joined to models.User on the content's user_id first, e.g.:
         query.join(models.User, models.Post.user_id == models.User.id)
              .filter(_visible_authors_clause(db, viewer_id))
     """
     if viewer_id is None:
         return models.User.is_private == False
-    return or_(
+    base = or_(
         models.User.is_private == False,
         models.User.id == viewer_id,
         models.User.id.in_(_following_ids(db, viewer_id)),
     )
+    blocked_ids = blocked_user_ids(db, viewer_id)
+    if blocked_ids:
+        return and_(base, models.User.id.notin_(blocked_ids))
+    return base
 
 
 def _require_author_visible(db: Session, author: models.User, viewer_id: int | None) -> None:
     """Same rule as _visible_authors_clause, but for a single already-fetched
-    item (a specific post/reel by id) rather than a list query."""
+    item (a specific post/reel by id) rather than a list query. A block
+    (either direction) hides the item entirely — 404, not 403, same as if
+    it never existed for this viewer — checked before the private-account
+    rule below since it's the stricter case."""
+    if viewer_id is not None and viewer_id != author.id and is_blocked(db, viewer_id, author.id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     if not author.is_private:
         return
     if viewer_id is not None and (
@@ -389,6 +403,9 @@ def get_home_feed(
     """
     query = db.query(models.Post).join(models.User, models.Post.user_id == models.User.id)
     query = query.filter(_visible_authors_clause(db, current_user.id))
+    muted_ids = muted_user_ids(db, current_user.id, for_stories=False)
+    if muted_ids:
+        query = query.filter(models.Post.user_id.notin_(muted_ids))
     total = query.count()
     posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_post_detail(db, p, current_user.id) for p in posts]
@@ -803,6 +820,8 @@ def get_reels_home_feed(
     Explore-style reel feed — this is the follows-scoped one.
     """
     author_ids = _following_ids(db, current_user.id) + [current_user.id]
+    muted_ids = set(muted_user_ids(db, current_user.id, for_stories=False))
+    author_ids = [uid for uid in author_ids if uid not in muted_ids]
     query = db.query(models.Reel).filter(models.Reel.user_id.in_(author_ids))
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()

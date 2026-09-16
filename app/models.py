@@ -41,6 +41,7 @@ class Gender(str, enum.Enum):
 class MediaType(str, enum.Enum):
     image = "image"
     video = "video"
+    audio = "audio"
 
 
 class LikeTargetType(str, enum.Enum):
@@ -102,6 +103,15 @@ class DevicePlatform(str, enum.Enum):
     ios = "ios"
     android = "android"
     web = "web"
+
+
+class ParticipantStatus(str, enum.Enum):
+    """A conversation participant's status re: message requests. `pending`
+    means the conversation is sitting in that participant's Message
+    Requests (see chat_routes.get_message_requests) rather than their main
+    inbox, until they accept or decline it."""
+    accepted = "accepted"
+    pending = "pending"
 
 
 class AccountType(str, enum.Enum):
@@ -254,6 +264,95 @@ class FollowRequest(Base):
 
     requester = relationship("User", foreign_keys=[requester_id])
     target = relationship("User", foreign_keys=[target_id])
+
+
+# ==========================================================================
+# Privacy: block / restrict / mute
+# ==========================================================================
+
+class UserBlock(Base):
+    """`blocker_id` has blocked `blocked_id` — symmetric in effect (neither
+    can see the other's public content, message each other, etc; see
+    app/services/privacy_service.py) even though the row itself is
+    directional. Blocking also tears down any Follow/FollowRequest rows
+    between the two in both directions — see privacy_routes.block_user."""
+
+    __tablename__ = "user_blocks"
+    __table_args__ = (
+        UniqueConstraint("blocker_id", "blocked_id", name="uq_user_block"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    blocker_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    blocked_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    blocker = relationship("User", foreign_keys=[blocker_id])
+    blocked = relationship("User", foreign_keys=[blocked_id])
+
+
+class UserRestrict(Base):
+    """`restricter_id` has restricted `restricted_id` — one-directional and
+    silent (the restricted user is never told). Effect: restricted_id's
+    comments on restricter_id's posts are only visible to the two of them
+    (see comment_routes.get_comments), and DMs from restricted_id land as
+    message requests (see chat_routes) — same as real Instagram Restrict."""
+
+    __tablename__ = "user_restricts"
+    __table_args__ = (
+        UniqueConstraint("restricter_id", "restricted_id", name="uq_user_restrict"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    restricter_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    restricted_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    restricter = relationship("User", foreign_keys=[restricter_id])
+    restricted = relationship("User", foreign_keys=[restricted_id])
+
+
+class UserMute(Base):
+    """`muter_id` has muted `muted_id`'s posts and/or stories from their own
+    Home/Story feed — independent toggles, same as Instagram's two separate
+    "Mute Posts" / "Mute Stories" switches. Muting is silent, doesn't touch
+    the Follow relationship, and doesn't affect explore/hashtag/search
+    results — only the follows-scoped feeds (see content_routes.get_home_feed,
+    get_reels_home_feed, story_routes.get_story_feed)."""
+
+    __tablename__ = "user_mutes"
+    __table_args__ = (
+        UniqueConstraint("muter_id", "muted_id", name="uq_user_mute"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    muter_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    muted_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    mute_posts = Column(Boolean, default=True, nullable=False)
+    mute_stories = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    muter = relationship("User", foreign_keys=[muter_id])
+    muted = relationship("User", foreign_keys=[muted_id])
+
+
+class ConversationMute(Base):
+    """`user_id` has muted notifications for `conversation_id` — the DM
+    thread stays fully visible/usable, it just stops generating
+    Notification rows / push notifications for that user (see
+    chat_routes.send_message)."""
+
+    __tablename__ = "conversation_mutes"
+    __table_args__ = (
+        UniqueConstraint("user_id", "conversation_id", name="uq_conversation_mute"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
 
 
 class Post(Base):
@@ -770,6 +869,13 @@ class Story(Base):
     views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
     reactions = relationship("StoryReaction", back_populates="story", cascade="all, delete-orphan")
     location = relationship("Location", foreign_keys=[location_id])
+    mentions = relationship("StoryMention", back_populates="story", cascade="all, delete-orphan")
+    poll = relationship(
+        "StoryPoll", back_populates="story", uselist=False, cascade="all, delete-orphan"
+    )
+    question = relationship(
+        "StoryQuestion", back_populates="story", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class StoryView(Base):
@@ -807,6 +913,120 @@ class StoryReaction(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     story = relationship("Story", back_populates="reactions")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class StoryMention(Base):
+    """A user tagged in a story (Instagram's "@mention" sticker) — powers
+    a "mentioned in stories" notification/list for `user_id`, parsed out of
+    the story's caption the same way post hashtags are (see
+    app/services/story_mention_service.py)."""
+
+    __tablename__ = "story_mentions"
+    __table_args__ = (
+        UniqueConstraint("story_id", "user_id", name="uq_story_mention"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    story_id = Column(Integer, ForeignKey("stories.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    story = relationship("Story", back_populates="mentions")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class StoryPoll(Base):
+    """One poll sticker on a story — at most one per story (see
+    __table_args__ uniqueness on story_id). Options are a separate table
+    (StoryPollOption) rather than a fixed two-column pair so a poll isn't
+    hardcoded to exactly two choices, even though the create-story
+    endpoint currently only accepts two (matching Instagram's UI)."""
+
+    __tablename__ = "story_polls"
+    __table_args__ = (
+        UniqueConstraint("story_id", name="uq_story_poll_one_per_story"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    story_id = Column(Integer, ForeignKey("stories.id"), nullable=False, index=True)
+    question = Column(String(150), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    story = relationship("Story", back_populates="poll")
+    options = relationship(
+        "StoryPollOption", back_populates="poll", cascade="all, delete-orphan",
+        order_by="StoryPollOption.position",
+    )
+
+
+class StoryPollOption(Base):
+    __tablename__ = "story_poll_options"
+
+    id = Column(Integer, primary_key=True, index=True)
+    poll_id = Column(Integer, ForeignKey("story_polls.id"), nullable=False, index=True)
+    text = Column(String(60), nullable=False)
+    position = Column(Integer, default=0, nullable=False)
+
+    poll = relationship("StoryPoll", back_populates="options")
+    votes = relationship("StoryPollVote", back_populates="option", cascade="all, delete-orphan")
+
+
+class StoryPollVote(Base):
+    """One vote per (poll, user) — re-voting for a different option
+    replaces it, same convention as StoryReaction/MessageReaction."""
+
+    __tablename__ = "story_poll_votes"
+    __table_args__ = (
+        UniqueConstraint("poll_id", "user_id", name="uq_story_poll_vote"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    poll_id = Column(Integer, ForeignKey("story_polls.id"), nullable=False, index=True)
+    option_id = Column(Integer, ForeignKey("story_poll_options.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    option = relationship("StoryPollOption", back_populates="votes")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class StoryQuestion(Base):
+    """One question sticker on a story ("Ask me anything") — at most one
+    per story. Each viewer's answer is a separate, freeform
+    StoryQuestionResponse row (unlike a poll, there's no fixed option set)."""
+
+    __tablename__ = "story_questions"
+    __table_args__ = (
+        UniqueConstraint("story_id", name="uq_story_question_one_per_story"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    story_id = Column(Integer, ForeignKey("stories.id"), nullable=False, index=True)
+    prompt = Column(String(150), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    story = relationship("Story", back_populates="question")
+    responses = relationship(
+        "StoryQuestionResponse", back_populates="question", cascade="all, delete-orphan"
+    )
+
+
+class StoryQuestionResponse(Base):
+    """A single freeform answer from `user_id` to a story's question
+    sticker. Unlike a poll vote, a user can respond more than once (no
+    uniqueness constraint) — same as Instagram, where each submission sends
+    a fresh reply."""
+
+    __tablename__ = "story_question_responses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    question_id = Column(Integer, ForeignKey("story_questions.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    response_text = Column(String(500), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    question = relationship("StoryQuestion", back_populates="responses")
     user = relationship("User", foreign_keys=[user_id])
 
 
@@ -946,6 +1166,11 @@ class ConversationParticipant(Base):
     # Read-receipt watermark: the highest Message.id this participant has
     # seen in this conversation. NULL means nothing read yet.
     last_read_message_id = Column(Integer, nullable=True)
+    # Message requests: 'pending' until this participant accepts/declines
+    # (see chat_routes.accept_conversation / decline_conversation). The
+    # conversation creator's own row is always 'accepted' — see
+    # chat_routes.create_conversation for who gets 'pending'.
+    status = Column(Enum(ParticipantStatus), default=ParticipantStatus.accepted, nullable=False)
 
     conversation = relationship("Conversation", back_populates="participants")
     user = relationship("User", foreign_keys=[user_id])
@@ -957,7 +1182,19 @@ class Message(Base):
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
     sender_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    content = Column(String(2200), nullable=False)
+    # Nullable now: a media-only message (image/video/voice note, no
+    # caption) has no text content — see chat_routes.send_message /
+    # send_media_message, which enforce "at least one of content/media_url"
+    # at the request layer since the DB alone can't express that OR.
+    content = Column(String(2200), nullable=True)
+    media_url = Column(String(500), nullable=True)
+    media_type = Column(Enum(MediaType), nullable=True)
+    # Reply-to-another-message (distinct from reply_to_story_id below, which
+    # is specifically "this DM was sent by tapping reply on a story"). SET
+    # NULL so deleting/unsending the original doesn't break the reply chain.
+    reply_to_message_id = Column(
+        Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     # Set when this message is a "story reply" (tapping reply on someone's
     # story sends a DM). SET NULL on delete so replying to a story that later
     # expires/gets removed doesn't wipe out the DM history.
@@ -972,13 +1209,15 @@ class Message(Base):
     # Soft delete — the row (and its history) stays for moderation/audit,
     # but the API never returns `content` once this is set; see
     # chat_routes._to_message_out. Keeps other participants' message
-    # ordering/reply context intact instead of leaving a hole.
+    # ordering/reply context intact instead of leaving a hole. This is also
+    # what "unsend" (DELETE /api/chat/messages/:id) uses — same mechanism.
     is_deleted = Column(Boolean, default=False, nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")
     sender = relationship("User", foreign_keys=[sender_id])
+    reply_to_message = relationship("Message", remote_side=[id])
     reactions = relationship(
         "MessageReaction", back_populates="message", cascade="all, delete-orphan"
     )

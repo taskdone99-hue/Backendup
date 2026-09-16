@@ -2,7 +2,8 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import (
-    APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+    APIRouter, Depends, Form, HTTPException, Query, UploadFile,
+    WebSocket, WebSocketDisconnect, status
 )
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
@@ -12,6 +13,8 @@ from app import models, schemas
 from app.auth import get_current_user, get_user_from_raw_token
 from app.ws_manager import manager
 from app.services.notification_service import notify_user
+from app.services.privacy_service import is_blocked, is_conversation_muted
+from app.services.media_service import save_upload_file
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -61,10 +64,61 @@ def _conversation_participant_ids(db: Session, conversation_id: int) -> list[int
     return [r[0] for r in rows]
 
 
+def _reject_if_blocked_in_conversation(db: Session, conversation_id: int, sender_id: int) -> None:
+    """A block, in either direction, between the sender and any other
+    participant stops the message — same rule as content_routes.is_blocked,
+    applied here rather than at conversation-creation time so it also
+    covers a block that happens *after* a thread already exists (an
+    existing group chat with a later-blocked member, for instance)."""
+    other_ids = [uid for uid in _conversation_participant_ids(db, conversation_id) if uid != sender_id]
+    for uid in other_ids:
+        if is_blocked(db, sender_id, uid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Can't send messages in this conversation"
+            )
+
+
+def _validate_reply_target(
+    db: Session, conversation_id: int, reply_to_message_id: int | None
+) -> int | None:
+    if reply_to_message_id is None:
+        return None
+    original = (
+        db.query(models.Message)
+        .filter(
+            models.Message.id == reply_to_message_id,
+            models.Message.conversation_id == conversation_id,
+        )
+        .first()
+    )
+    if original is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="reply_to_message_id must refer to a message in this conversation",
+        )
+    return reply_to_message_id
+
+
 def _to_message_out(db: Session, message: models.Message) -> schemas.MessageOut:
     out = schemas.MessageOut.model_validate(message)
     if message.is_deleted:
         out.content = "This message was deleted"
+        out.media_url = None
+
+    if message.reply_to_message_id is not None:
+        original = (
+            db.query(models.Message)
+            .filter(models.Message.id == message.reply_to_message_id)
+            .first()
+        )
+        if original is not None:
+            out.reply_to = schemas.MessageRepliedToOut(
+                id=original.id,
+                sender_id=original.sender_id,
+                content="This message was deleted" if original.is_deleted else original.content,
+                media_type=original.media_type,
+                is_deleted=original.is_deleted,
+            )
 
     out.reactions = [
         schemas.MessageReactionOut(user_id=r.user_id, emoji=r.emoji) for r in message.reactions
@@ -103,6 +157,8 @@ def _to_conversation_out(
     )
 
     unread_count = 0
+    my_status = "accepted"
+    is_muted = False
     if viewer_id is not None:
         my_participant = next((p for p in conversation.participants if p.user_id == viewer_id), None)
         if my_participant is not None:
@@ -110,6 +166,8 @@ def _to_conversation_out(
             if my_participant.last_read_message_id is not None:
                 q = q.filter(models.Message.id > my_participant.last_read_message_id)
             unread_count = q.filter(models.Message.sender_id != viewer_id).count()
+            my_status = my_participant.status.value
+        is_muted = is_conversation_muted(db, viewer_id, conversation.id)
 
     return schemas.ConversationOut(
         id=conversation.id,
@@ -119,6 +177,8 @@ def _to_conversation_out(
         participants=participants,
         last_message=_to_message_out(db, last_message) if last_message else None,
         unread_count=unread_count,
+        status=my_status,
+        is_muted=is_muted,
     )
 
 
@@ -168,6 +228,12 @@ def create_conversation(
             detail=f"User(s) not found: {', '.join(str(m) for m in missing)}",
         )
 
+    for uid in other_ids:
+        if is_blocked(db, current_user.id, uid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Can't message this user"
+            )
+
     is_group = len(other_ids) > 1
 
     # For a 1:1 chat, reuse an existing conversation between the same two
@@ -200,9 +266,35 @@ def create_conversation(
     db.add(conversation)
     db.flush()
 
+    # Message requests: for a brand-new 1:1 thread, if the recipient
+    # doesn't already follow the sender, the thread lands in the
+    # recipient's Message Requests (GET /api/chat/requests) instead of
+    # their main inbox until they accept/decline — same as Instagram.
+    # Group threads and re-used existing 1:1 threads (handled above,
+    # before this point) are never gated this way.
+    recipient_status = models.ParticipantStatus.accepted
+    if not is_group:
+        recipient_follows_sender = (
+            db.query(models.Follow)
+            .filter(
+                models.Follow.follower_id == other_ids[0],
+                models.Follow.following_id == current_user.id,
+            )
+            .first()
+            is not None
+        )
+        if not recipient_follows_sender:
+            recipient_status = models.ParticipantStatus.pending
+
     all_participant_ids = {current_user.id, *other_ids}
     for uid in all_participant_ids:
-        db.add(models.ConversationParticipant(conversation_id=conversation.id, user_id=uid))
+        participant_status = (
+            recipient_status if (uid != current_user.id and not is_group)
+            else models.ParticipantStatus.accepted
+        )
+        db.add(models.ConversationParticipant(
+            conversation_id=conversation.id, user_id=uid, status=participant_status
+        ))
 
     profile_message_out = None
     if not is_group:
@@ -237,10 +329,15 @@ def get_conversations(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """Only conversations this user has accepted — pending message
+    requests live in GET /api/chat/requests until acted on."""
     conversations = (
         db.query(models.Conversation)
         .join(models.ConversationParticipant)
-        .filter(models.ConversationParticipant.user_id == current_user.id)
+        .filter(
+            models.ConversationParticipant.user_id == current_user.id,
+            models.ConversationParticipant.status == models.ParticipantStatus.accepted,
+        )
         .options(joinedload(models.Conversation.participants).joinedload(
             models.ConversationParticipant.user
         ))
@@ -254,6 +351,114 @@ def get_conversations(
         reverse=True,
     )
     return schemas.ConversationsResponse(items=items)
+
+
+@router.get("/requests", response_model=schemas.ConversationsResponse)
+def get_message_requests(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """1:1 threads started by someone this user doesn't yet follow —
+    sitting here, unnotified-as-a-normal-DM, until accepted or declined."""
+    conversations = (
+        db.query(models.Conversation)
+        .join(models.ConversationParticipant)
+        .filter(
+            models.ConversationParticipant.user_id == current_user.id,
+            models.ConversationParticipant.status == models.ParticipantStatus.pending,
+        )
+        .options(joinedload(models.Conversation.participants).joinedload(
+            models.ConversationParticipant.user
+        ))
+        .order_by(models.Conversation.created_at.desc())
+        .all()
+    )
+    items = [_to_conversation_out(db, c, viewer_id=current_user.id) for c in conversations]
+    return schemas.ConversationsResponse(items=items)
+
+
+@router.post(
+    "/conversations/{conversation_id}/accept",
+    response_model=schemas.ConversationRequestActionResponse,
+)
+def accept_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    participant = _get_participant_or_403(db, conversation_id, current_user.id)
+    participant.status = models.ParticipantStatus.accepted
+    db.commit()
+    return schemas.ConversationRequestActionResponse(
+        message="Message request accepted", conversation_id=conversation_id
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/decline",
+    response_model=schemas.ConversationRequestActionResponse,
+)
+def decline_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Declining a request deletes the conversation outright (same as
+    Instagram deleting a declined DM request) — only meaningful for the
+    1:1, still-pending case, since that's the only kind a participant can
+    be 'pending' in."""
+    participant = _get_participant_or_403(db, conversation_id, current_user.id)
+    if participant.status != models.ParticipantStatus.pending:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="This conversation isn't a pending request"
+        )
+    conversation = _get_conversation_or_404(db, conversation_id)
+    db.delete(conversation)
+    db.commit()
+    return schemas.ConversationRequestActionResponse(
+        message="Message request declined", conversation_id=conversation_id
+    )
+
+
+@router.post("/conversations/{conversation_id}/mute", response_model=schemas.MessageResponse)
+def mute_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    existing = (
+        db.query(models.ConversationMute)
+        .filter(
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
+        )
+        .first()
+    )
+    if existing is None:
+        db.add(models.ConversationMute(user_id=current_user.id, conversation_id=conversation_id))
+        db.commit()
+    return schemas.MessageResponse(message="Conversation muted")
+
+
+@router.delete("/conversations/{conversation_id}/mute", response_model=schemas.MessageResponse)
+def unmute_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = (
+        db.query(models.ConversationMute)
+        .filter(
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
+        )
+        .first()
+    )
+    if row is not None:
+        db.delete(row)
+        db.commit()
+    return schemas.MessageResponse(message="Conversation unmuted")
 
 
 @router.delete("/conversations/{conversation_id}", response_model=schemas.MessageResponse)
@@ -349,6 +554,67 @@ def get_messages(
     return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
 
 
+async def _create_and_dispatch_message(
+    db: Session,
+    conversation_id: int,
+    message: models.Message,
+    current_user: models.User,
+    preview: str,
+) -> schemas.MessageOut:
+    """Shared by send_message (text) and send_media_message (image/video/
+    voice): persist the message, mark it read for the sender, create
+    per-recipient delivery-status rows, push it live over the chat socket,
+    and notify anyone who isn't currently connected. `preview` is the
+    short text used in that notification (e.g. the caption, or "Sent a
+    photo" for a caption-less media message)."""
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+
+    my_participant = _get_participant_or_403(db, conversation_id, current_user.id)
+    my_participant.last_read_message_id = message.id
+    db.commit()
+
+    participant_ids = _conversation_participant_ids(db, conversation_id)
+    recipient_ids = [uid for uid in participant_ids if uid != current_user.id]
+
+    now = datetime.now(timezone.utc)
+    for uid in recipient_ids:
+        db.add(models.MessageStatus(
+            message_id=message.id,
+            user_id=uid,
+            delivered_at=now if manager.is_online(uid) else None,
+        ))
+    db.commit()
+
+    message_out = _to_message_out(db, message)
+
+    await manager.send_to_users(
+        recipient_ids,
+        {"type": "message", "conversation_id": conversation_id, "message": message_out.model_dump(mode="json")},
+    )
+
+    offline_ids = [uid for uid in recipient_ids if not manager.is_online(uid)]
+    # Muted-conversation participants still get delivery/WS updates above
+    # (the thread itself is unaffected) — muting only suppresses the
+    # Notification row + push below, same as Instagram's "mute
+    # notifications for this chat".
+    notify_ids = [uid for uid in offline_ids if not is_conversation_muted(db, uid, conversation_id)]
+    for uid in notify_ids:
+        await notify_user(
+            db,
+            user_id=uid,
+            actor=current_user,
+            notif_type=models.NotificationType.message,
+            message=f"{current_user.username} sent you a message",
+            target_type="conversation",
+            target_id=conversation_id,
+            push_body=preview,
+        )
+
+    return message_out
+
+
 @router.post(
     "/conversations/{conversation_id}/messages",
     response_model=schemas.MessageOut,
@@ -361,72 +627,76 @@ async def send_message(
     current_user: models.User = Depends(get_current_user),
 ):
     _get_conversation_or_404(db, conversation_id)
-    my_participant = _get_participant_or_403(db, conversation_id, current_user.id)
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    _reject_if_blocked_in_conversation(db, conversation_id, current_user.id)
+
+    reply_to_id = _validate_reply_target(db, conversation_id, payload.reply_to_message_id)
 
     message = models.Message(
         conversation_id=conversation_id,
         sender_id=current_user.id,
         content=payload.content,
+        reply_to_message_id=reply_to_id,
     )
-    db.add(message)
-    db.commit()
-    db.refresh(message)
+    preview = payload.content if len(payload.content) <= 80 else payload.content[:77] + "..."
+    return await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
 
-    # Sending your own message counts as having read up to it — otherwise
-    # you'd immediately see your own message as "unread".
-    my_participant.last_read_message_id = message.id
-    db.commit()
 
-    participant_ids = _conversation_participant_ids(db, conversation_id)
-    recipient_ids = [uid for uid in participant_ids if uid != current_user.id]
+@router.post(
+    "/conversations/{conversation_id}/media",
+    response_model=schemas.MediaMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_media_message(
+    conversation_id: int,
+    file: UploadFile,
+    caption: str | None = Form(default=None),
+    reply_to_message_id: int | None = Form(default=None),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Send an image, video, or voice note. `file`'s content-type decides
+    which: images and videos go through the same validation as posts/reels
+    (see save_upload_file); anything under `audio/*` is treated as a voice
+    note. `caption` is optional text alongside the media."""
+    _get_conversation_or_404(db, conversation_id)
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    _reject_if_blocked_in_conversation(db, conversation_id, current_user.id)
 
-    # One MessageStatus row per recipient — delivered immediately if
-    # they're online right now (the WS push below reaches them live),
-    # otherwise left null until they next fetch this conversation.
-    now = datetime.now(timezone.utc)
-    for uid in recipient_ids:
-        db.add(models.MessageStatus(
-            message_id=message.id,
-            user_id=uid,
-            delivered_at=now if manager.is_online(uid) else None,
-        ))
-    db.commit()
+    reply_to_id = _validate_reply_target(db, conversation_id, reply_to_message_id)
 
-    message_out = _to_message_out(db, message)
+    content_type = (file.content_type or "").lower()
+    if content_type.startswith("audio/"):
+        url, kind = save_upload_file(file, "chat_voice", allow_audio=True)
+    else:
+        url, kind = save_upload_file(file, "chat_media", allow_video=True)
 
-    # Live delivery to anyone with the chat open right now.
-    await manager.send_to_users(
-        recipient_ids,
-        {"type": "message", "conversation_id": conversation_id, "message": message_out.model_dump(mode="json")},
+    media_type = {
+        "image": models.MediaType.image,
+        "video": models.MediaType.video,
+        "audio": models.MediaType.audio,
+    }[kind]
+
+    message = models.Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content=caption,
+        media_url=url,
+        media_type=media_type,
+        reply_to_message_id=reply_to_id,
     )
-
-    # Notification for recipients who are NOT currently connected to the
-    # chat socket — they won't see the "message" WS event above, so this is
-    # how they find out. Routed through notify_user() (the same fan-out
-    # used by follow/follow-request/story notifications) so it: (1) writes
-    # the Notification row, (2) pushes a live
-    # {"type":"notification","notification":{...}} event to their
-    # notifications-socket connection if they have one open, and (3) sends
-    # an FCM push to their devices. Previously this block only did (1) and
-    # (3) directly, which is why a recipient connected to
-    # /api/notifications/ws but not /api/chat/ws never got a live push for
-    # a new message — notify_user() closes that gap.
-    offline_ids = [uid for uid in recipient_ids if not manager.is_online(uid)]
-    if offline_ids:
-        preview = payload.content if len(payload.content) <= 80 else payload.content[:77] + "..."
-        for uid in offline_ids:
-            await notify_user(
-                db,
-                user_id=uid,
-                actor=current_user,
-                notif_type=models.NotificationType.message,
-                message=f"{current_user.username} sent you a message",
-                target_type="conversation",
-                target_id=conversation_id,
-                push_body=preview,
-            )
-
-    return message_out
+    preview = caption or {"image": "Sent a photo", "video": "Sent a video", "audio": "Sent a voice message"}[kind]
+    message_out = await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
+    return schemas.MediaMessageResponse(
+        id=message_out.id,
+        conversation_id=message_out.conversation_id,
+        sender_id=message_out.sender_id,
+        content=message_out.content,
+        media_url=message_out.media_url,
+        media_type=message_out.media_type,
+        reply_to_message_id=message_out.reply_to_message_id,
+        created_at=message_out.created_at,
+    )
 
 
 @router.post("/conversations/{conversation_id}/read", response_model=schemas.MarkReadResponse)
