@@ -504,6 +504,7 @@ class Reel(Base):
     title = Column(String(150), nullable=True)
     video_url = Column(String(500), nullable=False)
     thumbnail_url = Column(String(500), nullable=True)
+    duration_seconds = Column(Float, nullable=True)
     # Deliberately NOT a ForeignKey: a real FK with the default RESTRICT
     # behavior would block deleting an original reel once anything remixes
     # its audio. This is an informal reference to reels.id instead — a
