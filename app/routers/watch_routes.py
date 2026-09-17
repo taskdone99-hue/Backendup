@@ -13,18 +13,26 @@ Design notes:
 
   * Timestamps are always taken from the server clock, never from the
     client, so a modified app can't report inflated watch times.
-  * At most one *active* (started, not yet ended) session is allowed per
+
+  * At most one active (started, not yet ended) session is allowed per
     user. If /watch/start is called while one is already open — e.g. the
     frontend missed sending /watch/end before the next reel started — the
     old session is auto-closed first using "now" as its end time, exactly
-    as if the user had scrolled away at that instant. This keeps the API
-    resilient to imperfect frontend event ordering instead of just 409ing.
+    as if the user had scrolled away at that instant.
+
   * Sessions shorter than MIN_VALID_WATCH_SECONDS are kept in the table
-    (useful for abuse/analytics review) but flagged `is_valid=False` and
-    excluded from history and stats. Same treatment for sessions longer
-    than MAX_VALID_WATCH_SECONDS — these are stale/abandoned sessions
-    auto-closed long after the fact, not real long watches (see the
-    constant's own comment below for the full explanation).
+    but flagged is_valid=False and excluded from history and stats.
+
+  * Sessions longer than MAX_VALID_WATCH_SECONDS are also kept in the table
+    but flagged is_valid=False. Their full elapsed duration is retained for
+    audit/debugging instead of being silently reduced to MAX_VALID_WATCH_SECONDS.
+
+  * For normal sessions, credited watch time cannot exceed the actual Reel
+    duration when duration_seconds is available.
+
+  * This prevents a 10-second Reel from contributing more than 10 seconds
+    of valid watch time while also preserving stale/abandoned sessions as
+    invalid records rather than turning them into valid 600-second sessions.
 """
 
 import os
@@ -39,28 +47,43 @@ from app import models, schemas
 from app.auth import get_current_user
 from app.database import get_db
 
+
 router = APIRouter(prefix="/api/watch", tags=["watch"])
+
 
 # Sessions shorter than this are noise (accidental taps, fast scroll-throughs)
 # and are excluded from history/stats rather than counted as a "watch".
-MIN_VALID_WATCH_SECONDS = int(os.getenv("MIN_VALID_WATCH_SECONDS", "2"))
+MIN_VALID_WATCH_SECONDS = int(
+    os.getenv("MIN_VALID_WATCH_SECONDS", "2")
+)
 
-# Sessions longer than this are almost certainly stale, not real engagement:
-# reels are short-form vertical video, so even generously accounting for
-# looping, nobody is genuinely watching one for longer than this in a single
-# sitting. Without this cap, a session that never gets a clean /watch/end
-# (app killed, phone locked, connectivity lost) sits "active" until the
-# user's *next* /watch/start — possibly hours or days later — at which point
-# _close_session auto-closes it using "now", crediting the entire elapsed
-# gap as watch time. That's the exact shape of bug this constant closes:
-# e.g. a 10-second reel showing ~93,000 seconds (~26 hours) of "watch time"
-# is one abandoned session getting auto-closed a day later, not duplicate or
-# overlapping sessions being double-counted (the UniqueConstraint on
-# active_owner_id above already rules that out at the DB level).
-MAX_VALID_WATCH_SECONDS = int(os.getenv("MAX_VALID_WATCH_SECONDS", "600"))
+
+# Sessions longer than this are almost certainly stale/abandoned rather than
+# real engagement.
+#
+# Example:
+# User starts watching a 10-second Reel and then kills the app.
+# No /watch/end request reaches the backend.
+# The next day the user starts another Reel.
+#
+# The old session is auto-closed using the server's current time. Its elapsed
+# duration may therefore be ~93,000 seconds.
+#
+# We intentionally DO NOT clamp such a session down to 600 seconds.
+# Instead, we preserve its actual elapsed duration and mark it invalid:
+#
+#     watch_seconds = ~93000
+#     is_valid = False
+#
+# _period_stats() only counts is_valid=True sessions, so stale sessions cannot
+# inflate monetization watch time.
+MAX_VALID_WATCH_SECONDS = int(
+    os.getenv("MAX_VALID_WATCH_SECONDS", "600")
+)
 
 
 def _now() -> datetime:
+    """Return the current UTC server time."""
     return datetime.now(timezone.utc)
 
 
@@ -69,37 +92,88 @@ def _close_session(
     session: models.WatchSession,
     ended_at: datetime,
 ) -> None:
-    """Close a watch session and cap credited time to the Reel duration."""
+    """
+    Close a watch session.
+
+    Rules:
+
+    1. Calculate elapsed time using server timestamps.
+    2. If the session is within MAX_VALID_WATCH_SECONDS and the Reel has a
+       known duration, never credit more than the Reel's actual duration.
+    3. If the session itself exceeds MAX_VALID_WATCH_SECONDS, preserve the
+       full elapsed value and mark the session invalid.
+    4. Never allow a stale session to become valid merely because its value
+       was clamped to the maximum.
+    """
 
     started_at = session.started_at
 
+    # SQLAlchemy/MySQL may return a naive datetime depending on configuration.
+    # Treat naive database timestamps as UTC.
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
 
     if ended_at.tzinfo is None:
         ended_at = ended_at.replace(tzinfo=timezone.utc)
 
+    # Server-side elapsed duration.
     elapsed_seconds = max(
         0,
         int((ended_at - started_at).total_seconds()),
     )
 
-    # Get the Reel so we can never credit more time than
-    # the actual Reel duration.
+    # Start with the real elapsed time.
+    watch_seconds = elapsed_seconds
+
+    # Fetch the Reel so we can compare the watch session with the actual
+    # video duration.
     reel = (
         db.query(models.Reel)
         .filter(models.Reel.id == session.reel_id)
         .first()
     )
 
-    watch_seconds = elapsed_seconds
+    # IMPORTANT:
+    #
+    # Only apply Reel-duration capping when the session itself is within
+    # the allowed maximum.
+    #
+    # Example:
+    #
+    # 10-second Reel + 8-second session
+    #     => 8 seconds
+    #
+    # 10-second Reel + 14-second session
+    #     => 10 seconds
+    #
+    # 10-second Reel + 25-hour abandoned session
+    #     => ~90000+ seconds, INVALID
+    #
+    # We must not turn the 25-hour session into 600 seconds because that
+    # would make it appear valid.
+    if elapsed_seconds <= MAX_VALID_WATCH_SECONDS:
+        if reel is not None and reel.duration_seconds is not None:
+            duration_seconds = max(
+                0,
+                int(reel.duration_seconds),
+            )
 
-    if reel is not None and reel.duration_seconds is not None:
-        duration_seconds = max(0, int(reel.duration_seconds))
-        watch_seconds = min(elapsed_seconds, duration_seconds)
+            watch_seconds = min(
+                elapsed_seconds,
+                duration_seconds,
+            )
 
-    # Safety limit for missing/invalid duration values.
-    watch_seconds = min(watch_seconds, MAX_VALID_WATCH_SECONDS)
+    # IMPORTANT:
+    #
+    # Do NOT do:
+    #
+    #     watch_seconds = min(watch_seconds, MAX_VALID_WATCH_SECONDS)
+    #
+    # because that converts an invalid 601-second session into exactly
+    # 600 seconds, which would incorrectly make it valid.
+    #
+    # Instead, the actual value is retained and is_valid determines whether
+    # it contributes to history/statistics/monetization.
 
     session.ended_at = ended_at
     session.watch_seconds = watch_seconds
@@ -111,28 +185,57 @@ def _close_session(
         <= MAX_VALID_WATCH_SECONDS
     )
 
-@router.post("/start", response_model=schemas.WatchStartResponse, status_code=status.HTTP_201_CREATED)
+
+@router.post(
+    "/start",
+    response_model=schemas.WatchStartResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def start_watch(
     body: schemas.WatchStartRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    reel = db.query(models.Reel).filter(models.Reel.id == body.reel_id).first()
+    """
+    Start a Reel watch session.
+
+    If the current user already has an active session, close that session
+    first using the current server time.
+    """
+
+    reel = (
+        db.query(models.Reel)
+        .filter(models.Reel.id == body.reel_id)
+        .first()
+    )
+
     if reel is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reel not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Reel not found",
+        )
 
     now = _now()
 
-    # Lock the user's active session row (if any) so a concurrent
-    # start/end for the same user can't race with this one.
+    # Lock the user's active session row, if one exists.
+    #
+    # This prevents concurrent start requests for the same user from
+    # accidentally creating overlapping active sessions.
     existing_active = (
         db.query(models.WatchSession)
-        .filter(models.WatchSession.active_owner_id == current_user.id)
+        .filter(
+            models.WatchSession.active_owner_id == current_user.id
+        )
         .with_for_update()
         .first()
     )
+
     if existing_active is not None:
-        _close_session(db, existing_active, now)
+        _close_session(
+            db,
+            existing_active,
+            now,
+        )
 
     session = models.WatchSession(
         user_id=current_user.id,
@@ -141,30 +244,46 @@ def start_watch(
         active_owner_id=current_user.id,
         is_valid=True,
     )
+
     db.add(session)
+
     try:
         db.commit()
+
     except IntegrityError:
-        # Belt-and-braces: two /watch/start calls for the same user landed
-        # concurrently and both passed the check above.
+        # Belt-and-braces protection for two concurrent /watch/start
+        # requests that both pass the active-session query.
         db.rollback()
+
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A watch session is already active for this user",
         )
+
     db.refresh(session)
 
     return schemas.WatchStartResponse(
-        session_id=session.id, reel_id=session.reel_id, started_at=session.started_at
+        session_id=session.id,
+        reel_id=session.reel_id,
+        started_at=session.started_at,
     )
 
 
-@router.post("/end", response_model=schemas.WatchEndResponse)
+@router.post(
+    "/end",
+    response_model=schemas.WatchEndResponse,
+)
 def end_watch(
     body: schemas.WatchEndRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """
+    End an existing watch session.
+
+    The end timestamp always comes from the server clock.
+    """
+
     session = (
         db.query(models.WatchSession)
         .filter(
@@ -174,12 +293,25 @@ def end_watch(
         .with_for_update()
         .first()
     )
-    if session is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Watch session not found")
-    if session.ended_at is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Watch session already ended")
 
-    _close_session(db, session, _now())
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Watch session not found",
+        )
+
+    if session.ended_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Watch session already ended",
+        )
+
+    _close_session(
+        db,
+        session,
+        _now(),
+    )
+
     db.commit()
     db.refresh(session)
 
@@ -191,20 +323,47 @@ def end_watch(
     )
 
 
-@router.get("/history", response_model=schemas.PaginatedWatchHistoryResponse)
+@router.get(
+    "/history",
+    response_model=schemas.PaginatedWatchHistoryResponse,
+)
 def get_watch_history(
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+    limit: int = Query(
+        20,
+        ge=1,
+        le=100,
+    ),
+    offset: int = Query(
+        0,
+        ge=0,
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    query = db.query(models.WatchSession).filter(
-        models.WatchSession.user_id == current_user.id,
-        models.WatchSession.is_valid.is_(True),
-        models.WatchSession.ended_at.isnot(None),
+    """
+    Return valid completed watch sessions for the current user.
+    """
+
+    query = (
+        db.query(models.WatchSession)
+        .filter(
+            models.WatchSession.user_id == current_user.id,
+            models.WatchSession.is_valid.is_(True),
+            models.WatchSession.ended_at.isnot(None),
+        )
     )
+
     total = query.count()
-    rows = query.order_by(models.WatchSession.started_at.desc()).offset(offset).limit(limit).all()
+
+    rows = (
+        query
+        .order_by(
+            models.WatchSession.started_at.desc()
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
     items = [
         schemas.WatchHistoryItem(
@@ -216,7 +375,14 @@ def get_watch_history(
         )
         for row in rows
     ]
-    all_time = _period_stats(db, current_user.id, None)
+
+    # All-time valid watch statistics.
+    all_time = _period_stats(
+        db,
+        current_user.id,
+        None,
+    )
+
     return schemas.PaginatedWatchHistoryResponse(
         total=total,
         limit=limit,
@@ -227,35 +393,95 @@ def get_watch_history(
     )
 
 
-def _period_stats(db: Session, user_id: int, since: datetime | None) -> schemas.WatchPeriodStats:
+def _period_stats(
+    db: Session,
+    user_id: int,
+    since: datetime | None,
+) -> schemas.WatchPeriodStats:
+    """
+    Calculate valid watch-time statistics.
+
+    Only sessions that are:
+      - owned by the requested user
+      - completed
+      - marked is_valid=True
+
+    are included.
+
+    This is the important protection that keeps stale/abandoned sessions
+    from contributing to monetization.
+    """
+
     query = db.query(
-        func.coalesce(func.sum(models.WatchSession.watch_seconds), 0),
+        func.coalesce(
+            func.sum(models.WatchSession.watch_seconds),
+            0,
+        ),
         func.count(models.WatchSession.id),
     ).filter(
         models.WatchSession.user_id == user_id,
         models.WatchSession.is_valid.is_(True),
         models.WatchSession.ended_at.isnot(None),
     )
+
     if since is not None:
-        query = query.filter(models.WatchSession.started_at >= since)
+        query = query.filter(
+            models.WatchSession.started_at >= since
+        )
 
     watch_seconds, reels_watched = query.one()
-    return schemas.WatchPeriodStats(watch_seconds=int(watch_seconds), reels_watched=int(reels_watched))
+
+    return schemas.WatchPeriodStats(
+        watch_seconds=int(watch_seconds),
+        reels_watched=int(reels_watched),
+    )
 
 
-@router.get("/stats", response_model=schemas.WatchStatsResponse)
+@router.get(
+    "/stats",
+    response_model=schemas.WatchStatsResponse,
+)
 def get_watch_stats(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """
+    Return today's, last-7-days', last-30-days', and all-time
+    valid watch statistics.
+    """
+
     now = _now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    today_start = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
     week_start = now - timedelta(days=7)
+
     month_start = now - timedelta(days=30)
 
     return schemas.WatchStatsResponse(
-        today=_period_stats(db, current_user.id, today_start),
-        week=_period_stats(db, current_user.id, week_start),
-        month=_period_stats(db, current_user.id, month_start),
-        total=_period_stats(db, current_user.id, None),
+        today=_period_stats(
+            db,
+            current_user.id,
+            today_start,
+        ),
+        week=_period_stats(
+            db,
+            current_user.id,
+            week_start,
+        ),
+        month=_period_stats(
+            db,
+            current_user.id,
+            month_start,
+        ),
+        total=_period_stats(
+            db,
+            current_user.id,
+            None,
+        ),
     )
