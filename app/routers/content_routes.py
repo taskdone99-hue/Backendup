@@ -47,7 +47,8 @@ def _to_post_detail(
         # a single-item list from the flat columns so `media` is never empty.
         detail.media = [
             schemas.MediaItemOut(
-                id=post.id, media_url=post.media_url, media_type=post.media_type, position=0
+                id=post.id, media_url=post.media_url, media_type=post.media_type, position=0,
+                caption=post.caption,
             )
         ]
     detail.media_count = len(detail.media)
@@ -249,6 +250,7 @@ def create_post(
         "The response's `media` array lists all of them, in upload order.",
     ),
     caption: str | None = Form(default=None),
+    media_captions: list[str] | None = Form(default=None, description="One caption per uploaded file, in the same order; trailing captions may be omitted."),
     alt_text: str | None = Form(default=None),
     ai_generated: bool = Form(default=False),
     music_title: str | None = Form(default=None),
@@ -316,6 +318,11 @@ def create_post(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Attach at least one file via `file` (single) or `files` (multiple)",
         )
+    if media_captions is not None and len(media_captions) > len(upload_files):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="media_captions cannot contain more captions than uploaded files",
+        )
 
     tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
     member_ids = _parse_ids(member_user_ids, "member_user_ids")
@@ -370,6 +377,7 @@ def create_post(
             media_url=url,
             media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
             position=position,
+            caption=media_captions[position] if media_captions and position < len(media_captions) else None,
         ))
 
     sync_post_hashtags(db, post, caption)
@@ -559,6 +567,9 @@ def update_post_media(
     files: list[UploadFile] | None = File(
         default=None, description="Replace with 2+ files instead, for a carousel post."
     ),
+    media_captions: list[str] | None = Form(
+        default=None, description="One caption per uploaded file, in the same order; trailing captions may be omitted."
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -580,6 +591,11 @@ def update_post_media(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Attach at least one file via `file` (single) or `files` (multiple)",
         )
+    if media_captions is not None and len(media_captions) > len(upload_files):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="media_captions cannot contain more captions than uploaded files",
+        )
 
     old_urls = [post.media_url] + [m.media_url for m in post.media_items]
     old_urls = list(dict.fromkeys(old_urls))  # de-dupe (media_items[0] often == media_url)
@@ -598,6 +614,7 @@ def update_post_media(
             media_url=url,
             media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
             position=position,
+            caption=media_captions[position] if media_captions and position < len(media_captions) else None,
         ))
 
     db.commit()

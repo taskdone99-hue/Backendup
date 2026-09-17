@@ -19,6 +19,7 @@ chosen, without needing to touch any of the callers below.
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
+import math
 
 from app import models
 
@@ -165,3 +166,54 @@ def resolve_location_from_form(
     name, rather than silently fabricating a place.
     """
     return None
+
+
+def find_nearby_locations(
+    db: Session,
+    *,
+    latitude: float,
+    longitude: float,
+    radius_km: float,
+    limit: int,
+):
+    """Return saved locations within radius, nearest first.
+
+    Uses a portable bounding-box SQL pre-filter, then exact Haversine
+    calculation in Python so MySQL and SQLite behave the same.
+    """
+    earth_km = 6371.0088
+    lat_delta = radius_km / 111.32
+    cos_lat = max(math.cos(math.radians(latitude)), 1e-9)
+    lng_delta = radius_km / (111.32 * cos_lat)
+
+    rows = (
+        db.query(models.Location)
+        .filter(
+            models.Location.latitude.isnot(None),
+            models.Location.longitude.isnot(None),
+            models.Location.latitude >= latitude - lat_delta,
+            models.Location.latitude <= latitude + lat_delta,
+            models.Location.longitude >= longitude - lng_delta,
+            models.Location.longitude <= longitude + lng_delta,
+        )
+        .all()
+    )
+
+    lat1 = math.radians(latitude)
+    lon1 = math.radians(longitude)
+    results = []
+    for location in rows:
+        lat2 = math.radians(location.latitude)
+        lon2 = math.radians(location.longitude)
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = (
+            math.sin(dlat / 2) ** 2
+            + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        )
+        distance_km = earth_km * 2 * math.asin(min(1.0, math.sqrt(a)))
+        if distance_km <= radius_km:
+            results.append((location, distance_km))
+
+    results.sort(key=lambda item: item[1])
+    return results[:limit]

@@ -738,9 +738,18 @@ class MediaItemOut(BaseModel):
     media_url: str
     media_type: MediaType
     position: int = 0
+    caption: str | None = None
 
     class Config:
         from_attributes = True
+
+
+class NearbyLocationOut(LocationOut):
+    distance_km: float
+
+
+class NearbyLocationsResponse(BaseModel):
+    items: list[NearbyLocationOut] = []
 
 
 class PostDetailOut(PostOut):

@@ -17,6 +17,7 @@ from app.services.location_service import (
     find_or_create_location,
     get_location_or_404,
     search_locations,
+    find_nearby_locations,
 )
 from app.routers.content_routes import _visible_authors_clause, _to_post_detail, _to_reel_detail
 from app.routers.story_routes import _active_story_query, _to_story_out
@@ -66,10 +67,40 @@ def search_locations_endpoint(
     )
 
 
-# NOTE: /search must be registered before /{location_id} — Starlette matches
-# routes in registration order, so a literal path declared after a
-# "/{location_id}" pattern would never be reached.
+@router.get("/nearby", response_model=schemas.NearbyLocationsResponse)
+def nearby_locations(
+    latitude: float = Query(...),
+    longitude: float = Query(...),
+    radius_km: float = Query(10, gt=0, le=500),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Find saved locations within radius, sorted nearest first."""
+    if not (-90 <= latitude <= 90):
+        raise HTTPException(status_code=400, detail="latitude must be between -90 and 90")
+    if not (-180 <= longitude <= 180):
+        raise HTTPException(status_code=400, detail="longitude must be between -180 and 180")
 
+    rows = find_nearby_locations(
+        db,
+        latitude=latitude,
+        longitude=longitude,
+        radius_km=radius_km,
+        limit=limit,
+    )
+    return schemas.NearbyLocationsResponse(
+        items=[
+            schemas.NearbyLocationOut(
+                **schemas.LocationOut.model_validate(location).model_dump(),
+                distance_km=round(distance_km, 3),
+            )
+            for location, distance_km in rows
+        ]
+    )
+
+
+# NOTE: /search and /nearby must be registered before /{location_id} — Starlette
+# matches routes in registration order.
 @router.get("/{location_id}", response_model=schemas.LocationOut)
 def get_location(location_id: int, db: Session = Depends(get_db)):
     location = get_location_or_404(db, location_id)
