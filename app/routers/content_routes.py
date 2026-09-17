@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import and_, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -1004,9 +1005,68 @@ def delete_reel(
         {models.Audio.source_reel_id: None}, synchronize_session=False
     )
 
+    # CreatorCollaborationRequest.reel_id is the last real foreign key into
+    # reels, and the one that was still 500ing here: a reel that's ever been
+    # the subject of a collaboration proposal couldn't be deleted at all.
+    # The rows aren't dropped, because an accepted request may already have
+    # paid out a CreatorEarning and that audit trail has to survive. Instead
+    # the reel reference is nulled (the column is nullable by design — a
+    # request can always stand alone as a general proposal), and anything
+    # still pending is cancelled, since the reel it was proposing work on no
+    # longer exists and accepting it would tag a collaborator onto nothing.
+    db.query(models.CreatorCollaborationRequest).filter(
+        models.CreatorCollaborationRequest.reel_id == reel_id,
+        models.CreatorCollaborationRequest.status == models.CollaborationStatus.pending,
+    ).update(
+        {
+            models.CreatorCollaborationRequest.status: models.CollaborationStatus.cancelled,
+            models.CreatorCollaborationRequest.responded_at: datetime.now(timezone.utc),
+        },
+        synchronize_session=False,
+    )
+    db.query(models.CreatorCollaborationRequest).filter(
+        models.CreatorCollaborationRequest.reel_id == reel_id
+    ).update({models.CreatorCollaborationRequest.reel_id: None}, synchronize_session=False)
+
+    # Bookmarks point at the reel informally (target_type/target_id), so
+    # they don't raise a foreign key error — they just rot into entries that
+    # render as blanks in GET /api/saved. Drop the SavedItem rows and their
+    # collection memberships. Shares are deliberately left alone: a share is
+    # a historical record of "I sent you this", not a live pointer.
+    saved_item_ids = [
+        row[0]
+        for row in db.query(models.SavedItem.id)
+        .filter(
+            models.SavedItem.target_type == models.SavedItemType.reel,
+            models.SavedItem.target_id == reel_id,
+        )
+        .all()
+    ]
+    if saved_item_ids:
+        db.query(models.SavedCollectionItem).filter(
+            models.SavedCollectionItem.saved_item_id.in_(saved_item_ids)
+        ).delete(synchronize_session=False)
+        db.query(models.SavedItem).filter(
+            models.SavedItem.id.in_(saved_item_ids)
+        ).delete(synchronize_session=False)
+
     video_url, thumbnail_url = reel.video_url, reel.thumbnail_url
-    db.delete(reel)  # cascades collaborators + revenue splits via the ORM relationship
-    db.commit()
+    try:
+        db.delete(reel)  # cascades collaborators + revenue splits via the ORM relationship
+        db.commit()
+    except IntegrityError:
+        # Something still references the reel. Roll back so the cleanup
+        # above doesn't get half-committed, leaving a reel that's had its
+        # likes and comments stripped but is still there.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This reel can't be deleted because other records still reference it",
+        )
+
+    # Only unlink the media once the row is actually gone — deleting the
+    # file first would leave a playable-looking reel with a dead video URL
+    # if the commit failed.
     delete_media_file(video_url)
     if thumbnail_url:
         delete_media_file(thumbnail_url)
