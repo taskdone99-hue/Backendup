@@ -49,6 +49,7 @@ from app.routers import (
 #   python -m app.backfill_post_media_and_hashtags   (posts made before that update)
 #   python -m app.add_reel_location_columns          (adds location_* to the existing reels table)
 #   python -m app.add_dm_media_and_request_columns   (adds media/reply/request columns to messages + conversation_participants)
+#   python -m app.add_post_media_caption_column      (adds per-photo caption to the existing post_media table)
 Base.metadata.create_all(bind=engine)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")

@@ -21,7 +21,10 @@ Design notes:
     resilient to imperfect frontend event ordering instead of just 409ing.
   * Sessions shorter than MIN_VALID_WATCH_SECONDS are kept in the table
     (useful for abuse/analytics review) but flagged `is_valid=False` and
-    excluded from history and stats.
+    excluded from history and stats. Same treatment for sessions longer
+    than MAX_VALID_WATCH_SECONDS — these are stale/abandoned sessions
+    auto-closed long after the fact, not real long watches (see the
+    constant's own comment below for the full explanation).
 """
 
 import os
@@ -41,6 +44,20 @@ router = APIRouter(prefix="/api/watch", tags=["watch"])
 # Sessions shorter than this are noise (accidental taps, fast scroll-throughs)
 # and are excluded from history/stats rather than counted as a "watch".
 MIN_VALID_WATCH_SECONDS = int(os.getenv("MIN_VALID_WATCH_SECONDS", "2"))
+
+# Sessions longer than this are almost certainly stale, not real engagement:
+# reels are short-form vertical video, so even generously accounting for
+# looping, nobody is genuinely watching one for longer than this in a single
+# sitting. Without this cap, a session that never gets a clean /watch/end
+# (app killed, phone locked, connectivity lost) sits "active" until the
+# user's *next* /watch/start — possibly hours or days later — at which point
+# _close_session auto-closes it using "now", crediting the entire elapsed
+# gap as watch time. That's the exact shape of bug this constant closes:
+# e.g. a 10-second reel showing ~93,000 seconds (~26 hours) of "watch time"
+# is one abandoned session getting auto-closed a day later, not duplicate or
+# overlapping sessions being double-counted (the UniqueConstraint on
+# active_owner_id above already rules that out at the DB level).
+MAX_VALID_WATCH_SECONDS = int(os.getenv("MAX_VALID_WATCH_SECONDS", "600"))
 
 
 def _now() -> datetime:
@@ -65,7 +82,12 @@ def _close_session(session: models.WatchSession, ended_at: datetime) -> None:
     session.ended_at = ended_at
     session.watch_seconds = watch_seconds
     session.active_owner_id = None
-    session.is_valid = watch_seconds >= MIN_VALID_WATCH_SECONDS
+    # Too short (noise) OR implausibly long (a stale session that was
+    # auto-closed on a much-later /watch/start rather than a timely
+    # /watch/end — see MAX_VALID_WATCH_SECONDS above) — either way, not a
+    # real watch, so excluded from history/stats via is_valid rather than
+    # crediting a fabricated duration.
+    session.is_valid = MIN_VALID_WATCH_SECONDS <= watch_seconds <= MAX_VALID_WATCH_SECONDS
 
 
 @router.post("/start", response_model=schemas.WatchStartResponse, status_code=status.HTTP_201_CREATED)
