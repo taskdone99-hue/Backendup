@@ -4,7 +4,7 @@ Posts and Reels: creation, CRUD, feeds, and reel-audio remixing.
 Comments and likes for these live in comment_routes.py; the "video upload /
 thumbnail / metadata / collaborators / revenue-split" flow lives in
 video_routes.py (it operates on the same Reel rows created here, since this
-app has a single video-content type).
+app has a rom asingle video-content type).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -17,7 +17,12 @@ from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.form_fields import OptionalFloatForm, OptionalIntForm
-from app.services.media_service import delete_media_file, generate_video_thumbnail, save_upload_file
+from app.services.media_service import (
+    delete_media_file,
+    generate_video_thumbnail,
+    get_video_duration,
+    save_upload_file,
+)
 from app.services import engagement
 from app.services.location_service import resolve_location_from_form, find_or_create_location
 from app.services.hashtag_service import extract_hashtags, sync_post_hashtags
@@ -794,6 +799,11 @@ def create_reel(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Reels must be a video file"
         )
 
+    # Extract and store the real video duration. This is used by WatchSession
+    # validation so a viewer cannot accumulate more watch time than the reel
+    # actually contains.
+    duration_seconds = get_video_duration(url)
+
     thumbnail_url = None
     if thumbnail is not None and thumbnail.filename:
         thumbnail_url, thumb_kind = save_upload_file(thumbnail, "thumbnails", allow_video=False)
@@ -809,6 +819,7 @@ def create_reel(
         caption=caption,
         video_url=url,
         thumbnail_url=thumbnail_url,
+        duration_seconds=duration_seconds,
         location_name=location.name if location else location_name,
         location_latitude=location.latitude if location else location_latitude,
         location_longitude=location.longitude if location else location_longitude,
@@ -1027,10 +1038,14 @@ def remix_reel_audio(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Reels must be a video file"
         )
 
+    # Extract and store the real duration for the remixed reel too.
+    duration_seconds = get_video_duration(url)
+
     remix = models.Reel(
         user_id=current_user.id,
         caption=caption,
         video_url=url,
+        duration_seconds=duration_seconds,
         remixed_from_id=original.id,
     )
     db.add(remix)

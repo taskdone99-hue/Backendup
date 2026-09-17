@@ -195,6 +195,52 @@ def generate_video_thumbnail(video_public_url: str, subfolder: str = "thumbnails
             return None
 
     return _public_url(f"{subfolder}/{thumb_path.name}")
+def get_video_duration(video_public_url: str) -> float | None:
+    """
+    Return the video duration in seconds using ffprobe.
+    Returns None if the video cannot be inspected.
+    """
+    video_path = _local_path_from_url(video_public_url)
+
+    if video_path is None or not video_path.exists():
+        return None
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        logger.warning(
+            "Video duration extraction failed for %s: %s",
+            video_path.name,
+            e,
+        )
+        return None
+
+    if result.returncode != 0:
+        logger.warning(
+            "ffprobe failed for %s: %s",
+            video_path.name,
+            result.stderr[-500:],
+        )
+        return None
+
+    try:
+        duration = float(result.stdout.strip())
+        return duration if duration >= 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 def delete_media_file(public_url: str) -> None:
