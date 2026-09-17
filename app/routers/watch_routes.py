@@ -64,31 +64,52 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _close_session(session: models.WatchSession, ended_at: datetime) -> None:
-    """Stamp a session as ended in place. Caller commits."""
+def _close_session(
+    db: Session,
+    session: models.WatchSession,
+    ended_at: datetime,
+) -> None:
+    """Close a watch session and cap credited time to the Reel duration."""
 
     started_at = session.started_at
 
-    # Normalize timezone from DB
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
 
     if ended_at.tzinfo is None:
         ended_at = ended_at.replace(tzinfo=timezone.utc)
-        
 
-    watch_seconds = max(0, int((ended_at - started_at).total_seconds()))
+    elapsed_seconds = max(
+        0,
+        int((ended_at - started_at).total_seconds()),
+    )
+
+    # Get the Reel so we can never credit more time than
+    # the actual Reel duration.
+    reel = (
+        db.query(models.Reel)
+        .filter(models.Reel.id == session.reel_id)
+        .first()
+    )
+
+    watch_seconds = elapsed_seconds
+
+    if reel is not None and reel.duration_seconds is not None:
+        duration_seconds = max(0, int(reel.duration_seconds))
+        watch_seconds = min(elapsed_seconds, duration_seconds)
+
+    # Safety limit for missing/invalid duration values.
+    watch_seconds = min(watch_seconds, MAX_VALID_WATCH_SECONDS)
 
     session.ended_at = ended_at
     session.watch_seconds = watch_seconds
     session.active_owner_id = None
-    # Too short (noise) OR implausibly long (a stale session that was
-    # auto-closed on a much-later /watch/start rather than a timely
-    # /watch/end — see MAX_VALID_WATCH_SECONDS above) — either way, not a
-    # real watch, so excluded from history/stats via is_valid rather than
-    # crediting a fabricated duration.
-    session.is_valid = MIN_VALID_WATCH_SECONDS <= watch_seconds <= MAX_VALID_WATCH_SECONDS
 
+    session.is_valid = (
+        MIN_VALID_WATCH_SECONDS
+        <= watch_seconds
+        <= MAX_VALID_WATCH_SECONDS
+    )
 
 @router.post("/start", response_model=schemas.WatchStartResponse, status_code=status.HTTP_201_CREATED)
 def start_watch(
@@ -111,7 +132,7 @@ def start_watch(
         .first()
     )
     if existing_active is not None:
-        _close_session(existing_active, now)
+        _close_session(db, existing_active, now)
 
     session = models.WatchSession(
         user_id=current_user.id,
@@ -158,7 +179,7 @@ def end_watch(
     if session.ended_at is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Watch session already ended")
 
-    _close_session(session, _now())
+    _close_session(db, session, _now())
     db.commit()
     db.refresh(session)
 
