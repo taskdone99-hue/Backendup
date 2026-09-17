@@ -72,6 +72,13 @@ class NotificationType(str, enum.Enum):
     mention = "mention"
     share = "share"
     message = "message"
+    # Creator-to-creator collaboration lifecycle (see
+    # app/services/collaboration_service.py). Kept as three distinct values
+    # rather than one so the client can dispatch on them directly, the same
+    # way `follow` and `follow_request` are separate above.
+    collaboration_request = "collaboration_request"
+    collaboration_accepted = "collaboration_accepted"
+    collaboration_rejected = "collaboration_rejected"
     other = "other"
 
 

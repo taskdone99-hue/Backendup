@@ -35,14 +35,14 @@ def _to_out(request: models.CreatorCollaborationRequest) -> schemas.CreatorColla
 
 
 @router.post("", response_model=schemas.CreatorCollaborationOut, status_code=status.HTTP_201_CREATED)
-def create_collaboration_request(
+async def create_collaboration_request(
     payload: schemas.CreatorCollaborationCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    request = collaboration_service.create_request(
+    request = await collaboration_service.create_request(
         db,
-        requester_id=current_user.id,
+        requester=current_user,
         partner_user_id=payload.partner_user_id,
         reel_id=payload.reel_id,
         message=payload.message,
@@ -88,24 +88,24 @@ def get_collaboration_request(
 
 
 @router.post("/{request_id}/accept", response_model=schemas.CreatorCollaborationOut)
-def accept_collaboration_request(
+async def accept_collaboration_request(
     request_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     request = collaboration_service.get_request_or_404(db, request_id)
-    request = collaboration_service.accept_request(db, request, current_user.id)
+    request = await collaboration_service.accept_request(db, request, current_user)
     return _to_out(request)
 
 
 @router.post("/{request_id}/reject", response_model=schemas.CreatorCollaborationOut)
-def reject_collaboration_request(
+async def reject_collaboration_request(
     request_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     request = collaboration_service.get_request_or_404(db, request_id)
-    request = collaboration_service.reject_request(db, request, current_user.id)
+    request = await collaboration_service.reject_request(db, request, current_user)
     return _to_out(request)
 
 

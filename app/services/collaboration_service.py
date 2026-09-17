@@ -17,27 +17,133 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services import privacy_service
 from app.services.monetization_service import record_earning
+from app.services.notification_service import notify_user
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_request(
+def _assert_can_reach_partner(db: Session, requester: models.User, partner: models.User) -> None:
+    """Who you're allowed to propose a collaboration to.
+
+    Public partner  -> anyone can ask, no follow relationship needed.
+    Private partner -> only an *approved* follower can ask. A pending
+                       FollowRequest doesn't count: the partner hasn't let
+                       the requester in yet, so surfacing a collaboration
+                       invite to them would leak around the private wall.
+
+    A block in either direction hides the partner from the requester
+    everywhere else in the app, so it blocks this too — and it's checked
+    first so the error can't be used to detect a block.
+    """
+    if privacy_service.is_blocked(db, requester.id, partner.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Partner user not found"
+        )
+
+    if not partner.is_private:
+        return
+
+    is_follower = (
+        db.query(models.Follow)
+        .filter(
+            models.Follow.follower_id == requester.id,
+            models.Follow.following_id == partner.id,
+        )
+        .first()
+        is not None
+    )
+    if not is_follower:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"@{partner.username} has a private account — you need to be "
+                "following them before you can send a collaboration request"
+            ),
+        )
+
+
+def _assert_not_duplicate(
+    db: Session, *, requester_id: int, partner_id: int, reel_id: int | None
+) -> None:
+    """One open proposal per pair, per reel.
+
+    Checked in both directions: if the partner has already invited the
+    requester, the requester should answer that one rather than open a
+    competing thread that both sides could accept separately.
+
+    Scoped by reel_id so a general "let's work together" proposal and a
+    per-reel one can coexist, while two invites on the same reel (or two
+    general ones) can't. Resolved requests — rejected/cancelled — never
+    block a fresh attempt.
+    """
+    reel_clause = (
+        models.CreatorCollaborationRequest.reel_id.is_(None)
+        if reel_id is None
+        else models.CreatorCollaborationRequest.reel_id == reel_id
+    )
+    existing = (
+        db.query(models.CreatorCollaborationRequest)
+        .filter(
+            models.CreatorCollaborationRequest.status == models.CollaborationStatus.pending,
+            reel_clause,
+            or_(
+                and_(
+                    models.CreatorCollaborationRequest.requester_id == requester_id,
+                    models.CreatorCollaborationRequest.partner_id == partner_id,
+                ),
+                and_(
+                    models.CreatorCollaborationRequest.requester_id == partner_id,
+                    models.CreatorCollaborationRequest.partner_id == requester_id,
+                ),
+            ),
+        )
+        .first()
+    )
+    if existing is not None:
+        detail = (
+            "You already have a pending collaboration request with this creator"
+            if existing.requester_id == requester_id
+            else "This creator has already sent you a collaboration request — respond to that one instead"
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+    # Already a tagged co-creator on this reel — nothing left to propose.
+    if reel_id is not None:
+        already_tagged = (
+            db.query(models.ReelCollaborator)
+            .filter(
+                models.ReelCollaborator.reel_id == reel_id,
+                models.ReelCollaborator.user_id == partner_id,
+            )
+            .first()
+        )
+        if already_tagged is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This creator is already a collaborator on that reel",
+            )
+
+
+async def create_request(
     db: Session,
     *,
-    requester_id: int,
+    requester: models.User,
     partner_user_id: int,
     reel_id: int | None,
     message: str | None,
     proposed_revenue_share_percentage: int | None,
     proposed_amount_cents: int | None,
 ) -> models.CreatorCollaborationRequest:
+    requester_id = requester.id
+
     if partner_user_id == requester_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -52,6 +158,8 @@ def create_request(
     if partner is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Partner user not found")
 
+    _assert_can_reach_partner(db, requester, partner)
+
     if reel_id is not None:
         reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
         if reel is None:
@@ -61,6 +169,10 @@ def create_request(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You can only propose a collaboration on a reel you own",
             )
+
+    _assert_not_duplicate(
+        db, requester_id=requester_id, partner_id=partner_user_id, reel_id=reel_id
+    )
 
     request = models.CreatorCollaborationRequest(
         requester_id=requester_id,
@@ -73,6 +185,21 @@ def create_request(
     )
     db.add(request)
     db.commit()
+    db.refresh(request)
+
+    # Fan out to the partner (DB row + WebSocket + FCM push). Same pattern
+    # as a follow request — notify_user swallows WS/push failures itself, so
+    # the request is never lost just because delivery hiccuped.
+    await notify_user(
+        db,
+        user_id=partner.id,
+        actor=requester,
+        notif_type=models.NotificationType.collaboration_request,
+        message=f"{requester.username} invited you to collaborate",
+        target_type="collab_request",
+        target_id=request.id,
+    )
+
     db.refresh(request)
     return request
 
@@ -128,7 +255,10 @@ def list_requests(
     return total, rows
 
 
-def accept_request(db: Session, request: models.CreatorCollaborationRequest, current_user_id: int) -> models.CreatorCollaborationRequest:
+async def accept_request(
+    db: Session, request: models.CreatorCollaborationRequest, responder: models.User
+) -> models.CreatorCollaborationRequest:
+    current_user_id = responder.id
     if request.partner_id != current_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the invited partner can accept this request")
     if request.status != models.CollaborationStatus.pending:
@@ -166,10 +296,25 @@ def accept_request(db: Session, request: models.CreatorCollaborationRequest, cur
 
     db.commit()
     db.refresh(request)
+
+    await notify_user(
+        db,
+        user_id=request.requester_id,
+        actor=responder,
+        notif_type=models.NotificationType.collaboration_accepted,
+        message=f"{responder.username} accepted your collaboration request",
+        target_type="collab_request",
+        target_id=request.id,
+    )
+
+    db.refresh(request)
     return request
 
 
-def reject_request(db: Session, request: models.CreatorCollaborationRequest, current_user_id: int) -> models.CreatorCollaborationRequest:
+async def reject_request(
+    db: Session, request: models.CreatorCollaborationRequest, responder: models.User
+) -> models.CreatorCollaborationRequest:
+    current_user_id = responder.id
     if request.partner_id != current_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the invited partner can reject this request")
     if request.status != models.CollaborationStatus.pending:
@@ -178,6 +323,18 @@ def reject_request(db: Session, request: models.CreatorCollaborationRequest, cur
     request.status = models.CollaborationStatus.rejected
     request.responded_at = _now()
     db.commit()
+    db.refresh(request)
+
+    await notify_user(
+        db,
+        user_id=request.requester_id,
+        actor=responder,
+        notif_type=models.NotificationType.collaboration_rejected,
+        message=f"{responder.username} declined your collaboration request",
+        target_type="collab_request",
+        target_id=request.id,
+    )
+
     db.refresh(request)
     return request
 
