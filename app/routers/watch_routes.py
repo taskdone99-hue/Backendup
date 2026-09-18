@@ -437,6 +437,67 @@ def _period_stats(
     )
 
 
+def _owner_period_stats(
+    db: Session,
+    owner_id: int,
+    since: datetime | None,
+) -> schemas.WatchPeriodStats:
+    """
+    Calculate valid watch-time credited toward a Reel owner's monetization.
+
+    This is the "who does the watch time belong to" counterpart to
+    _period_stats() above. _period_stats() answers "how much has this user
+    watched"; this answers "how much watch time has this user *earned* as
+    a creator" — i.e. time other people spent watching Reels this user
+    posted.
+
+    A row is credited to owner_id's monetization total only when:
+      - the WatchSession's reel.user_id == owner_id (it's their Reel)
+      - the WatchSession's viewer (user_id) is NOT owner_id — a creator
+        watching their own Reel never counts toward their own
+        monetization, no matter how long the session
+      - the session is completed and marked is_valid=True (the same
+        server-side validity check _close_session() already applies:
+        excludes too-short sessions, and excludes stale/abandoned
+        sessions auto-closed with an inflated elapsed duration)
+
+    Joins against Reel (instead of trusting anything client-supplied) so
+    ownership is always read from the current reel.user_id at query time.
+    """
+
+    query = (
+        db.query(
+            func.coalesce(
+                func.sum(models.WatchSession.watch_seconds),
+                0,
+            ),
+            func.count(models.WatchSession.id),
+        )
+        .join(
+            models.Reel,
+            models.Reel.id == models.WatchSession.reel_id,
+        )
+        .filter(
+            models.Reel.user_id == owner_id,
+            models.WatchSession.user_id != owner_id,
+            models.WatchSession.is_valid.is_(True),
+            models.WatchSession.ended_at.isnot(None),
+        )
+    )
+
+    if since is not None:
+        query = query.filter(
+            models.WatchSession.started_at >= since
+        )
+
+    watch_seconds, sessions_counted = query.one()
+
+    return schemas.WatchPeriodStats(
+        watch_seconds=int(watch_seconds),
+        reels_watched=int(sessions_counted),
+    )
+
+
 @router.get(
     "/stats",
     response_model=schemas.WatchStatsResponse,

@@ -932,13 +932,19 @@ assert {i["id"] for i in page1["items"]}.isdisjoint({i["id"] for i in page2["ite
 
 # ==========================================================================
 # MONETIZATION tests
+#
+# Watch time is credited to the Reel *owner*, not the viewer -- so every
+# scenario below needs a distinct owner (whose /api/monetization/status we
+# check) and a distinct viewer (whose WatchSession rows we create against
+# that owner's Reel). Self-views (owner watching their own Reel) are
+# exercised separately and must never count.
 # ==========================================================================
 
-def _make_watch_session(user, reel, watch_seconds, is_valid=True, started_ago_seconds=3600):
+def _make_watch_session(viewer, reel, watch_seconds, is_valid=True, started_ago_seconds=3600):
     started = datetime.now(timezone.utc) - timedelta(seconds=started_ago_seconds)
     ended = started + timedelta(seconds=watch_seconds)
     session = models.WatchSession(
-        user_id=user.id, reel_id=reel.id, started_at=started, ended_at=ended,
+        user_id=viewer.id, reel_id=reel.id, started_at=started, ended_at=ended,
         watch_seconds=watch_seconds, active_owner_id=None, is_valid=is_valid,
     )
     db.add(session)
@@ -951,15 +957,27 @@ mon_user_exact = models.User(username="mon_exact", full_name="Mon Exact", is_pho
 mon_user_over = models.User(username="mon_over", full_name="Mon Over", is_phone_verified=True)
 mon_user_dup = models.User(username="mon_dup", full_name="Mon Dup", is_phone_verified=True)
 mon_user_invalid = models.User(username="mon_invalid", full_name="Mon Invalid", is_phone_verified=True)
-db.add_all([mon_user_zero, mon_user_under, mon_user_exact, mon_user_over, mon_user_dup, mon_user_invalid])
+mon_viewer = models.User(username="mon_viewer", full_name="Mon Viewer", is_phone_verified=True)
+db.add_all([
+    mon_user_zero, mon_user_under, mon_user_exact, mon_user_over,
+    mon_user_dup, mon_user_invalid, mon_viewer,
+])
 db.commit()
-for u in (mon_user_zero, mon_user_under, mon_user_exact, mon_user_over, mon_user_dup, mon_user_invalid):
+for u in (mon_user_zero, mon_user_under, mon_user_exact, mon_user_over, mon_user_dup, mon_user_invalid, mon_viewer):
     db.refresh(u)
 
-mon_reel = models.Reel(user_id=loc_owner.id, caption="mon reel", video_url="/static/mon_reel.mp4")
-db.add(mon_reel)
+# Each owner gets their own Reel -- sessions on one owner's Reel must never
+# leak into another owner's monetization total.
+mon_reel_zero = models.Reel(user_id=mon_user_zero.id, caption="mon reel zero", video_url="/static/mon_reel_zero.mp4")
+mon_reel_under = models.Reel(user_id=mon_user_under.id, caption="mon reel under", video_url="/static/mon_reel_under.mp4")
+mon_reel_exact = models.Reel(user_id=mon_user_exact.id, caption="mon reel exact", video_url="/static/mon_reel_exact.mp4")
+mon_reel_over = models.Reel(user_id=mon_user_over.id, caption="mon reel over", video_url="/static/mon_reel_over.mp4")
+mon_reel_dup = models.Reel(user_id=mon_user_dup.id, caption="mon reel dup", video_url="/static/mon_reel_dup.mp4")
+mon_reel_invalid = models.Reel(user_id=mon_user_invalid.id, caption="mon reel invalid", video_url="/static/mon_reel_invalid.mp4")
+db.add_all([mon_reel_zero, mon_reel_under, mon_reel_exact, mon_reel_over, mon_reel_dup, mon_reel_invalid])
 db.commit()
-db.refresh(mon_reel)
+for reel in (mon_reel_zero, mon_reel_under, mon_reel_exact, mon_reel_over, mon_reel_dup, mon_reel_invalid):
+    db.refresh(reel)
 
 def _mon_headers(user):
     return {"Authorization": f"Bearer {create_access_token({'sub': str(user.id)})}"}
@@ -974,9 +992,19 @@ assert body["watch_time_seconds"] == 0
 assert body["required_watch_time_seconds"] == 7200
 assert body["remaining_seconds"] == 7200
 
-# 19. < 7200 -> OFF
-_make_watch_session(mon_user_under, mon_reel, 5400)
-r = check("GET /api/monetization/status (5400 seconds -> OFF)", client.get(
+# 18b. Watching your own Reel never counts toward your own monetization,
+# no matter how long the session.
+_make_watch_session(mon_user_zero, mon_reel_zero, 5000)
+r = check("GET /api/monetization/status (self-view -> still 0)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_user_zero)
+), 200)
+body = r.json()
+assert body["monetization_enabled"] is False
+assert body["watch_time_seconds"] == 0, "a Reel owner's own view of their own Reel must not count"
+
+# 19. < 7200 -> OFF (another user watches mon_user_under's Reel)
+_make_watch_session(mon_viewer, mon_reel_under, 5400)
+r = check("GET /api/monetization/status (5400 seconds from a viewer -> OFF)", client.get(
     "/api/monetization/status", headers=_mon_headers(mon_user_under)
 ), 200)
 body = r.json()
@@ -984,9 +1012,14 @@ assert body["monetization_enabled"] is False
 assert body["watch_time_seconds"] == 5400
 # 22. Remaining time calculated correctly
 assert body["remaining_seconds"] == 1800
+# and it must not have leaked onto the viewer's own monetization status
+r = check("GET /api/monetization/status (viewer's own status unaffected)", client.get(
+    "/api/monetization/status", headers=_mon_headers(mon_viewer)
+), 200)
+assert r.json()["watch_time_seconds"] == 0
 
 # 20. exactly 7200 -> ON
-_make_watch_session(mon_user_exact, mon_reel, 7200)
+_make_watch_session(mon_viewer, mon_reel_exact, 7200)
 r = check("GET /api/monetization/status (exactly 7200 -> ON)", client.get(
     "/api/monetization/status", headers=_mon_headers(mon_user_exact)
 ), 200)
@@ -996,7 +1029,7 @@ assert body["watch_time_seconds"] == 7200
 assert body["remaining_seconds"] == 0
 
 # 21. > 7200 -> ON
-_make_watch_session(mon_user_over, mon_reel, 8500)
+_make_watch_session(mon_viewer, mon_reel_over, 8500)
 r = check("GET /api/monetization/status (8500 -> ON)", client.get(
     "/api/monetization/status", headers=_mon_headers(mon_user_over)
 ), 200)
@@ -1007,18 +1040,19 @@ assert body["remaining_seconds"] == 0
 
 # 23. Duplicate watch sessions are not double-counted (two separate,
 # legitimate sessions just sum normally -- "duplicate" here means the
-# server-side sum, not double-billing a single session twice).
-_make_watch_session(mon_user_dup, mon_reel, 3000, started_ago_seconds=7200)
-_make_watch_session(mon_user_dup, mon_reel, 3000, started_ago_seconds=3600)
-r = check("GET /api/monetization/status (two 3000s sessions -> 6000, not 12000)", client.get(
+# server-side sum, not double-billing a single session twice), and they
+# accumulate onto the Reel owner regardless of who the viewer is.
+_make_watch_session(mon_viewer, mon_reel_dup, 3000, started_ago_seconds=7200)
+_make_watch_session(mon_user_zero, mon_reel_dup, 3000, started_ago_seconds=3600)  # a second, different viewer
+r = check("GET /api/monetization/status (two 3000s sessions from two viewers -> 6000, not 12000)", client.get(
     "/api/monetization/status", headers=_mon_headers(mon_user_dup)
 ), 200)
 body = r.json()
 assert body["watch_time_seconds"] == 6000
 
 # 24. Invalid watch session does not increase qualifying time
-_make_watch_session(mon_user_invalid, mon_reel, 1, is_valid=False)  # below MIN_VALID_WATCH_SECONDS
-_make_watch_session(mon_user_invalid, mon_reel, 100, is_valid=True)
+_make_watch_session(mon_viewer, mon_reel_invalid, 1, is_valid=False)  # below MIN_VALID_WATCH_SECONDS
+_make_watch_session(mon_viewer, mon_reel_invalid, 100, is_valid=True)
 r = check("GET /api/monetization/status (invalid session excluded)", client.get(
     "/api/monetization/status", headers=_mon_headers(mon_user_invalid)
 ), 200)
@@ -1046,7 +1080,7 @@ r = check("GET /api/reels/feed (existing API still works)", client.get(
 
 # 28. Existing watch-session functionality continues working
 r = check("POST /api/watch/start (existing API still works)", client.post(
-    "/api/watch/start", headers=h1, json={"reel_id": mon_reel.id}
+    "/api/watch/start", headers=h1, json={"reel_id": mon_reel_zero.id}
 ), 201)
 watch_session_id = r.json()["session_id"]
 r = check("POST /api/watch/end (existing API still works)", client.post(

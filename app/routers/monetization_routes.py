@@ -19,11 +19,13 @@ def get_status(
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Reel watch-time monetization eligibility for the current user —
-    calculated dynamically from WatchSession rows on every call (see
-    app.services.monetization_service), never persisted, so there's no
-    stale-state risk across a period reset and no way for a client to set
-    monetization_enabled directly.
+    Reel watch-time monetization eligibility for the current user, as a
+    Reel *owner* — i.e. valid watch time other viewers have spent on
+    Reels this user posted. Watching your own Reels never counts toward
+    your own eligibility. Calculated dynamically from WatchSession rows
+    on every call (see app.services.monetization_service), never
+    persisted, so there's no stale-state risk across a period reset and
+    no way for a client to set monetization_enabled directly.
     """
     return get_monetization_status(db, current_user.id)
 

@@ -143,9 +143,13 @@ def _backdate_active_session(user_id: int, hours_ago: float) -> None:
 # ---- the core bug: a stale session auto-closed on the next /watch/start ----
 
 def test_stale_abandoned_session_does_not_inflate_watch_time():
+    # Reels are owned by someone else so this test actually exercises
+    # "a stale session must not inflate the *owner's* monetization" rather
+    # than trivially passing because of the (separate) self-view exclusion.
+    owner = _make_user("watchcap_u1_owner")
     uid = _make_user("watchcap_u1")
-    reel_a = _make_reel(uid)
-    reel_b = _make_reel(uid)
+    reel_a = _make_reel(owner)
+    reel_b = _make_reel(owner)
 
     # User starts watching reel_a, then the app is killed — no /watch/end
     # ever arrives. Backdate it to simulate that session having been open
@@ -168,19 +172,23 @@ def test_stale_abandoned_session_does_not_inflate_watch_time():
     assert stale_session.is_valid is False
     db.close()
 
-    # And it must not count toward monetization eligibility.
-    status_resp = client.get("/api/monetization/status", headers=_auth_headers(uid))
+    # And it must not count toward the Reel owner's monetization eligibility.
+    status_resp = client.get("/api/monetization/status", headers=_auth_headers(owner))
     assert status_resp.json()["watch_time_seconds"] == 0
 
 
 def test_normal_session_within_range_still_counts():
-    uid = _make_user("watchcap_u2")
-    reel = _make_reel(uid)
+    # Owner and viewer are two different accounts: watch time is credited
+    # to the Reel *owner*'s monetization, never to the viewer who generated
+    # it, so this needs both to check that attribution correctly.
+    owner = _make_user("watchcap_u2_owner")
+    viewer = _make_user("watchcap_u2_viewer")
+    reel = _make_reel(owner)
 
-    start = client.post("/api/watch/start", headers=_auth_headers(uid), json={"reel_id": reel}).json()
-    _backdate_active_session(uid, hours_ago=30 / 3600)  # 30 seconds ago — a real, brief watch
+    start = client.post("/api/watch/start", headers=_auth_headers(viewer), json={"reel_id": reel}).json()
+    _backdate_active_session(viewer, hours_ago=30 / 3600)  # 30 seconds ago — a real, brief watch
     end = client.post(
-        "/api/watch/end", headers=_auth_headers(uid), json={"session_id": start["session_id"]}
+        "/api/watch/end", headers=_auth_headers(viewer), json={"session_id": start["session_id"]}
     )
     assert end.status_code == 200
 
@@ -190,8 +198,12 @@ def test_normal_session_within_range_still_counts():
     assert MIN_VALID_WATCH_SECONDS <= session.watch_seconds <= MAX_VALID_WATCH_SECONDS
     db.close()
 
-    status_resp = client.get("/api/monetization/status", headers=_auth_headers(uid))
-    assert status_resp.json()["watch_time_seconds"] >= 25
+    owner_status = client.get("/api/monetization/status", headers=_auth_headers(owner))
+    assert owner_status.json()["watch_time_seconds"] >= 25
+
+    # It must not also count toward the viewer's own monetization.
+    viewer_status = client.get("/api/monetization/status", headers=_auth_headers(viewer))
+    assert viewer_status.json()["watch_time_seconds"] == 0
 
 
 def test_session_right_at_the_cap_boundary_is_valid():
@@ -223,14 +235,17 @@ def test_session_one_second_past_the_cap_is_invalid():
 # ---- data-repair script for rows already corrupted before this fix ----
 
 def test_fix_stale_watch_sessions_repairs_preexisting_bad_rows():
-    uid = _make_user("watchcap_u5")
-    reel = _make_reel(uid)
+    # Owner and viewer are two different accounts — see the note in
+    # test_normal_session_within_range_still_counts above.
+    owner = _make_user("watchcap_u5_owner")
+    viewer = _make_user("watchcap_u5_viewer")
+    reel = _make_reel(owner)
 
     db = TestSessionLocal()
     # Simulate a row written by the old, uncapped code: is_valid=True with
     # an absurd watch_seconds, exactly like the reported 92,985-second case.
     bad_session = models.WatchSession(
-        user_id=uid, reel_id=reel,
+        user_id=viewer, reel_id=reel,
         started_at=datetime.now(timezone.utc) - timedelta(seconds=92985),
         ended_at=datetime.now(timezone.utc),
         watch_seconds=92985, active_owner_id=None, is_valid=True,
@@ -241,7 +256,7 @@ def test_fix_stale_watch_sessions_repairs_preexisting_bad_rows():
     bad_id = bad_session.id
     db.close()
 
-    status_before = client.get("/api/monetization/status", headers=_auth_headers(uid)).json()
+    status_before = client.get("/api/monetization/status", headers=_auth_headers(owner)).json()
     assert status_before["watch_time_seconds"] == 92985
 
     db = TestSessionLocal()
@@ -249,7 +264,7 @@ def test_fix_stale_watch_sessions_repairs_preexisting_bad_rows():
     db.close()
     assert fixed_count == 1
 
-    status_after = client.get("/api/monetization/status", headers=_auth_headers(uid)).json()
+    status_after = client.get("/api/monetization/status", headers=_auth_headers(owner)).json()
     assert status_after["watch_time_seconds"] == 0
 
     db = TestSessionLocal()
