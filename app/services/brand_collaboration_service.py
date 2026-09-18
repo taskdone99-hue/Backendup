@@ -20,16 +20,17 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.monetization_service import record_earning
+from app.services.notification_service import notify_user
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_offer(
+async def create_offer(
     db: Session,
     *,
-    created_by_id: int,
+    created_by: models.User,
     creator_user_id: int,
     brand_name: str,
     brand_contact_email: str | None,
@@ -39,6 +40,7 @@ def create_offer(
     currency: str,
     deliverables: str | None,
 ) -> models.BrandCollaboration:
+    created_by_id = created_by.id
     if creator_user_id == created_by_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -67,6 +69,23 @@ def create_offer(
     )
     db.add(offer)
     db.commit()
+    db.refresh(offer)
+
+    # This was previously missing entirely — a brand offer landed in the
+    # creator's list (GET /api/brand-collaborations) but never generated a
+    # Notification row, WS push, or FCM push, so the creator had no way to
+    # find out short of polling the list themselves. Same fan-out as a
+    # creator-to-creator request (collaboration_service.create_request).
+    await notify_user(
+        db,
+        user_id=creator.id,
+        actor=created_by,
+        notif_type=models.NotificationType.brand_collaboration_offer,
+        message=f"{created_by.username} sent you a brand collaboration offer: {campaign_title}",
+        target_type="brand_collab_offer",
+        target_id=offer.id,
+    )
+
     db.refresh(offer)
     return offer
 
@@ -118,8 +137,8 @@ def list_offers(
     return total, rows
 
 
-def accept_offer(db: Session, offer: models.BrandCollaboration, current_user_id: int) -> models.BrandCollaboration:
-    if offer.creator_id != current_user_id:
+async def accept_offer(db: Session, offer: models.BrandCollaboration, responder: models.User) -> models.BrandCollaboration:
+    if offer.creator_id != responder.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the targeted creator can accept this offer")
     if offer.status != models.BrandCollaborationStatus.pending:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Offer is already {offer.status.value}")
@@ -139,11 +158,23 @@ def accept_offer(db: Session, offer: models.BrandCollaboration, current_user_id:
 
     db.commit()
     db.refresh(offer)
+
+    await notify_user(
+        db,
+        user_id=offer.created_by_id,
+        actor=responder,
+        notif_type=models.NotificationType.brand_collaboration_accepted,
+        message=f"{responder.username} accepted your brand collaboration offer",
+        target_type="brand_collab_offer",
+        target_id=offer.id,
+    )
+
+    db.refresh(offer)
     return offer
 
 
-def reject_offer(db: Session, offer: models.BrandCollaboration, current_user_id: int) -> models.BrandCollaboration:
-    if offer.creator_id != current_user_id:
+async def reject_offer(db: Session, offer: models.BrandCollaboration, responder: models.User) -> models.BrandCollaboration:
+    if offer.creator_id != responder.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the targeted creator can reject this offer")
     if offer.status != models.BrandCollaborationStatus.pending:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Offer is already {offer.status.value}")
@@ -151,6 +182,18 @@ def reject_offer(db: Session, offer: models.BrandCollaboration, current_user_id:
     offer.status = models.BrandCollaborationStatus.rejected
     offer.responded_at = _now()
     db.commit()
+    db.refresh(offer)
+
+    await notify_user(
+        db,
+        user_id=offer.created_by_id,
+        actor=responder,
+        notif_type=models.NotificationType.brand_collaboration_rejected,
+        message=f"{responder.username} declined your brand collaboration offer",
+        target_type="brand_collab_offer",
+        target_id=offer.id,
+    )
+
     db.refresh(offer)
     return offer
 

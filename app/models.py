@@ -79,6 +79,12 @@ class NotificationType(str, enum.Enum):
     collaboration_request = "collaboration_request"
     collaboration_accepted = "collaboration_accepted"
     collaboration_rejected = "collaboration_rejected"
+    # Brand (paid-partnership) collaboration lifecycle — same three-value
+    # shape as the creator_collaboration_* values above, for the same
+    # reason (see app/services/brand_collaboration_service.py).
+    brand_collaboration_offer = "brand_collaboration_offer"
+    brand_collaboration_accepted = "brand_collaboration_accepted"
+    brand_collaboration_rejected = "brand_collaboration_rejected"
     other = "other"
 
 

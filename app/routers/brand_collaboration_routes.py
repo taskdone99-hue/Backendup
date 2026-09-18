@@ -38,7 +38,7 @@ def _to_out(offer: models.BrandCollaboration) -> schemas.BrandCollaborationOut:
 
 
 @router.post("", response_model=schemas.BrandCollaborationOut, status_code=status.HTTP_201_CREATED)
-def create_brand_collaboration(
+async def create_brand_collaboration(
     payload: schemas.BrandCollaborationCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -46,9 +46,9 @@ def create_brand_collaboration(
     """Create a brand sponsorship offer targeting a creator. The
     authenticated caller is treated as the brand's representative
     (`created_by`) — see the BrandCollaboration model docstring."""
-    offer = brand_collaboration_service.create_offer(
+    offer = await brand_collaboration_service.create_offer(
         db,
-        created_by_id=current_user.id,
+        created_by=current_user,
         creator_user_id=payload.creator_user_id,
         brand_name=payload.brand_name,
         brand_contact_email=payload.brand_contact_email,
@@ -97,24 +97,24 @@ def get_brand_collaboration(
 
 
 @router.post("/{offer_id}/accept", response_model=schemas.BrandCollaborationOut)
-def accept_brand_collaboration(
+async def accept_brand_collaboration(
     offer_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     offer = brand_collaboration_service.get_offer_or_404(db, offer_id)
-    offer = brand_collaboration_service.accept_offer(db, offer, current_user.id)
+    offer = await brand_collaboration_service.accept_offer(db, offer, current_user)
     return _to_out(offer)
 
 
 @router.post("/{offer_id}/reject", response_model=schemas.BrandCollaborationOut)
-def reject_brand_collaboration(
+async def reject_brand_collaboration(
     offer_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     offer = brand_collaboration_service.get_offer_or_404(db, offer_id)
-    offer = brand_collaboration_service.reject_offer(db, offer, current_user.id)
+    offer = await brand_collaboration_service.reject_offer(db, offer, current_user)
     return _to_out(offer)
 
 
