@@ -479,7 +479,10 @@ def test_creates_user_from_pending_signup_if_registered_first():
 # ---------------------------------------------------------------------------
 
 
-def test_existing_user_logs_in_without_creating_duplicate():
+def test_existing_user_second_login_blocked_while_session_active():
+    """Single-active-session rule: logging in again for the same account
+    before the first session ends (no logout, not yet expired) is now
+    blocked with 409 instead of silently issuing a second session."""
     with _mock_msg91_success("919876543210"):
         first = client.post(
             VERIFY_URL,
@@ -487,7 +490,6 @@ def test_existing_user_logs_in_without_creating_duplicate():
         )
 
     assert first.status_code == 200
-
     first_user_id = first.json()["user"]["id"]
 
     with _mock_msg91_success("919876543210"):
@@ -496,34 +498,96 @@ def test_existing_user_logs_in_without_creating_duplicate():
             json={"access_token": "token-2"},
         )
 
-    assert second.status_code == 200
-
-    second_user_id = second.json()["user"]["id"]
-
-    assert first_user_id == second_user_id
+    assert second.status_code == 409
+    assert "already logged in" in second.json()["detail"].lower()
 
     db = TestSessionLocal()
-
     try:
         assert (
             db.query(models.User)
-            .filter(
-                models.User.phone_number
-                == "+919876543210"
-            )
+            .filter(models.User.phone_number == "+919876543210")
             .count()
             == 1
         )
-
     finally:
         db.close()
 
-    # Refresh tokens differ per login
-    # because each call issues a fresh one.
-    assert (
-        first.json()["refresh_token"]
-        != second.json()["refresh_token"]
+    # The blocked attempt must not have replaced the still-active session.
+    r = client.get(
+        "/api/auth/me",
+        headers={"Authorization": f"Bearer {first.json()['access_token']}"},
     )
+    assert r.status_code == 200
+    assert r.json()["id"] == first_user_id
+
+
+def test_existing_user_can_relogin_after_logout():
+    """Logging out frees the account up for a new login."""
+    with _mock_msg91_success("919876543210"):
+        first = client.post(
+            VERIFY_URL,
+            json={"access_token": "token-1"},
+        )
+    assert first.status_code == 200
+
+    logout_resp = client.post(
+        "/api/auth/logout",
+        json={"refresh_token": first.json()["refresh_token"]},
+    )
+    assert logout_resp.status_code == 200
+
+    with _mock_msg91_success("919876543210"):
+        second = client.post(
+            VERIFY_URL,
+            json={"access_token": "token-2"},
+        )
+
+    assert second.status_code == 200
+    assert second.json()["user"]["id"] == first.json()["user"]["id"]
+    assert second.json()["refresh_token"] != first.json()["refresh_token"]
+
+
+def test_existing_user_can_relogin_after_session_expiry():
+    """A session past its expires_at no longer counts as active, so a new
+    login is allowed without an explicit logout."""
+    with _mock_msg91_success("919876543210"):
+        first = client.post(
+            VERIFY_URL,
+            json={"access_token": "token-1"},
+        )
+    assert first.status_code == 200
+
+    # Simulate the passage of time by backdating the session's expiry.
+    db = TestSessionLocal()
+    try:
+        import hashlib
+        import hmac
+
+        token_hash = hmac.new(
+            auth.SECRET_KEY.encode(),
+            first.json()["refresh_token"].encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        record = (
+            db.query(models.RefreshToken)
+            .filter(models.RefreshToken.token_hash == token_hash)
+            .first()
+        )
+        from datetime import datetime, timedelta, timezone
+
+        record.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+        db.commit()
+    finally:
+        db.close()
+
+    with _mock_msg91_success("919876543210"):
+        second = client.post(
+            VERIFY_URL,
+            json={"access_token": "token-2"},
+        )
+
+    assert second.status_code == 200
+    assert second.json()["user"]["id"] == first.json()["user"]["id"]
 
 
 # ---------------------------------------------------------------------------

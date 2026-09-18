@@ -439,7 +439,20 @@ def get_explore_feed(
     the trailing `days` window) rather than plain recency — same idea as
     GET /api/reels/trending, just without the score>0 filter, so posts with
     no engagement yet still show up (ordered after everything that has some,
-    newest first)."""
+    newest first).
+
+    The "don't already follow" narrowing is a personalization heuristic on
+    top of the privacy rules, not a privacy rule itself — a logged-in user
+    who already follows every author currently eligible for Explore (a
+    brand-new account that followed a handful of people, a small install
+    with few users, etc.) should still see the same publicly-visible feed
+    an anonymous viewer would, just without their own posts. So if
+    excluding followed authors would leave the feed empty, that exclusion
+    is dropped and Explore falls back to every visible post except the
+    viewer's own — privacy/visibility (_visible_authors_clause: private
+    accounts, blocks) is enforced in both the personalized and fallback
+    query and is never loosened.
+    """
     viewer_id = current_user.id if current_user else None
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -466,16 +479,26 @@ def get_explore_feed(
     )
     score = func.coalesce(likes_subq.c.like_score, 0) + func.coalesce(comments_subq.c.comment_score, 0)
 
-    query = (
-        db.query(models.Post, score.label("score"))
-        .join(models.User, models.Post.user_id == models.User.id)
-        .outerjoin(likes_subq, models.Post.id == likes_subq.c.post_id)
-        .outerjoin(comments_subq, models.Post.id == comments_subq.c.post_id)
-        .filter(_visible_authors_clause(db, viewer_id))
-    )
+    def _base_query():
+        return (
+            db.query(models.Post, score.label("score"))
+            .join(models.User, models.Post.user_id == models.User.id)
+            .outerjoin(likes_subq, models.Post.id == likes_subq.c.post_id)
+            .outerjoin(comments_subq, models.Post.id == comments_subq.c.post_id)
+            .filter(_visible_authors_clause(db, viewer_id))
+        )
+
+    query = _base_query()
     if current_user is not None:
         excluded_ids = _following_ids(db, current_user.id) + [current_user.id]
-        query = query.filter(models.Post.user_id.notin_(excluded_ids))
+        personalized_query = query.filter(models.Post.user_id.notin_(excluded_ids))
+        if personalized_query.count() > 0:
+            query = personalized_query
+        else:
+            # Nothing left once followed accounts are excluded — fall back
+            # to every visible post except the viewer's own, rather than
+            # showing an empty Explore feed.
+            query = query.filter(models.Post.user_id != current_user.id)
     query = query.order_by(score.desc(), models.Post.created_at.desc())
 
     total = query.count()
