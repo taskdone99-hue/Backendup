@@ -479,10 +479,10 @@ def test_creates_user_from_pending_signup_if_registered_first():
 # ---------------------------------------------------------------------------
 
 
-def test_existing_user_second_login_blocked_while_session_active():
-    """Single-active-session rule: logging in again for the same account
-    before the first session ends (no logout, not yet expired) is now
-    blocked with 409 instead of silently issuing a second session."""
+def test_existing_user_second_login_allowed_while_session_active():
+    """Multi-device login: logging in again for the same account before
+    the first session ends (no logout, not yet expired) succeeds and both
+    sessions remain valid at the same time."""
     with _mock_msg91_success("919876543210"):
         first = client.post(
             VERIFY_URL,
@@ -498,8 +498,8 @@ def test_existing_user_second_login_blocked_while_session_active():
             json={"access_token": "token-2"},
         )
 
-    assert second.status_code == 409
-    assert "already logged in" in second.json()["detail"].lower()
+    assert second.status_code == 200
+    assert second.json()["user"]["id"] == first_user_id
 
     db = TestSessionLocal()
     try:
@@ -512,13 +512,14 @@ def test_existing_user_second_login_blocked_while_session_active():
     finally:
         db.close()
 
-    # The blocked attempt must not have replaced the still-active session.
-    r = client.get(
-        "/api/auth/me",
-        headers={"Authorization": f"Bearer {first.json()['access_token']}"},
-    )
-    assert r.status_code == 200
-    assert r.json()["id"] == first_user_id
+    # Both the original and the new session stay valid at the same time.
+    for token in (first.json()["access_token"], second.json()["access_token"]):
+        r = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        assert r.json()["id"] == first_user_id
 
 
 def test_existing_user_can_relogin_after_logout():

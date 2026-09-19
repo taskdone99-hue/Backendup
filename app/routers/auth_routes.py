@@ -23,7 +23,6 @@ from app.auth import (
     create_refresh_token,
     get_valid_refresh_token,
     revoke_refresh_token,
-    raise_if_active_session,
     get_current_user,
     OTP_EXPIRE_MINUTES,
     OTP_RESEND_COOLDOWN_SECONDS,
@@ -195,15 +194,9 @@ def _finalize_verified_identifier(
     otherwise a new account is created (from a matching PendingSignup if
     /register was called first, or a placeholder-username account
     otherwise), matching Instagram's passwordless-first-login pattern.
-    A first-time signup can't collide with a prior session (there isn't
-    one yet), so the single-active-session check below only applies to
-    the existing-account/login branch.
     """
     user = _get_user_by_identifier(db, identifier, channel)
     is_new_user = user is None
-
-    if not is_new_user:
-        raise_if_active_session(db, user.id)
 
     if user is None:
         pending = (
@@ -389,8 +382,6 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This account has been deactivated",
         )
-
-    raise_if_active_session(db, user.id)
 
     return _issue_token_pair(db, user)
 
