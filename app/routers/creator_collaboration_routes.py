@@ -110,11 +110,11 @@ async def reject_collaboration_request(
 
 
 @router.post("/{request_id}/cancel", response_model=schemas.CreatorCollaborationOut)
-def cancel_collaboration_request(
+async def cancel_collaboration_request(
     request_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     request = collaboration_service.get_request_or_404(db, request_id)
-    request = collaboration_service.cancel_request(db, request, current_user.id)
+    request = await collaboration_service.cancel_request(db, request, current_user)
     return _to_out(request)

@@ -79,6 +79,7 @@ class NotificationType(str, enum.Enum):
     collaboration_request = "collaboration_request"
     collaboration_accepted = "collaboration_accepted"
     collaboration_rejected = "collaboration_rejected"
+    collaboration_cancelled = "collaboration_cancelled"
     # Brand (paid-partnership) collaboration lifecycle — same three-value
     # shape as the creator_collaboration_* values above, for the same
     # reason (see app/services/brand_collaboration_service.py).
@@ -557,6 +558,28 @@ class ReelCollaborator(Base):
     added_at = Column(DateTime(timezone=True), server_default=func.now())
 
     reel = relationship("Reel", back_populates="collaborators")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class ReelTag(Base):
+    """A user tagged in a reel's video — powers POST /api/reels/:id/tags.
+    Same shape/purpose as PostTag, just scoped to reels instead of posts:
+    this is "I appear in this video" (tap-to-tag), not a co-creator credit
+    (that's ReelCollaborator)."""
+
+    __tablename__ = "reel_tags"
+    __table_args__ = (
+        UniqueConstraint("reel_id", "user_id", name="uq_reel_tag"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    x_position = Column(Float, nullable=True)
+    y_position = Column(Float, nullable=True)
+    tagged_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    reel = relationship("Reel", foreign_keys=[reel_id])
     user = relationship("User", foreign_keys=[user_id])
 
 

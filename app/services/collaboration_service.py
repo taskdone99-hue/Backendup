@@ -339,7 +339,10 @@ async def reject_request(
     return request
 
 
-def cancel_request(db: Session, request: models.CreatorCollaborationRequest, current_user_id: int) -> models.CreatorCollaborationRequest:
+async def cancel_request(
+    db: Session, request: models.CreatorCollaborationRequest, canceller: models.User
+) -> models.CreatorCollaborationRequest:
+    current_user_id = canceller.id
     if request.requester_id != current_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the requester can cancel this request")
     if request.status != models.CollaborationStatus.pending:
@@ -348,5 +351,19 @@ def cancel_request(db: Session, request: models.CreatorCollaborationRequest, cur
     request.status = models.CollaborationStatus.cancelled
     request.responded_at = _now()
     db.commit()
+    db.refresh(request)
+
+    # Same fan-out as accept/reject above — the invited partner otherwise
+    # has no way to learn the request they were sitting on just disappeared.
+    await notify_user(
+        db,
+        user_id=request.partner_id,
+        actor=canceller,
+        notif_type=models.NotificationType.collaboration_cancelled,
+        message=f"{canceller.username} cancelled their collaboration request",
+        target_type="collab_request",
+        target_id=request.id,
+    )
+
     db.refresh(request)
     return request

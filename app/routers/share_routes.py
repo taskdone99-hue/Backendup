@@ -79,3 +79,17 @@ def get_share_link(
 
     base = PUBLIC_BASE_URL or "https://app.example.com"
     return schemas.ShareLinkResponse(post_id=post_id, url=f"{base}/p/{post_id}")
+
+
+@router.get("/reels/{reel_id}/link", response_model=schemas.ReelShareLinkResponse)
+def get_reel_share_link(
+    reel_id: int,
+    db: Session = Depends(get_db),
+):
+    """Generate a shareable deep-link URL for a reel — the reels page only
+    had the post version of this (get_share_link above), so a reel share
+    button had nowhere to fetch its link from."""
+    _get_content_or_404(db, models.ShareContentType.reel, reel_id)
+
+    base = PUBLIC_BASE_URL or "https://app.example.com"
+    return schemas.ReelShareLinkResponse(reel_id=reel_id, url=f"{base}/r/{reel_id}")

@@ -841,6 +841,22 @@ class PostTagsResponse(BaseModel):
     tags: list[PostTagOut]
 
 
+class ReelTagOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    x_position: float | None
+    y_position: float | None
+    tagged_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReelTagsResponse(BaseModel):
+    message: str
+    tags: list[ReelTagOut]
+
+
 class PostMemberAddRequest(BaseModel):
     user_id: int = Field(..., gt=0)
 
@@ -897,6 +913,15 @@ class LocationResponse(BaseModel):
 
 # ---- Reels / Video ----
 
+class CollaboratorOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    added_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class ReelDetailOut(ReelOut):
     title: str | None = None
     remixed_from_id: int | None = None
@@ -910,6 +935,9 @@ class ReelDetailOut(ReelOut):
     location_latitude: float | None = None
     location_longitude: float | None = None
     location: LocationOut | None = None
+    collaborators: list[CollaboratorOut] = []
+    tags_count: int = 0
+    tags: list[UserSummaryOut] = []
 
 
 class PaginatedReelDetailResponse(BaseModel):
@@ -946,15 +974,6 @@ class ThumbnailUploadResponse(BaseModel):
 
 class CollaboratorAddRequest(BaseModel):
     user_id: int = Field(..., gt=0)
-
-
-class CollaboratorOut(BaseModel):
-    id: int
-    user: UserSummaryOut
-    added_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class CollaboratorsResponse(BaseModel):
@@ -1277,6 +1296,11 @@ class InternalShareResponse(BaseModel):
 
 class ShareLinkResponse(BaseModel):
     post_id: int
+    url: str
+
+
+class ReelShareLinkResponse(BaseModel):
+    reel_id: int
     url: str
 
 

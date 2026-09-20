@@ -168,6 +168,19 @@ def _to_reel_detail(
             latitude=reel.location_latitude,
             longitude=reel.location_longitude,
         )
+    # Collaborators tagged via POST /api/videos/:id/collaborators (and, since
+    # accept_request in collaboration_service.py writes to the same table,
+    # anyone who came in through an accepted creator-collaboration request)
+    # weren't previously surfaced here at all — a client had no way to know
+    # a reel had a co-creator without a separate call.
+    detail.collaborators = [
+        schemas.CollaboratorOut.model_validate(c) for c in reel.collaborators
+    ]
+    reel_tags = (
+        db.query(models.ReelTag).filter(models.ReelTag.reel_id == reel.id).all()
+    )
+    detail.tags_count = len(reel_tags)
+    detail.tags = [schemas.UserSummaryOut.model_validate(t.user) for t in reel_tags]
     return detail
 
 
@@ -1156,3 +1169,102 @@ def unsave_reel(
 ):
     _unsave_target(db, current_user.id, models.SavedItemType.reel, reel_id)
     return schemas.MessageResponse(message="Reel unsaved")
+
+
+# ==========================================================================
+# Reel Tags — "I appear in this video" (tap-to-tag), same shape as Tag
+# People on posts (post_details_routes.py) but scoped to reels via
+# models.ReelTag. Not to be confused with ReelCollaborator (a co-creator
+# credit, managed via POST /api/videos/:id/collaborators) — a reel can have
+# both a tagged friend and a credited collaborator, and they're unrelated.
+# ==========================================================================
+
+def _all_reel_tags(db: Session, reel_id: int) -> list[models.ReelTag]:
+    return (
+        db.query(models.ReelTag)
+        .filter(models.ReelTag.reel_id == reel_id)
+        .order_by(models.ReelTag.tagged_at)
+        .all()
+    )
+
+
+@reels_router.post(
+    "/{reel_id}/tags", response_model=schemas.ReelTagsResponse, status_code=status.HTTP_201_CREATED
+)
+def tag_reel_people(
+    reel_id: int,
+    payload: schemas.TagPeopleRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    reel = _get_reel_or_404(db, reel_id)
+    if reel.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only tag people on your own reels"
+        )
+
+    user_ids = [t.user_id for t in payload.tags]
+    found_ids = {
+        u.id for u in db.query(models.User.id).filter(models.User.id.in_(user_ids)).all()
+    }
+    missing = [uid for uid in user_ids if uid not in found_ids]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User(s) not found: {', '.join(str(m) for m in missing)}",
+        )
+
+    already_tagged = {
+        t.user_id
+        for t in db.query(models.ReelTag.user_id)
+        .filter(models.ReelTag.reel_id == reel_id, models.ReelTag.user_id.in_(user_ids))
+        .all()
+    }
+
+    for tag in payload.tags:
+        if tag.user_id in already_tagged:
+            continue
+        db.add(models.ReelTag(
+            reel_id=reel.id,
+            user_id=tag.user_id,
+            x_position=tag.x_position,
+            y_position=tag.y_position,
+        ))
+    db.commit()
+
+    return schemas.ReelTagsResponse(message="Tagged", tags=_all_reel_tags(db, reel_id))
+
+
+@reels_router.get("/{reel_id}/tags", response_model=schemas.ReelTagsResponse)
+def get_reel_tags(reel_id: int, db: Session = Depends(get_db)):
+    _get_reel_or_404(db, reel_id)
+    return schemas.ReelTagsResponse(message="", tags=_all_reel_tags(db, reel_id))
+
+
+@reels_router.delete("/{reel_id}/tags/{user_id}", response_model=schemas.MessageResponse)
+def remove_reel_tag(
+    reel_id: int,
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    reel = _get_reel_or_404(db, reel_id)
+    tag = (
+        db.query(models.ReelTag)
+        .filter(models.ReelTag.reel_id == reel_id, models.ReelTag.user_id == user_id)
+        .first()
+    )
+    if tag is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag not found")
+
+    # Same rule as post tags: the reel owner can remove any tag, and a
+    # tagged person can untag themselves.
+    if current_user.id != reel.user_id and current_user.id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the reel owner or the tagged user can remove this tag",
+        )
+
+    db.delete(tag)
+    db.commit()
+    return schemas.MessageResponse(message="Tag removed")
