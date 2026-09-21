@@ -128,3 +128,17 @@ def is_conversation_muted(db: Session, user_id: int, conversation_id: int) -> bo
         .first()
         is not None
     )
+
+
+# ---- close friends ----
+
+def is_close_friend(db: Session, owner_id: int, friend_id: int) -> bool:
+    """True if `owner_id` has added `friend_id` to their Close Friends list
+    — used to gate visibility of a close_friends-only story (see
+    story_routes._viewer_can_see_story)."""
+    return (
+        db.query(models.CloseFriend)
+        .filter(models.CloseFriend.owner_id == owner_id, models.CloseFriend.friend_id == friend_id)
+        .first()
+        is not None
+    )
