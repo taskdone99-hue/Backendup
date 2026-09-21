@@ -554,6 +554,40 @@ def get_messages(
     return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
 
 
+@router.get(
+    "/conversations/{conversation_id}/media", response_model=schemas.PaginatedMessagesResponse
+)
+def get_conversation_media(
+    conversation_id: int,
+    media_type: models.MediaType | None = Query(
+        default=None, description="Filter to just image, video, or audio (voice notes)"
+    ),
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """The conversation's media gallery — every image/video/voice-note
+    message, newest first, optionally narrowed to one media_type. Same
+    shape as GET .../messages (still individual messages, just filtered to
+    ones with an attachment) so a client can reuse its message-rendering
+    code for grid/gallery view."""
+    _get_conversation_or_404(db, conversation_id)
+    _require_participant(db, conversation_id, current_user.id)
+
+    query = db.query(models.Message).filter(
+        models.Message.conversation_id == conversation_id,
+        models.Message.media_url.isnot(None),
+    )
+    if media_type is not None:
+        query = query.filter(models.Message.media_type == media_type)
+
+    total = query.count()
+    messages = query.order_by(models.Message.created_at.desc()).offset(offset).limit(limit).all()
+    items = [_to_message_out(db, m) for m in messages]
+    return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
+
+
 async def _create_and_dispatch_message(
     db: Session,
     conversation_id: int,

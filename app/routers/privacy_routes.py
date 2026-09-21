@@ -230,3 +230,63 @@ def get_muted_users(
         for r in rows
     ]
     return schemas.PaginatedMutedUsersResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+# ---- close friends ----
+
+@router.post("/close-friends/{user_id}", response_model=schemas.CloseFriendActionResponse)
+def add_close_friend(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if user_id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You can't add yourself as a close friend")
+    _get_target_user_or_404(db, user_id)
+
+    existing = (
+        db.query(models.CloseFriend)
+        .filter(models.CloseFriend.owner_id == current_user.id, models.CloseFriend.friend_id == user_id)
+        .first()
+    )
+    if existing is None:
+        db.add(models.CloseFriend(owner_id=current_user.id, friend_id=user_id))
+        db.commit()
+    return schemas.CloseFriendActionResponse(message="Added to close friends", is_close_friend=True)
+
+
+@router.delete("/close-friends/{user_id}", response_model=schemas.CloseFriendActionResponse)
+def remove_close_friend(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = (
+        db.query(models.CloseFriend)
+        .filter(models.CloseFriend.owner_id == current_user.id, models.CloseFriend.friend_id == user_id)
+        .first()
+    )
+    if row is not None:
+        db.delete(row)
+        db.commit()
+    return schemas.CloseFriendActionResponse(message="Removed from close friends", is_close_friend=False)
+
+
+@router.get("/close-friends", response_model=schemas.PaginatedUsersResponse)
+def get_close_friends(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    query = (
+        db.query(models.User)
+        .join(models.CloseFriend, models.CloseFriend.friend_id == models.User.id)
+        .filter(models.CloseFriend.owner_id == current_user.id)
+    )
+    total = query.count()
+    users = query.order_by(models.CloseFriend.created_at.desc()).offset(offset).limit(limit).all()
+    return schemas.PaginatedUsersResponse(
+        total=total, limit=limit, offset=offset,
+        items=[schemas.UserSummaryOut.model_validate(u) for u in users],
+    )

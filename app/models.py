@@ -44,6 +44,11 @@ class MediaType(str, enum.Enum):
     audio = "audio"
 
 
+class StoryVisibility(str, enum.Enum):
+    public = "public"
+    close_friends = "close_friends"
+
+
 class LikeTargetType(str, enum.Enum):
     post = "post"
     reel = "reel"
@@ -350,6 +355,27 @@ class UserMute(Base):
     muted = relationship("User", foreign_keys=[muted_id])
 
 
+class CloseFriend(Base):
+    """`owner_id` has added `friend_id` to their Close Friends list — a
+    one-directional, silent allow-list (the added user is never told).
+    Effect: a story created with visibility=close_friends is only shown to
+    the owner and the users in this list (see story_routes.py); nothing
+    else in the app reads this table."""
+
+    __tablename__ = "close_friends"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "friend_id", name="uq_close_friend"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    friend_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    owner = relationship("User", foreign_keys=[owner_id])
+    friend = relationship("User", foreign_keys=[friend_id])
+
+
 class ConversationMute(Base):
     """`user_id` has muted notifications for `conversation_id` — the DM
     thread stays fully visible/usable, it just stops generating
@@ -524,6 +550,17 @@ class Reel(Base):
     # its audio. This is an informal reference to reels.id instead — a
     # remix that outlives its original just keeps a dangling id.
     remixed_from_id = Column(Integer, nullable=True, index=True)
+    # The sound this reel uses — set directly on creation ("use this audio")
+    # or copied from the original when remixing (see
+    # content_routes.remix_reel_audio). SET NULL rather than a hard FK
+    # delete so removing an Audio row doesn't cascade-delete every reel
+    # that used it.
+    audio_id = Column(
+        Integer,
+        ForeignKey("audio_tracks.id", ondelete="SET NULL", use_alter=True, name="fk_reels_audio"),
+        nullable=True,
+        index=True,
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Same shape as Post's location fields above — flat columns stay
@@ -536,6 +573,7 @@ class Reel(Base):
 
     user = relationship("User", back_populates="reels")
     location = relationship("Location", foreign_keys=[location_id])
+    audio = relationship("Audio", foreign_keys=[audio_id])
     collaborators = relationship(
         "ReelCollaborator", back_populates="reel", cascade="all, delete-orphan"
     )
@@ -902,6 +940,13 @@ class Story(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
     # New, additive — see Post.location_id for the same pattern/rationale.
     location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
+    # 'public' (default, visible per normal follow/privacy rules) or
+    # 'close_friends' (visible only to the owner and users in the owner's
+    # CloseFriend list — see story_routes._viewer_can_see_story). New,
+    # additive column; every pre-existing row reads as 'public'.
+    visibility = Column(
+        Enum(StoryVisibility), default=StoryVisibility.public, nullable=False
+    )
 
     user = relationship("User", back_populates="stories")
     views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
@@ -914,6 +959,37 @@ class Story(Base):
     question = relationship(
         "StoryQuestion", back_populates="story", uselist=False, cascade="all, delete-orphan"
     )
+
+
+class StoryDraft(Base):
+    """A story saved before publishing — no expires_at, never shown in any
+    feed/viewers/archive endpoint until POST /{draft_id}/publish turns it
+    into a real Story row (at which point this row is deleted).
+
+    ASSUMPTION: scoped to the core story fields (media/caption/location/
+    close_friends_only) and not the sticker extras (mentions, poll,
+    question) that live on Story — a draft is "finish this later", not a
+    parallel copy of every attachable extra. Flag if drafts should carry
+    those too.
+    """
+
+    __tablename__ = "story_drafts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    media_url = Column(String(500), nullable=False)
+    media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
+    caption = Column(String(280), nullable=True)
+    location_name = Column(String(150), nullable=True)
+    location_latitude = Column(Float, nullable=True)
+    location_longitude = Column(Float, nullable=True)
+    location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
+    close_friends_only = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    location = relationship("Location", foreign_keys=[location_id])
 
 
 class StoryView(Base):

@@ -96,3 +96,31 @@ def test_reel_share_link(client, make_user, make_reel):
     body = response.json()
     assert body["reel_id"] == reel.id
     assert str(reel.id) in body["url"]
+
+
+def test_user_reels_endpoint_includes_accepted_collab_reels(client, db, make_user, make_reel):
+    """anjali (2nd report): GET /api/users/{user_id}/reels only returned
+    reels the user owns, not ones they're a credited collaborator on."""
+    owner, collaborator = make_user("kai"), make_user("liu")
+    reel = make_reel(owner)
+
+    client.login(owner)
+    request_id = client.post(
+        "/api/creator-collaborations",
+        json={"partner_user_id": collaborator.id, "reel_id": reel.id},
+    ).json()["id"]
+
+    client.login(collaborator)
+    accept = client.post(f"/api/creator-collaborations/{request_id}/accept")
+    assert accept.status_code == 200, accept.text
+
+    # Shows on the collaborator's own reels list...
+    collaborator_reels = client.get(f"/api/users/{collaborator.id}/reels")
+    assert collaborator_reels.status_code == 200, collaborator_reels.text
+    ids = [r["id"] for r in collaborator_reels.json()["items"]]
+    assert reel.id in ids, collaborator_reels.json()
+
+    # ...and still shows on the owner's, without duplicating it.
+    owner_reels = client.get(f"/api/users/{owner.id}/reels")
+    owner_ids = [r["id"] for r in owner_reels.json()["items"]]
+    assert owner_ids.count(reel.id) == 1

@@ -181,6 +181,8 @@ def _to_reel_detail(
     )
     detail.tags_count = len(reel_tags)
     detail.tags = [schemas.UserSummaryOut.model_validate(t.user) for t in reel_tags]
+    if reel.audio_id and reel.audio is not None:
+        detail.audio = schemas.AudioOut.model_validate(reel.audio)
     return detail
 
 
@@ -790,6 +792,10 @@ def create_reel(
     location_state: str | None = Form(default=None),
     location_country: str | None = Form(default=None),
     location_place_id: str | None = Form(default=None),
+    audio_id: OptionalIntForm(
+        description="Optional. Use an existing saved sound (see GET /api/audio/{id}) as this "
+        "reel's audio track. Leave unset for a reel with its own original audio."
+    ) = None,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -813,6 +819,12 @@ def create_reel(
         raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
     if location_longitude is not None and not (-180 <= location_longitude <= 180):
         raise HTTPException(status_code=400, detail="location_longitude must be between -180 and 180")
+
+    audio = None
+    if audio_id is not None:
+        audio = db.query(models.Audio).filter(models.Audio.id == audio_id).first()
+        if audio is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio not found")
 
     try:
         location = resolve_location_from_form(
@@ -861,6 +873,7 @@ def create_reel(
         location_latitude=location.latitude if location else location_latitude,
         location_longitude=location.longitude if location else location_longitude,
         location_id=location.id if location else None,
+        audio_id=audio.id if audio else None,
     )
     db.add(reel)
     db.commit()
@@ -1128,6 +1141,25 @@ def remix_reel_audio(
     """
     original = _get_reel_or_404(db, reel_id)
 
+    # If the original doesn't already have a saved Audio row (e.g. it was
+    # uploaded with its own baked-in sound, never explicitly "used" an
+    # existing one), back-fill one now so the remix — and this original —
+    # both point at the same audio_id and show up together under
+    # GET /api/audio/{id}/reels. ASSUMPTION: the audio_url itself is the
+    # original reel's video_url (audio and video aren't stored separately
+    # anywhere in this codebase); flag if a real extracted-audio file is
+    # expected instead.
+    if original.audio_id is None:
+        audio = models.Audio(
+            title=original.title or original.caption or f"Original audio · reel {original.id}",
+            audio_url=original.video_url,
+            source_reel_id=original.id,
+        )
+        db.add(audio)
+        db.flush()
+        original.audio_id = audio.id
+        db.add(original)
+
     url, kind = save_upload_file(file, "reels", allow_video=True)
     if kind != "video":
         raise HTTPException(
@@ -1143,11 +1175,33 @@ def remix_reel_audio(
         video_url=url,
         duration_seconds=duration_seconds,
         remixed_from_id=original.id,
+        audio_id=original.audio_id,
     )
     db.add(remix)
     db.commit()
     db.refresh(remix)
     return _to_reel_detail(db, remix, current_user.id)
+
+
+@reels_router.get("/{reel_id}/remixes", response_model=schemas.PaginatedReelDetailResponse)
+def get_reel_remixes(
+    reel_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
+    """All reels remixed from this one (models.Reel.remixed_from_id), newest
+    first — the "N remixes" list a client shows under a reel's audio/remix
+    button."""
+    _get_reel_or_404(db, reel_id)
+    viewer_id = current_user.id if current_user else None
+
+    query = db.query(models.Reel).filter(models.Reel.remixed_from_id == reel_id)
+    total = query.count()
+    reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
+    items = [_to_reel_detail(db, r, viewer_id) for r in reels]
+    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
 
 @reels_router.post("/{reel_id}/save", response_model=schemas.MessageResponse)

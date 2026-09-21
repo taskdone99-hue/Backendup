@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -228,7 +229,16 @@ def get_user_reels(
 
     from app.routers.content_routes import _to_reel_detail
 
-    query = db.query(models.Reel).filter(models.Reel.user_id == user_id)
+    # Own reels plus any reel where this user is a credited collaborator
+    # (from an accepted creator-collaboration request or a direct
+    # POST /api/videos/:id/collaborators add) — a collab reel should show
+    # up on both profiles, same as Instagram.
+    collab_reel_ids = db.query(models.ReelCollaborator.reel_id).filter(
+        models.ReelCollaborator.user_id == user_id
+    )
+    query = db.query(models.Reel).filter(
+        or_(models.Reel.user_id == user_id, models.Reel.id.in_(collab_reel_ids))
+    )
     total = query.count()
     reels = (
         query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()

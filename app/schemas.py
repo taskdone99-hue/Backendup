@@ -601,9 +601,39 @@ class StoryOut(BaseModel):
     mentions: "list[StoryMentionOut]" = []
     poll: "StoryPollOut | None" = None
     question: "StoryQuestionOut | None" = None
+    close_friends_only: bool = False
 
     class Config:
         from_attributes = True
+
+
+class PaginatedStoryResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[StoryOut]
+
+
+class StoryDraftOut(BaseModel):
+    id: int
+    user_id: int
+    media_url: str
+    media_type: MediaType
+    caption: str | None
+    location: LocationOut | None = None
+    close_friends_only: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedStoryDraftsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[StoryDraftOut]
 
 
 class StoryUserFeedOut(BaseModel):
@@ -913,6 +943,28 @@ class LocationResponse(BaseModel):
 
 # ---- Reels / Video ----
 
+class AudioOut(BaseModel):
+    id: int
+    title: str
+    artist: str | None
+    audio_url: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AudioDetailOut(AudioOut):
+    reels_count: int = 0
+
+
+class PaginatedAudioResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[AudioDetailOut]
+
+
 class CollaboratorOut(BaseModel):
     id: int
     user: UserSummaryOut
@@ -938,6 +990,7 @@ class ReelDetailOut(ReelOut):
     collaborators: list[CollaboratorOut] = []
     tags_count: int = 0
     tags: list[UserSummaryOut] = []
+    audio: AudioOut | None = None
 
 
 class PaginatedReelDetailResponse(BaseModel):
@@ -1848,6 +1901,11 @@ class BlockActionResponse(BaseModel):
 class RestrictActionResponse(BaseModel):
     message: str
     is_restricted: bool
+
+
+class CloseFriendActionResponse(BaseModel):
+    message: str
+    is_close_friend: bool
 
 
 class MuteRequest(BaseModel):

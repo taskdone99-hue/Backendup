@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
@@ -12,7 +12,7 @@ from app.services.media_service import delete_media_file, save_upload_file
 from app.services.push_service import send_push
 from app.services.location_service import resolve_location_from_form
 from app.services import story_extras_service
-from app.services.privacy_service import blocked_user_ids, muted_user_ids, is_blocked
+from app.services.privacy_service import blocked_user_ids, muted_user_ids, is_blocked, is_close_friend
 
 
 router = APIRouter(prefix="/api/stories", tags=["stories"])
@@ -84,6 +84,7 @@ def _to_story_out(
     out = schemas.StoryOut.model_validate(story)
 
     out.user = schemas.UserSummaryOut.model_validate(story.user)
+    out.close_friends_only = story.visibility == models.StoryVisibility.close_friends
 
     out.views_count = len(story.views)
     out.reactions_count = len(story.reactions)
@@ -126,9 +127,20 @@ def _to_story_out(
     return out
 
 
+def _viewer_can_see_story(db: Session, story: "models.Story", viewer_id: int) -> bool:
+    """False only for a close_friends-only story viewed by someone who
+    isn't the owner and isn't on the owner's Close Friends list."""
+    if story.visibility != models.StoryVisibility.close_friends:
+        return True
+    if story.user_id == viewer_id:
+        return True
+    return is_close_friend(db, story.user_id, viewer_id)
+
+
 def _get_active_story_or_404(
     db: Session,
     story_id: int,
+    viewer_id: int | None = None,
 ) -> models.Story:
 
     story = (
@@ -138,6 +150,15 @@ def _get_active_story_or_404(
     )
 
     if story is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Story not found",
+        )
+
+    # Same "pretend it doesn't exist" treatment as a blocked user's content
+    # (see is_blocked usage elsewhere in this file) — a close_friends-only
+    # story is invisible, not "forbidden", to someone outside the list.
+    if viewer_id is not None and not _viewer_can_see_story(db, story, viewer_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Story not found",
@@ -312,6 +333,9 @@ def create_story(
     question_prompt: str | None = Form(
         default=None, description="Adds an 'Ask me anything'-style question sticker"
     ),
+    close_friends_only: bool = Form(
+        default=False, description="If true, only visible to users on your Close Friends list"
+    ),
 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -456,6 +480,11 @@ def create_story(
             if location
             else None
         ),
+        visibility=(
+            models.StoryVisibility.close_friends
+            if close_friends_only
+            else models.StoryVisibility.public
+        ),
     )
 
     db.add(story)
@@ -543,6 +572,10 @@ def get_story_feed(
         )
         .all()
     )
+
+    # A close_friends-only story only belongs in this feed if the viewer is
+    # actually on that author's Close Friends list.
+    stories = [s for s in stories if _viewer_can_see_story(db, s, current_user.id)]
 
     grouped: dict[
         int,
@@ -646,6 +679,216 @@ def get_my_stories(
 
 
 # -------------------------------------------------------------------
+# Story Archive
+# -------------------------------------------------------------------
+#
+# Every story the owner has ever posted stays queryable here after it
+# expires out of the public feed/viewers/mine endpoints (see
+# _active_story_query, which all of those use and which excludes anything
+# past expires_at). cleanup_expired_stories.py no longer hard-deletes a
+# story the moment it expires — see that file's ARCHIVE_RETENTION_DAYS —
+# specifically so this endpoint has something to return.
+
+@router.get(
+    "/archive",
+    response_model=schemas.PaginatedStoryResponse,
+)
+def get_story_archive(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Owner-only — the logged-in user's own expired stories, newest first."""
+    now = datetime.now(timezone.utc)
+
+    query = (
+        db.query(models.Story)
+        .options(
+            joinedload(models.Story.user),
+            joinedload(models.Story.location),
+        )
+        .filter(
+            models.Story.user_id == current_user.id,
+            models.Story.expires_at <= now,
+        )
+    )
+    total = query.count()
+    stories = query.order_by(models.Story.created_at.desc()).offset(offset).limit(limit).all()
+
+    return schemas.PaginatedStoryResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=[_to_story_out(s, current_user.id) for s in stories],
+    )
+
+
+# -------------------------------------------------------------------
+# Story Drafts
+# -------------------------------------------------------------------
+#
+# A draft is "finish this later" — saved media/caption/location, no
+# expires_at, never shown in the feed/mine/archive/viewers endpoints.
+# Publishing turns it into a real Story row (same expires_at logic as
+# POST /api/stories) and deletes the draft.
+
+def _to_draft_out(draft: models.StoryDraft) -> schemas.StoryDraftOut:
+    out = schemas.StoryDraftOut.model_validate(draft)
+    if draft.location_id and draft.location is not None:
+        out.location = schemas.LocationOut.model_validate(draft.location)
+    elif draft.location_name:
+        out.location = schemas.LocationOut(
+            name=draft.location_name,
+            latitude=draft.location_latitude,
+            longitude=draft.location_longitude,
+        )
+    return out
+
+
+def _get_own_draft_or_404(db: Session, draft_id: int, current_user: models.User) -> models.StoryDraft:
+    draft = (
+        db.query(models.StoryDraft)
+        .filter(models.StoryDraft.id == draft_id, models.StoryDraft.user_id == current_user.id)
+        .first()
+    )
+    if draft is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found")
+    return draft
+
+
+@router.post("/drafts", response_model=schemas.StoryDraftOut, status_code=status.HTTP_201_CREATED)
+def create_story_draft(
+    file: UploadFile,
+    caption: str | None = Form(default=None),
+    location_id: str | None = Form(default=None),
+    location_name: str | None = Form(default=None),
+    location_address: str | None = Form(default=None),
+    location_city: str | None = Form(default=None),
+    location_state: str | None = Form(default=None),
+    location_country: str | None = Form(default=None),
+    location_latitude: str | None = Form(default=None),
+    location_longitude: str | None = Form(default=None),
+    location_place_id: str | None = Form(default=None),
+    close_friends_only: bool = Form(default=False),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    parsed_location_id = _optional_int(location_id, "location_id")
+    parsed_location_latitude = _optional_float(location_latitude, "location_latitude")
+    parsed_location_longitude = _optional_float(location_longitude, "location_longitude")
+
+    try:
+        location = resolve_location_from_form(
+            db,
+            location_id=parsed_location_id,
+            location_name=location_name,
+            location_address=location_address,
+            location_city=location_city,
+            location_state=location_state,
+            location_country=location_country,
+            location_latitude=parsed_location_latitude,
+            location_longitude=parsed_location_longitude,
+            location_place_id=location_place_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    url, kind = save_upload_file(file, "stories", allow_video=True)
+
+    draft = models.StoryDraft(
+        user_id=current_user.id,
+        media_url=url,
+        media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
+        caption=caption,
+        location_name=location.name if location else location_name,
+        location_latitude=location.latitude if location else parsed_location_latitude,
+        location_longitude=location.longitude if location else parsed_location_longitude,
+        location_id=location.id if location else None,
+        close_friends_only=close_friends_only,
+    )
+    db.add(draft)
+    db.commit()
+    db.refresh(draft)
+    return _to_draft_out(draft)
+
+
+@router.get("/drafts", response_model=schemas.PaginatedStoryDraftsResponse)
+def get_story_drafts(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    query = db.query(models.StoryDraft).filter(models.StoryDraft.user_id == current_user.id)
+    total = query.count()
+    drafts = query.order_by(models.StoryDraft.updated_at.desc()).offset(offset).limit(limit).all()
+    return schemas.PaginatedStoryDraftsResponse(
+        total=total, limit=limit, offset=offset, items=[_to_draft_out(d) for d in drafts]
+    )
+
+
+@router.get("/drafts/{draft_id}", response_model=schemas.StoryDraftOut)
+def get_story_draft(
+    draft_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    draft = _get_own_draft_or_404(db, draft_id, current_user)
+    return _to_draft_out(draft)
+
+
+@router.delete("/drafts/{draft_id}", response_model=schemas.MessageResponse)
+def delete_story_draft(
+    draft_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    draft = _get_own_draft_or_404(db, draft_id, current_user)
+    delete_media_file(draft.media_url)
+    db.delete(draft)
+    db.commit()
+    return schemas.MessageResponse(message="Draft deleted")
+
+
+@router.post("/drafts/{draft_id}/publish", response_model=schemas.StoryOut, status_code=status.HTTP_201_CREATED)
+def publish_story_draft(
+    draft_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Turns the draft into a live story (starts its 24h expiry clock now)
+    and deletes the draft row — same one-way conversion as posting fresh,
+    just skipping the re-upload."""
+    draft = _get_own_draft_or_404(db, draft_id, current_user)
+
+    story = models.Story(
+        user_id=current_user.id,
+        media_url=draft.media_url,
+        media_type=draft.media_type,
+        caption=draft.caption,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=STORY_LIFETIME_HOURS),
+        # Story only stores location_id (no flat name/lat/lng columns,
+        # unlike StoryDraft/Reel/Post) — the draft's flat fields were just
+        # a fallback for "resolve_location_from_form couldn't attach a
+        # Location row", which has nothing to carry over here.
+        location_id=draft.location_id,
+        visibility=(
+            models.StoryVisibility.close_friends
+            if draft.close_friends_only
+            else models.StoryVisibility.public
+        ),
+    )
+    db.add(story)
+    db.delete(draft)
+    db.commit()
+    db.refresh(story)
+
+    story = _active_story_query(db).filter(models.Story.id == story.id).first()
+    return _to_story_out(story, current_user.id)
+
+
+# -------------------------------------------------------------------
 # Get Single Story
 # -------------------------------------------------------------------
 
@@ -662,6 +905,7 @@ def get_story(
     story = _get_active_story_or_404(
         db,
         story_id,
+        current_user.id,
     )
 
     return _to_story_out(
@@ -736,6 +980,7 @@ def view_story(
     story = _get_active_story_or_404(
         db,
         story_id,
+        current_user.id,
     )
 
     existing = (
@@ -792,6 +1037,7 @@ def get_story_viewers(
     story = _get_active_story_or_404(
         db,
         story_id,
+        current_user.id,
     )
 
     _require_own_story(
@@ -852,6 +1098,7 @@ def react_to_story(
     story = _get_active_story_or_404(
         db,
         story_id,
+        current_user.id,
     )
 
     existing = (
@@ -918,6 +1165,7 @@ def remove_story_reaction(
     story = _get_active_story_or_404(
         db,
         story_id,
+        current_user.id,
     )
 
     existing = (
@@ -960,6 +1208,7 @@ def get_story_reactions(
     story = _get_active_story_or_404(
         db,
         story_id,
+        current_user.id,
     )
 
     _require_own_story(
@@ -1019,6 +1268,7 @@ def reply_to_story(
     story = _get_active_story_or_404(
         db,
         story_id,
+        current_user.id,
     )
 
     if story.user_id == current_user.id:
@@ -1083,7 +1333,7 @@ def vote_story_poll(
 ):
     """Casts (or changes) this viewer's vote. One vote per user per poll —
     voting again with a different option_id just moves it."""
-    story = _get_active_story_or_404(db, story_id)
+    story = _get_active_story_or_404(db, story_id, current_user.id)
     if story.poll is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This story has no poll")
 
@@ -1105,7 +1355,7 @@ def vote_story_poll(
         db.add(models.StoryPollVote(poll_id=story.poll.id, option_id=option.id, user_id=current_user.id))
     db.commit()
 
-    story = _get_active_story_or_404(db, story_id)
+    story = _get_active_story_or_404(db, story_id, current_user.id)
     return story_extras_service.to_poll_out(story.poll, current_user.id)
 
 
@@ -1120,7 +1370,7 @@ def respond_to_story_question(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    story = _get_active_story_or_404(db, story_id)
+    story = _get_active_story_or_404(db, story_id, current_user.id)
     if story.question is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This story has no question")
     if is_blocked(db, current_user.id, story.user_id):
@@ -1160,7 +1410,7 @@ def get_story_question_responses(
 ):
     """Story-owner only — same as Instagram, where question-sticker
     answers are private to the poster, not shown publicly like poll votes."""
-    story = _get_active_story_or_404(db, story_id)
+    story = _get_active_story_or_404(db, story_id, current_user.id)
     _require_own_story(story, current_user)
     if story.question is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This story has no question")
