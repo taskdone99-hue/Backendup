@@ -3,8 +3,8 @@ Location APIs — attach a place to a post/story/reel, look it up, search
 saved locations, and browse content tagged at a location.
 
 Not user-location tracking: every Location row exists only because someone
-explicitly attached it to a post/story/reel (or called POST /api/locations
-to save one for later) — see app/services/location_service.py.
+explicitly attached it to a post/story/reel — see
+app/services/location_service.py.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -14,7 +14,6 @@ from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.services.location_service import (
-    find_or_create_location,
     get_location_or_404,
     search_locations,
     find_nearby_locations,
@@ -23,29 +22,6 @@ from app.routers.content_routes import _visible_authors_clause, _to_post_detail,
 from app.routers.story_routes import _active_story_query, _to_story_out
 
 router = APIRouter(prefix="/api/locations", tags=["locations"])
-
-
-@router.post("", response_model=schemas.LocationOut, status_code=status.HTTP_201_CREATED)
-def create_location(
-    payload: schemas.LocationCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Save a location for later use (attach to posts/stories by id).
-    Returns an existing matching location instead of a duplicate — see
-    location_service.find_or_create_location for the dedupe rule."""
-    location = find_or_create_location(
-        db,
-        name=payload.name,
-        address=payload.address,
-        city=payload.city,
-        state=payload.state,
-        country=payload.country,
-        latitude=payload.latitude,
-        longitude=payload.longitude,
-        place_id=payload.place_id,
-    )
-    return schemas.LocationOut.model_validate(location)
 
 
 @router.get("/search", response_model=schemas.PaginatedLocationSearchResponse)

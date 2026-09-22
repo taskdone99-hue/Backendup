@@ -282,7 +282,7 @@ def create_post(
     location_latitude: float | None = Form(default=None),
     location_longitude: float | None = Form(default=None),
     location_id: int | None = Form(
-        default=None, description="Attach an already-saved location (see POST /api/locations) by id"
+        default=None, description="Attach an already-saved location by id"
     ),
     location_address: str | None = Form(default=None),
     location_city: str | None = Form(default=None),
@@ -784,7 +784,7 @@ def create_reel(
         description="Optional. Leave unset (or blank) for no coordinates."
     ) = None,
     location_id: OptionalIntForm(
-        description="Optional. Attach an already-saved location (see POST /api/locations) by id. "
+        description="Optional. Attach an already-saved location by id. "
         "Leave unset (or blank) if you're not tagging an existing saved location."
     ) = None,
     location_address: str | None = Form(default=None),

@@ -886,8 +886,8 @@ class Location(Base):
     A reusable, shareable place — attached optionally to Posts and/or
     Stories via location_id. Not user-location tracking: a row here only
     ever exists because someone explicitly attached it to a piece of
-    content (via POST /api/locations or inline at post/story creation), and
-    no history of where a user has been is kept anywhere.
+    content (inline at post/story/reel creation), and no history of where
+    a user has been is kept anywhere.
 
     Multiple posts/stories can point at the same Location row — see
     app.services.location_service.find_or_create_location, which dedupes by

@@ -537,24 +537,11 @@ class LocationIn(BaseModel):
     """Inline location payload for PUT /api/posts/:id's `location` field —
     kept name-only + optional coordinates for backward compatibility with
     existing callers of that endpoint. To attach a richer location (address,
-    city, state, country, place_id) use POST /api/locations first and pass
-    its id, or use the location_* fields on post/story creation."""
+    city, state, country, place_id), use the location_* fields on post/story
+    creation, which resolve or create a saved location and attach it by id."""
     name: str = Field(..., max_length=150)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
-
-
-class LocationCreate(BaseModel):
-    """POST /api/locations — create (or reuse, if it matches an existing
-    one) a saved location that can then be attached to posts/stories by id."""
-    name: str = Field(..., max_length=150)
-    address: str | None = Field(default=None, max_length=500)
-    city: str | None = Field(default=None, max_length=100)
-    state: str | None = Field(default=None, max_length=100)
-    country: str | None = Field(default=None, max_length=100)
-    latitude: float | None = Field(default=None, ge=-90, le=90)
-    longitude: float | None = Field(default=None, ge=-180, le=180)
-    place_id: str | None = Field(default=None, max_length=255)
 
 
 class LocationOut(BaseModel):

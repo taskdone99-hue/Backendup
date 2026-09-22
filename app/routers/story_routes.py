@@ -307,10 +307,7 @@ def create_story(
     # empty optional fields as "".
     location_id: str | None = Form(
         default=None,
-        description=(
-            "Attach an already-saved location "
-            "(see POST /api/locations) by id"
-        ),
+        description="Attach an already-saved location by id",
     ),
 
     location_name: str | None = Form(default=None),
