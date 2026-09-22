@@ -766,6 +766,9 @@ class NearbyLocationOut(LocationOut):
 
 
 class NearbyLocationsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
     items: list[NearbyLocationOut] = []
 
 

@@ -175,11 +175,17 @@ def find_nearby_locations(
     longitude: float,
     radius_km: float,
     limit: int,
+    offset: int = 0,
 ):
-    """Return saved locations within radius, nearest first.
+    """Return (total, page) of saved locations within radius, nearest first
+    — same (total, page) shape as search_locations above, so the router can
+    build a normal paginated response.
 
     Uses a portable bounding-box SQL pre-filter, then exact Haversine
-    calculation in Python so MySQL and SQLite behave the same.
+    calculation in Python so MySQL and SQLite behave the same. The
+    bounding-box query itself isn't offset/limited (it has to pull every
+    candidate in the box to sort by true distance first) — offset/limit are
+    applied after sorting, to the distance-ordered list.
     """
     earth_km = 6371.0088
     lat_delta = radius_km / 111.32
@@ -216,4 +222,5 @@ def find_nearby_locations(
             results.append((location, distance_km))
 
     results.sort(key=lambda item: item[1])
-    return results[:limit]
+    total = len(results)
+    return total, results[offset:offset + limit]

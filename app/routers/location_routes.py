@@ -49,29 +49,35 @@ def nearby_locations(
     longitude: float = Query(...),
     radius_km: float = Query(10, gt=0, le=500),
     limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """Find saved locations within radius, sorted nearest first."""
+    """Find saved locations within radius, sorted nearest first, paginated
+    the same way as GET /search (total/limit/offset/items)."""
     if not (-90 <= latitude <= 90):
         raise HTTPException(status_code=400, detail="latitude must be between -90 and 90")
     if not (-180 <= longitude <= 180):
         raise HTTPException(status_code=400, detail="longitude must be between -180 and 180")
 
-    rows = find_nearby_locations(
+    total, rows = find_nearby_locations(
         db,
         latitude=latitude,
         longitude=longitude,
         radius_km=radius_km,
         limit=limit,
+        offset=offset,
     )
     return schemas.NearbyLocationsResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
         items=[
             schemas.NearbyLocationOut(
                 **schemas.LocationOut.model_validate(location).model_dump(),
                 distance_km=round(distance_km, 3),
             )
             for location, distance_km in rows
-        ]
+        ],
     )
 
 

@@ -1,6 +1,7 @@
 """
 Tests for:
-  - GET /api/locations/nearby — Haversine-based nearby search
+  - GET /api/locations/nearby — Haversine-based nearby search, paginated
+    (total/limit/offset/items, same shape as GET /api/locations/search)
   - Per-photo captions on multi-media posts (media_captions on
     POST /api/posts and PUT /api/posts/:id/media)
 
@@ -104,26 +105,28 @@ def _make_user(username: str) -> int:
     return uid
 
 
+def _make_location(name: str, latitude: float, longitude: float) -> models.Location:
+    """Seed a Location row directly — there's no POST /api/locations
+    endpoint (locations are only ever created inline via find_or_create_location
+    at post/story/reel creation), so tests that need saved locations go
+    straight to the DB, same as test_search.py's seeded_data fixture."""
+    db = TestSessionLocal()
+    loc = models.Location(name=name, latitude=latitude, longitude=longitude)
+    db.add(loc)
+    db.commit()
+    db.refresh(loc)
+    db.close()
+    return loc
+
+
 # ---- Nearby Locations ----
 
 def test_nearby_returns_locations_within_radius_sorted_by_distance():
     # Hyderabad-area coordinates: Charminar, Golconda Fort (~11km away),
     # and a far-away point (Mumbai, ~620km) that should never show up.
-    charminar = client.post(
-        "/api/locations",
-        headers=_auth_headers(_make_user("nearby_u1")),
-        json={"name": "Charminar", "latitude": 17.3616, "longitude": 78.4747},
-    ).json()
-    golconda = client.post(
-        "/api/locations",
-        headers=_auth_headers(_make_user("nearby_u2")),
-        json={"name": "Golconda Fort", "latitude": 17.3833, "longitude": 78.4011},
-    ).json()
-    client.post(
-        "/api/locations",
-        headers=_auth_headers(_make_user("nearby_u3")),
-        json={"name": "Gateway of India", "latitude": 18.9220, "longitude": 72.8347},
-    )
+    _make_location("Charminar", 17.3616, 78.4747)
+    _make_location("Golconda Fort", 17.3833, 78.4011)
+    _make_location("Gateway of India", 18.9220, 72.8347)
 
     resp = client.get("/api/locations/nearby", params={"latitude": 17.3616, "longitude": 78.4747, "radius_km": 15})
     assert resp.status_code == 200
@@ -142,7 +145,9 @@ def test_nearby_returns_locations_within_radius_sorted_by_distance():
 def test_nearby_empty_when_nothing_in_range():
     resp = client.get("/api/locations/nearby", params={"latitude": 0.0, "longitude": 0.0, "radius_km": 1})
     assert resp.status_code == 200
-    assert resp.json()["items"] == []
+    body = resp.json()
+    assert body["items"] == []
+    assert body["total"] == 0
 
 
 def test_nearby_validates_latitude_range():
@@ -151,19 +156,69 @@ def test_nearby_validates_latitude_range():
 
 
 def test_nearby_respects_limit():
-    uid = _make_user("nearby_limit_u")
     for i in range(5):
-        client.post(
-            "/api/locations",
-            headers=_auth_headers(uid),
-            json={"name": f"Spot {i}", "latitude": 12.9716 + i * 0.001, "longitude": 77.5946},
-        )
+        _make_location(f"Spot {i}", 12.9716 + i * 0.001, 77.5946)
     resp = client.get(
         "/api/locations/nearby",
         params={"latitude": 12.9716, "longitude": 77.5946, "radius_km": 10, "limit": 2},
     )
     assert resp.status_code == 200
     assert len(resp.json()["items"]) <= 2
+
+
+def test_nearby_pagination_default_offset_and_shape():
+    for i in range(3):
+        _make_location(f"Page Spot {i}", 40.0 + i * 0.001, 116.0)
+    resp = client.get(
+        "/api/locations/nearby",
+        params={"latitude": 40.0, "longitude": 116.0, "radius_km": 10},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # same total/limit/offset/items shape as GET /search
+    assert set(body.keys()) == {"total", "limit", "offset", "items"}
+    assert body["offset"] == 0
+    assert body["limit"] == 20
+    assert body["total"] >= 3
+
+
+def test_nearby_pagination_second_page_has_no_overlap_and_stays_sorted():
+    latitude, longitude = 41.0, 117.0
+    for i in range(5):
+        _make_location(f"Paged {i}", latitude + i * 0.001, longitude)
+
+    page1 = client.get(
+        "/api/locations/nearby",
+        params={"latitude": latitude, "longitude": longitude, "radius_km": 10, "limit": 2, "offset": 0},
+    ).json()
+    page2 = client.get(
+        "/api/locations/nearby",
+        params={"latitude": latitude, "longitude": longitude, "radius_km": 10, "limit": 2, "offset": 2},
+    ).json()
+
+    assert page1["total"] == page2["total"] == 5
+    names1 = [i["name"] for i in page1["items"]]
+    names2 = [i["name"] for i in page2["items"]]
+    assert len(names1) == 2
+    assert len(names2) == 2
+    assert set(names1).isdisjoint(names2)  # no overlap between pages
+
+    # distances across the two pages stay non-decreasing (global sort preserved
+    # across the offset boundary, not just within each page)
+    all_distances = [i["distance_km"] for i in page1["items"]] + [i["distance_km"] for i in page2["items"]]
+    assert all_distances == sorted(all_distances)
+
+
+def test_nearby_pagination_offset_past_total_returns_empty_items():
+    _make_location("Solo Spot", 5.0, 5.0)
+    resp = client.get(
+        "/api/locations/nearby",
+        params={"latitude": 5.0, "longitude": 5.0, "radius_km": 10, "offset": 50},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"] == []
+    assert body["total"] >= 1
 
 
 # ---- Per-photo captions ----
