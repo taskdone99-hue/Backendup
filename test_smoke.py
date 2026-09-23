@@ -8,12 +8,21 @@ os.environ["DB_PASSWORD"] = "test"
 import app.database as database
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
-# Swap in sqlite in-memory (file-based so multiple connections share state)
+# Shared in-memory SQLite database for HTTP + WebSocket tests
 test_engine = create_engine(
-    "sqlite:///./smoke_test.db", connect_args={"check_same_thread": False}
+    "sqlite:///:memory:",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
 )
-TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+TestSessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=test_engine,
+)
+
 database.engine = test_engine
 database.SessionLocal = TestSessionLocal
 
@@ -21,12 +30,10 @@ from app import models
 from app.auth import create_access_token
 from app.database import Base, get_db
 
-if os.path.exists("smoke_test.db"):
-    os.remove("smoke_test.db")
+# Create all tables in the shared test database
 Base.metadata.create_all(bind=test_engine)
 
 from app.main import app
-
 def override_get_db():
     db = TestSessionLocal()
     try:
