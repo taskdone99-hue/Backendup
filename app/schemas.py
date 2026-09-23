@@ -782,10 +782,11 @@ class MediaItemOut(BaseModel):
 class NearbyLocationOut(LocationOut):
     distance_km: float
 
-
 class NearbyLocationsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
     items: list[NearbyLocationOut] = []
-
 
 class PostDetailOut(PostOut):
     user: UserSummaryOut | None = None
