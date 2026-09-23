@@ -34,6 +34,9 @@ from app.database import Base, get_db
 Base.metadata.create_all(bind=test_engine)
 
 from app.main import app
+import app.routers.notification_routes as notification_routes
+
+notification_routes.SessionLocal = TestSessionLocal
 def override_get_db():
     db = TestSessionLocal()
     try:
