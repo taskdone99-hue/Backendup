@@ -22,6 +22,26 @@ from app.routers.content_routes import _visible_authors_clause, _to_post_detail,
 from app.routers.story_routes import _active_story_query, _to_story_out
 
 router = APIRouter(prefix="/api/locations", tags=["locations"])
+@router.post("", response_model=schemas.LocationOut, status_code=status.HTTP_201_CREATED)
+def create_location(
+    payload: schemas.LocationCreate,
+    db: Session = Depends(get_db),
+):
+    location = models.Location(
+        name=payload.name,
+        address=payload.address,
+        city=payload.city,
+        state=payload.state,
+        country=payload.country,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+    )
+
+    db.add(location)
+    db.commit()
+    db.refresh(location)
+
+    return schemas.LocationOut.model_validate(location)
 
 
 @router.get("/search", response_model=schemas.PaginatedLocationSearchResponse)
