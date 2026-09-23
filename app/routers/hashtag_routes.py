@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app import models, schemas
-from app.auth import get_current_user_optional
+from app.auth import get_current_user, get_current_user_optional
 from app.routers.content_routes import _to_post_detail, _visible_authors_clause
 from app.services.hashtag_service import hashtag_posts_count
 
@@ -33,10 +33,52 @@ def _get_hashtag_or_404(db: Session, name: str) -> models.Hashtag:
     return hashtag
 
 
+def _get_or_create_hashtag(db: Session, name: str) -> models.Hashtag:
+    """Following a hashtag is valid even if nobody has posted under it yet
+    (Instagram lets you follow any hashtag by name) — unlike every other
+    lookup in this file, which 404s because there's nothing to *show* for
+    a hashtag with zero posts."""
+    normalized = _normalize(name)
+    hashtag = db.query(models.Hashtag).filter(models.Hashtag.name == normalized).first()
+    if hashtag is None:
+        hashtag = models.Hashtag(name=normalized)
+        db.add(hashtag)
+        db.commit()
+        db.refresh(hashtag)
+    return hashtag
+
+
 # NOTE: /trending must be registered before /{name} — Starlette matches
 # routes in registration order, so a literal path declared after a
 # "/{name}" pattern would never be reached (same reason /api/posts/feed
 # and /explore are registered before /api/posts/{post_id}).
+
+# NOTE: /trending and /following must be registered before /{name} —
+# Starlette matches routes in registration order, so a literal path
+# declared after a "/{name}" pattern would never be reached (same reason
+# /api/posts/feed and /explore are registered before /api/posts/{post_id}).
+
+@router.get("/following", response_model=schemas.PaginatedHashtagsResponse)
+def get_followed_hashtags(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    query = (
+        db.query(models.Hashtag)
+        .join(models.HashtagFollow, models.HashtagFollow.hashtag_id == models.Hashtag.id)
+        .filter(models.HashtagFollow.user_id == current_user.id)
+    )
+    total = query.count()
+    rows = (
+        query.order_by(models.HashtagFollow.created_at.desc()).offset(offset).limit(limit).all()
+    )
+    items = [
+        schemas.HashtagOut(name=h.name, posts_count=hashtag_posts_count(db, h)) for h in rows
+    ]
+    return schemas.PaginatedHashtagsResponse(total=total, limit=limit, offset=offset, items=items)
+
 
 @router.get("/trending", response_model=schemas.PaginatedTrendingHashtagsResponse)
 def get_trending_hashtags(
@@ -123,3 +165,53 @@ def get_hashtag_posts(
     posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_post_detail(db, p, viewer_id) for p in posts]
     return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+@router.post("/{name}/follow", response_model=schemas.HashtagFollowActionResponse)
+def follow_hashtag(
+    name: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    hashtag = _get_or_create_hashtag(db, name)
+
+    existing = (
+        db.query(models.HashtagFollow)
+        .filter(
+            models.HashtagFollow.user_id == current_user.id,
+            models.HashtagFollow.hashtag_id == hashtag.id,
+        )
+        .first()
+    )
+    if existing is None:
+        db.add(models.HashtagFollow(user_id=current_user.id, hashtag_id=hashtag.id))
+        db.commit()
+
+    return schemas.HashtagFollowActionResponse(
+        message=f"Following #{hashtag.name}", is_following=True
+    )
+
+
+@router.delete("/{name}/follow", response_model=schemas.HashtagFollowActionResponse)
+def unfollow_hashtag(
+    name: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    hashtag = _get_hashtag_or_404(db, name)
+
+    existing = (
+        db.query(models.HashtagFollow)
+        .filter(
+            models.HashtagFollow.user_id == current_user.id,
+            models.HashtagFollow.hashtag_id == hashtag.id,
+        )
+        .first()
+    )
+    if existing is not None:
+        db.delete(existing)
+        db.commit()
+
+    return schemas.HashtagFollowActionResponse(
+        message=f"Unfollowed #{hashtag.name}", is_following=False
+    )

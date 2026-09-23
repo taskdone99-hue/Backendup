@@ -85,6 +85,7 @@ class NotificationType(str, enum.Enum):
     collaboration_accepted = "collaboration_accepted"
     collaboration_rejected = "collaboration_rejected"
     collaboration_cancelled = "collaboration_cancelled"
+    moderation_warning = "moderation_warning"
     # Brand (paid-partnership) collaboration lifecycle — same three-value
     # shape as the creator_collaboration_* values above, for the same
     # reason (see app/services/brand_collaboration_service.py).
@@ -168,6 +169,12 @@ class User(Base):
     business_name = Column(String(100), nullable=True)
     business_category = Column(String(100), nullable=True)
     business_description = Column(String(500), nullable=True)
+    # New, additive — see add_user_admin_columns migration. Neither has any
+    # UI to self-toggle; is_admin is set directly in the DB by whoever
+    # provisions staff accounts, is_suspended only via
+    # PUT /api/admin/reports/{id} (action=suspend_user).
+    is_admin = Column(Boolean, default=False, nullable=False)
+    is_suspended = Column(Boolean, default=False, nullable=False)
     # Per-user chat display-font preference — PUT /api/chat/settings/font.
     # Nullable/free-form on purpose: the client owns the list of valid font
     # names, same way it owns theme names, so the API doesn't hardcode one.
@@ -771,7 +778,14 @@ class Audio(Base):
     audio_url = Column(String(500), nullable=False, unique=True)
     source_post_id = Column(Integer, ForeignKey("posts.id"), nullable=True)
     source_reel_id = Column(Integer, ForeignKey("reels.id"), nullable=True)
+    # New, additive — POST /api/audio (register/upload a sound). Nullable:
+    # rows created before this endpoint existed (e.g. back-filled from a
+    # reel remix) have no explicit duration/uploader.
+    duration_seconds = Column(Integer, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
 
 
 class SavedCollection(Base):
@@ -886,8 +900,8 @@ class Location(Base):
     A reusable, shareable place — attached optionally to Posts and/or
     Stories via location_id. Not user-location tracking: a row here only
     ever exists because someone explicitly attached it to a piece of
-    content (inline at post/story/reel creation), and no history of where
-    a user has been is kept anywhere.
+    content (via POST /api/locations or inline at post/story creation), and
+    no history of where a user has been is kept anywhere.
 
     Multiple posts/stories can point at the same Location row — see
     app.services.location_service.find_or_create_location, which dedupes by
@@ -1657,6 +1671,281 @@ class AdImpression(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     ad_id = Column(String(100), nullable=False, index=True)
     placement = Column(String(50), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+# ==========================================================================
+# Live
+# ==========================================================================
+#
+# Metadata-only: no streaming infra here (see live_routes.py docstring) —
+# this just tracks who's live, who's watching, and the comments/likes on
+# it, the same way the rest of this codebase stores social-graph state
+# around content rather than the media pipeline itself.
+
+class LiveStatus(str, enum.Enum):
+    live = "live"
+    ended = "ended"
+
+
+class LiveSession(Base):
+    __tablename__ = "live_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String(150), nullable=True)
+    status = Column(Enum(LiveStatus), default=LiveStatus.live, nullable=False, index=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    viewers = relationship("LiveViewer", back_populates="live", cascade="all, delete-orphan")
+    comments = relationship("LiveComment", back_populates="live", cascade="all, delete-orphan")
+    likes = relationship("LiveLike", back_populates="live", cascade="all, delete-orphan")
+
+
+class LiveViewer(Base):
+    """One row per join. A viewer who leaves and rejoins gets a second row
+    (left_at set on the first) — this is a join/leave log, not just a
+    membership flag, so "duplicate active viewer" only means "already has a
+    row with left_at IS NULL", checked in live_routes.join_live rather than
+    enforced as a DB constraint (SQLite/MySQL partial-unique-index support
+    isn't consistent enough across this project's two backends to rely on
+    one here — same reasoning as the application-level dedup checks used
+    elsewhere in this codebase, e.g. content_routes.tag_reel_people)."""
+
+    __tablename__ = "live_viewers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    live_id = Column(Integer, ForeignKey("live_sessions.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    joined_at = Column(DateTime(timezone=True), server_default=func.now())
+    left_at = Column(DateTime(timezone=True), nullable=True)
+
+    live = relationship("LiveSession", back_populates="viewers")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class LiveComment(Base):
+    __tablename__ = "live_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    live_id = Column(Integer, ForeignKey("live_sessions.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    content = Column(String(500), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    live = relationship("LiveSession", back_populates="comments")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class LiveLike(Base):
+    __tablename__ = "live_likes"
+    __table_args__ = (
+        UniqueConstraint("live_id", "user_id", name="uq_live_like"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    live_id = Column(Integer, ForeignKey("live_sessions.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    live = relationship("LiveSession", back_populates="likes")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+# ==========================================================================
+# Saved Audio ("Save Audio" — separate from a post/reel using a sound)
+# ==========================================================================
+
+class SavedAudio(Base):
+    __tablename__ = "saved_audio"
+    __table_args__ = (
+        UniqueConstraint("user_id", "audio_id", name="uq_saved_audio"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    audio_id = Column(Integer, ForeignKey("audio_tracks.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    audio = relationship("Audio", foreign_keys=[audio_id])
+
+
+# ==========================================================================
+# Reports / Moderation
+# ==========================================================================
+
+class ReportTargetType(str, enum.Enum):
+    user = "user"
+    post = "post"
+    reel = "reel"
+    comment = "comment"
+    story = "story"
+    message = "message"
+
+
+class ReportReason(str, enum.Enum):
+    spam = "spam"
+    nudity_or_sexual_content = "nudity_or_sexual_content"
+    hate_speech_or_symbols = "hate_speech_or_symbols"
+    harassment_or_bullying = "harassment_or_bullying"
+    violence_or_dangerous_content = "violence_or_dangerous_content"
+    false_information = "false_information"
+    intellectual_property = "intellectual_property"
+    self_injury = "self_injury"
+    other = "other"
+
+
+class ReportStatus(str, enum.Enum):
+    pending = "pending"
+    reviewing = "reviewing"
+    resolved = "resolved"
+    rejected = "rejected"
+
+
+class ReportAction(str, enum.Enum):
+    """What an admin did when closing out a report. dismiss/resolve are
+    pure status transitions; remove_content/warn_user/suspend_user have a
+    real side effect (see moderation_service.apply_action). There's no
+    "restore_content" — remove_content hard-deletes the target row, same
+    as this codebase's other delete endpoints (e.g. DELETE /api/posts/:id),
+    so there's nothing to restore from; flag if soft-delete is wanted
+    instead, which would need its own migration across every content
+    type."""
+
+    dismiss = "dismiss"
+    resolve = "resolve"
+    remove_content = "remove_content"
+    warn_user = "warn_user"
+    suspend_user = "suspend_user"
+
+
+class Report(Base):
+    """target_id is intentionally not a ForeignKey, same reasoning as
+    Like.target_id — it points at one of six different tables depending on
+    target_type; report_routes.py validates the target exists before
+    inserting."""
+
+    __tablename__ = "reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    target_type = Column(Enum(ReportTargetType), nullable=False, index=True)
+    target_id = Column(Integer, nullable=False, index=True)
+    reason = Column(Enum(ReportReason), nullable=False)
+    description = Column(String(1000), nullable=True)
+    status = Column(Enum(ReportStatus), default=ReportStatus.pending, nullable=False, index=True)
+    action = Column(Enum(ReportAction), nullable=True)
+    reviewed_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    reporter = relationship("User", foreign_keys=[reporter_id])
+    reviewed_by = relationship("User", foreign_keys=[reviewed_by_id])
+
+
+# ==========================================================================
+# Hashtag follow
+# ==========================================================================
+
+class HashtagFollow(Base):
+    __tablename__ = "hashtag_follows"
+    __table_args__ = (
+        UniqueConstraint("user_id", "hashtag_id", name="uq_hashtag_follow"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    hashtag_id = Column(Integer, ForeignKey("hashtags.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    hashtag = relationship("Hashtag", foreign_keys=[hashtag_id])
+
+
+# ==========================================================================
+# Recent search
+# ==========================================================================
+
+class RecentSearch(Base):
+    """One row per saved search-bar entry. Exactly one of query_text /
+    target_user_id is set: a free-text search ("sunset photography") saves
+    query_text; tapping a specific person in the results saves
+    target_user_id instead (Instagram's "recents" mixes both kinds), so a
+    client can render either a plain text chip or a tappable profile
+    row."""
+
+    __tablename__ = "recent_searches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    query_text = Column(String(150), nullable=True)
+    target_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+    target_user = relationship("User", foreign_keys=[target_user_id])
+
+
+# ==========================================================================
+# Notification preferences
+# ==========================================================================
+
+class NotificationPreference(Base):
+    """One row per user, created lazily on first read/write (see
+    notification_routes._get_or_create_preferences) rather than at signup
+    — every pre-existing user just gets the all-True defaults the first
+    time this is touched. push_enabled is the master switch for device
+    push (see push_service.py); the rest gate which notifications get
+    written/pushed at all (see notification_service.notify_user)."""
+
+    __tablename__ = "notification_preferences"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    likes_enabled = Column(Boolean, default=True, nullable=False)
+    comments_enabled = Column(Boolean, default=True, nullable=False)
+    follows_enabled = Column(Boolean, default=True, nullable=False)
+    mentions_enabled = Column(Boolean, default=True, nullable=False)
+    messages_enabled = Column(Boolean, default=True, nullable=False)
+    collaboration_requests_enabled = Column(Boolean, default=True, nullable=False)
+    push_enabled = Column(Boolean, default=True, nullable=False)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+# ==========================================================================
+# Mentions (posts / reels / comments — stories already have their own
+# StoryMention, left as-is)
+# ==========================================================================
+
+class MentionTargetType(str, enum.Enum):
+    post = "post"
+    reel = "reel"
+    comment = "comment"
+
+
+class Mention(Base):
+    """@username parsed out of a post caption, reel caption, or comment —
+    same generic target_type/target_id shape as Like/Report, and the same
+    reason: one table instead of three near-identical ones. See
+    app/services/mention_service.py (sync_mentions, called from
+    content_routes.create_post/update_post/create_reel and
+    comment_routes.create_comment)."""
+
+    __tablename__ = "mentions"
+    __table_args__ = (
+        UniqueConstraint("target_type", "target_id", "user_id", name="uq_mention_target"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_type = Column(Enum(MentionTargetType), nullable=False, index=True)
+    target_id = Column(Integer, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", foreign_keys=[user_id])

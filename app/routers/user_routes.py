@@ -658,3 +658,59 @@ def get_suggested_users(
     return schemas.PaginatedUsersResponse(
         total=len(suggestions), limit=limit, offset=offset, items=items
     )
+
+
+# ==========================================================================
+# Follower management extras
+# ==========================================================================
+
+@router.delete("/api/followers/{user_id}", response_model=schemas.MessageResponse)
+def remove_follower(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Removes `user_id` from the *current user's own* followers list —
+    different from DELETE /api/follow/{user_id}, which is the current user
+    unfollowing someone else. This deletes the Follow row the other
+    direction: follower_id=user_id, following_id=current_user.id."""
+    row = (
+        db.query(models.Follow)
+        .filter(models.Follow.follower_id == user_id, models.Follow.following_id == current_user.id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This user doesn't follow you")
+
+    db.delete(row)
+    db.commit()
+    return schemas.MessageResponse(message="Follower removed")
+
+
+@router.get("/api/users/{user_id}/follow-status", response_model=schemas.FollowStatusOut)
+def get_follow_status(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Lightweight standalone version of the is_following/is_followed_by/
+    request_pending fields already embedded in the full profile
+    (GET /api/users/{user_id}) — for a client that just wants to poll
+    relationship status without fetching the whole profile payload."""
+    _get_user_or_404(db, user_id)
+
+    request_pending = (
+        db.query(models.FollowRequest)
+        .filter(
+            models.FollowRequest.requester_id == current_user.id,
+            models.FollowRequest.target_id == user_id,
+        )
+        .first()
+        is not None
+    )
+
+    return schemas.FollowStatusOut(
+        is_following=_is_following(db, current_user.id, user_id),
+        is_followed_by=_is_following(db, user_id, current_user.id),
+        request_pending=request_pending,
+    )

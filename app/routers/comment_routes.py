@@ -12,6 +12,8 @@ from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.database import get_db
 from app.services import engagement
+from app.services.mention_service import sync_mentions
+from app.services.notification_service import notify_user
 from app.services.privacy_service import restricted_user_ids, is_blocked
 
 router = APIRouter(tags=["comments"])
@@ -80,6 +82,24 @@ def _target_exists(db: Session, target_type: models.LikeTargetType, target_id: i
     return db.query(model).filter(model.id == target_id).first() is not None
 
 
+async def _notify_comment_mentions(db: Session, comment: models.Comment, author: models.User) -> None:
+    newly_mentioned = sync_mentions(
+        db, models.MentionTargetType.comment, comment.id, comment.content, author.id
+    )
+    for user in newly_mentioned:
+        await notify_user(
+            db,
+            user_id=user.id,
+            actor=author,
+            notif_type=models.NotificationType.mention,
+            message=f"{author.username} mentioned you in a comment",
+            target_type="comment",
+            target_id=comment.id,
+        )
+    if newly_mentioned:
+        db.commit()
+
+
 # ==========================================================================
 # Comments
 # ==========================================================================
@@ -89,7 +109,7 @@ def _target_exists(db: Session, target_type: models.LikeTargetType, target_id: i
     response_model=schemas.CommentOut,
     status_code=status.HTTP_201_CREATED,
 )
-def add_comment(
+async def add_comment(
     post_id: int,
     payload: schemas.CommentCreate,
     db: Session = Depends(get_db),
@@ -102,6 +122,7 @@ def add_comment(
     db.add(comment)
     db.commit()
     db.refresh(comment)
+    await _notify_comment_mentions(db, comment, current_user)
     return _to_comment_out(db, comment, current_user.id)
 
 
@@ -135,7 +156,7 @@ def get_comments(
     response_model=schemas.CommentOut,
     status_code=status.HTTP_201_CREATED,
 )
-def add_reel_comment(
+async def add_reel_comment(
     reel_id: int,
     payload: schemas.CommentCreate,
     db: Session = Depends(get_db),
@@ -148,6 +169,7 @@ def add_reel_comment(
     db.add(comment)
     db.commit()
     db.refresh(comment)
+    await _notify_comment_mentions(db, comment, current_user)
     return _to_comment_out(db, comment, current_user.id)
 
 
@@ -177,7 +199,7 @@ def get_reel_comments(
     response_model=schemas.CommentOut,
     status_code=status.HTTP_201_CREATED,
 )
-def reply_to_comment(
+async def reply_to_comment(
     comment_id: int,
     payload: schemas.CommentCreate,
     db: Session = Depends(get_db),
@@ -197,6 +219,7 @@ def reply_to_comment(
     db.add(reply)
     db.commit()
     db.refresh(reply)
+    await _notify_comment_mentions(db, reply, current_user)
     return _to_comment_out(db, reply, current_user.id)
 
 

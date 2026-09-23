@@ -23,6 +23,11 @@ from app.models import (
     EarningSourceType,
     CollaborationStatus,
     BrandCollaborationStatus,
+    LiveStatus,
+    ReportTargetType,
+    ReportReason,
+    ReportStatus,
+    ReportAction,
 )
 
 PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
@@ -537,11 +542,24 @@ class LocationIn(BaseModel):
     """Inline location payload for PUT /api/posts/:id's `location` field —
     kept name-only + optional coordinates for backward compatibility with
     existing callers of that endpoint. To attach a richer location (address,
-    city, state, country, place_id), use the location_* fields on post/story
-    creation, which resolve or create a saved location and attach it by id."""
+    city, state, country, place_id) use POST /api/locations first and pass
+    its id, or use the location_* fields on post/story creation."""
     name: str = Field(..., max_length=150)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
+
+
+class LocationCreate(BaseModel):
+    """POST /api/locations — create (or reuse, if it matches an existing
+    one) a saved location that can then be attached to posts/stories by id."""
+    name: str = Field(..., max_length=150)
+    address: str | None = Field(default=None, max_length=500)
+    city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    country: str | None = Field(default=None, max_length=100)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    place_id: str | None = Field(default=None, max_length=255)
 
 
 class LocationOut(BaseModel):
@@ -766,9 +784,6 @@ class NearbyLocationOut(LocationOut):
 
 
 class NearbyLocationsResponse(BaseModel):
-    total: int
-    limit: int
-    offset: int
     items: list[NearbyLocationOut] = []
 
 
@@ -2046,3 +2061,256 @@ class MediaMessageResponse(BaseModel):
 class ConversationRequestActionResponse(BaseModel):
     message: str
     conversation_id: int
+
+
+# ==========================================================================
+# Live
+# ==========================================================================
+
+class LiveCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=150)
+
+
+class LiveSessionOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    title: str | None
+    status: LiveStatus
+    started_at: datetime
+    ended_at: datetime | None
+    viewer_count: int = 0
+    likes_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedLiveSessionsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[LiveSessionOut]
+
+
+class LiveActionResponse(BaseModel):
+    message: str
+    live: LiveSessionOut
+
+
+class LiveViewerOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    joined_at: datetime
+    left_at: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedLiveViewersResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[LiveViewerOut]
+
+
+class LiveViewerCountResponse(BaseModel):
+    live_id: int
+    viewer_count: int
+
+
+class LiveCommentCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=500)
+
+
+class LiveCommentOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    content: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedLiveCommentsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[LiveCommentOut]
+
+
+class LiveLikeActionResponse(BaseModel):
+    message: str
+    liked: bool
+    likes_count: int
+
+
+# ==========================================================================
+# Audio management (create/save) — audio discovery (details/reels/trending)
+# already has its own schemas in the Reels section above.
+# ==========================================================================
+
+class SavedAudioActionResponse(BaseModel):
+    message: str
+    is_saved: bool
+
+
+class PaginatedSavedAudioResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[AudioOut]
+
+
+# ==========================================================================
+# Reports / Moderation
+# ==========================================================================
+
+class ReportCreate(BaseModel):
+    target_type: ReportTargetType
+    target_id: int = Field(..., gt=0)
+    reason: ReportReason
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class ReportOut(BaseModel):
+    id: int
+    target_type: ReportTargetType
+    target_id: int
+    reason: ReportReason
+    description: str | None
+    status: ReportStatus
+    action: ReportAction | None
+    created_at: datetime
+    reviewed_at: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedReportsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[ReportOut]
+
+
+class AdminReportOut(ReportOut):
+    reporter: UserSummaryOut
+    reviewed_by: UserSummaryOut | None = None
+
+
+class PaginatedAdminReportsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[AdminReportOut]
+
+
+class ReportStatusUpdate(BaseModel):
+    status: ReportStatus
+    action: ReportAction | None = Field(
+        default=None,
+        description="Optional side-effecting action to take alongside the status change "
+        "— see models.ReportAction for what each one does.",
+    )
+
+
+# ==========================================================================
+# Hashtag follow
+# ==========================================================================
+
+class HashtagFollowActionResponse(BaseModel):
+    message: str
+    is_following: bool
+
+
+class PaginatedHashtagsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[HashtagOut]
+
+
+# ==========================================================================
+# Recent search
+# ==========================================================================
+
+class RecentSearchCreate(BaseModel):
+    query_text: str | None = Field(default=None, max_length=150)
+    target_user_id: int | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one(self):
+        if bool(self.query_text) == bool(self.target_user_id):
+            raise ValueError("Provide exactly one of query_text or target_user_id")
+        return self
+
+
+class RecentSearchOut(BaseModel):
+    id: int
+    query_text: str | None
+    target_user: UserSummaryOut | None = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedRecentSearchResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[RecentSearchOut]
+
+
+# ==========================================================================
+# Notification preferences
+# ==========================================================================
+
+class NotificationPreferencesOut(BaseModel):
+    likes_enabled: bool
+    comments_enabled: bool
+    follows_enabled: bool
+    mentions_enabled: bool
+    messages_enabled: bool
+    collaboration_requests_enabled: bool
+    push_enabled: bool
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationPreferencesUpdate(BaseModel):
+    likes_enabled: bool | None = None
+    comments_enabled: bool | None = None
+    follows_enabled: bool | None = None
+    mentions_enabled: bool | None = None
+    messages_enabled: bool | None = None
+    collaboration_requests_enabled: bool | None = None
+    push_enabled: bool | None = None
+
+
+# ==========================================================================
+# Account / security
+# ==========================================================================
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1)
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        return _validate_password_strength(v)
+
+
+# ==========================================================================
+# Follower management
+# ==========================================================================
+
+class FollowStatusOut(BaseModel):
+    is_following: bool
+    is_followed_by: bool
+    request_pending: bool

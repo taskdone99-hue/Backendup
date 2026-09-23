@@ -208,3 +208,60 @@ async def notifications_websocket(websocket: WebSocket, token: str = Query(...))
             await notification_manager.disconnect(user_id, websocket)
     finally:
         db.close()
+
+
+# ==========================================================================
+# Preferences — one row per user, created lazily on first touch (see
+# models.NotificationPreference).
+# ==========================================================================
+
+def _get_or_create_preferences(db: Session, user_id: int) -> models.NotificationPreference:
+    prefs = (
+        db.query(models.NotificationPreference)
+        .filter(models.NotificationPreference.user_id == user_id)
+        .first()
+    )
+    if prefs is None:
+        prefs = models.NotificationPreference(user_id=user_id)
+        db.add(prefs)
+        db.commit()
+        db.refresh(prefs)
+    return prefs
+
+
+@router.get("/preferences", response_model=schemas.NotificationPreferencesOut)
+def get_notification_preferences(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return schemas.NotificationPreferencesOut.model_validate(
+        _get_or_create_preferences(db, current_user.id)
+    )
+
+
+@router.put("/preferences", response_model=schemas.NotificationPreferencesOut)
+def update_notification_preferences(
+    payload: schemas.NotificationPreferencesUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    prefs = _get_or_create_preferences(db, current_user.id)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(prefs, field, value)
+    db.commit()
+    db.refresh(prefs)
+    return schemas.NotificationPreferencesOut.model_validate(prefs)
+
+
+@router.put("/read-all", response_model=schemas.MessageResponse)
+def mark_all_notifications_read(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    updated = (
+        db.query(models.Notification)
+        .filter(models.Notification.user_id == current_user.id, models.Notification.is_read.is_(False))
+        .update({"is_read": True}, synchronize_session=False)
+    )
+    db.commit()
+    return schemas.MessageResponse(message=f"Marked {updated} notification(s) as read")

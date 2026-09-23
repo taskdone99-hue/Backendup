@@ -27,6 +27,8 @@ from app.services.media_service import (
 from app.services import engagement
 from app.services.location_service import resolve_location_from_form, find_or_create_location
 from app.services.hashtag_service import extract_hashtags, sync_post_hashtags
+from app.services.mention_service import sync_mentions
+from app.services.notification_service import notify_user
 from app.services.privacy_service import blocked_user_ids, muted_user_ids, is_blocked
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
@@ -258,7 +260,7 @@ def _require_author_visible(db: Session, author: models.User, viewer_id: int | N
 # ==========================================================================
 
 @router.post("", response_model=schemas.PostDetailOut, status_code=status.HTTP_201_CREATED)
-def create_post(
+async def create_post(
     file: UploadFile | None = File(
         default=None,
         description="Single-photo/video post. Keep using this field name for "
@@ -282,7 +284,7 @@ def create_post(
     location_latitude: float | None = Form(default=None),
     location_longitude: float | None = Form(default=None),
     location_id: int | None = Form(
-        default=None, description="Attach an already-saved location by id"
+        default=None, description="Attach an already-saved location (see POST /api/locations) by id"
     ),
     location_address: str | None = Form(default=None),
     location_city: str | None = Form(default=None),
@@ -402,6 +404,18 @@ def create_post(
         ))
 
     sync_post_hashtags(db, post, caption)
+
+    newly_mentioned = sync_mentions(db, models.MentionTargetType.post, post.id, caption, current_user.id)
+    for user in newly_mentioned:
+        await notify_user(
+            db,
+            user_id=user.id,
+            actor=current_user,
+            notif_type=models.NotificationType.mention,
+            message=f"{current_user.username} mentioned you in a post",
+            target_type="post",
+            target_id=post.id,
+        )
 
     if tag_ids:
         _replace_post_tags(db, post, tag_ids)
@@ -535,7 +549,7 @@ def get_post(
 
 
 @router.put("/{post_id}", response_model=schemas.PostDetailOut)
-def update_post(
+async def update_post(
     post_id: int,
     payload: schemas.PostUpdate,
     db: Session = Depends(get_db),
@@ -554,6 +568,19 @@ def update_post(
         db.flush()  # post.id already exists (update, not create), but keep
         # ordering explicit: hashtag sync reads/writes rows keyed on it.
         sync_post_hashtags(db, post, post.caption)
+        newly_mentioned = sync_mentions(
+            db, models.MentionTargetType.post, post.id, post.caption, current_user.id
+        )
+        for user in newly_mentioned:
+            await notify_user(
+                db,
+                user_id=user.id,
+                actor=current_user,
+                notif_type=models.NotificationType.mention,
+                message=f"{current_user.username} mentioned you in a post",
+                target_type="post",
+                target_id=post.id,
+            )
 
     if "alt_text" in updates:
         post.alt_text = updates["alt_text"]
@@ -772,7 +799,7 @@ def unsave_post(
 # ==========================================================================
 
 @reels_router.post("", response_model=schemas.ReelDetailOut, status_code=status.HTTP_201_CREATED)
-def create_reel(
+async def create_reel(
     file: UploadFile,
     caption: str | None = Form(default=None),
     thumbnail: UploadFile | None = File(default=None),
@@ -784,7 +811,7 @@ def create_reel(
         description="Optional. Leave unset (or blank) for no coordinates."
     ) = None,
     location_id: OptionalIntForm(
-        description="Optional. Attach an already-saved location by id. "
+        description="Optional. Attach an already-saved location (see POST /api/locations) by id. "
         "Leave unset (or blank) if you're not tagging an existing saved location."
     ) = None,
     location_address: str | None = Form(default=None),
@@ -878,6 +905,20 @@ def create_reel(
     db.add(reel)
     db.commit()
     db.refresh(reel)
+
+    newly_mentioned = sync_mentions(db, models.MentionTargetType.reel, reel.id, caption, current_user.id)
+    for user in newly_mentioned:
+        await notify_user(
+            db,
+            user_id=user.id,
+            actor=current_user,
+            notif_type=models.NotificationType.mention,
+            message=f"{current_user.username} mentioned you in a reel",
+            target_type="reel",
+            target_id=reel.id,
+        )
+    db.commit()
+
     return _to_reel_detail(db, reel, current_user.id)
 
 

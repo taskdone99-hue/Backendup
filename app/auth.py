@@ -113,7 +113,7 @@ def get_current_user(
 
     user = db.query(models.User).filter(models.User.id == int(user_id)).first()
 
-    if user is None or not user.is_active:
+    if user is None or not user.is_active or user.is_suspended:
         raise credentials_exception
 
     return user
@@ -128,6 +128,22 @@ def get_current_user_optional(
 
     token = credentials.credentials
     return get_user_from_raw_token(token, db)
+
+
+def get_current_admin_user(
+    current_user: models.User = Depends(get_current_user),
+) -> models.User:
+    """Gate for /api/admin/* routes. Reuses get_current_user (so an
+    unauthenticated or suspended caller already gets 401 before this even
+    runs) and just adds the is_admin check on top — a normal user hitting
+    an admin route gets 403, not a 404/500 that might leak whether the
+    route exists."""
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    return current_user
 
 
 def get_user_from_raw_token(token: str, db: Session) -> Optional[models.User]:
@@ -149,7 +165,7 @@ def get_user_from_raw_token(token: str, db: Session) -> Optional[models.User]:
 
     user = db.query(models.User).filter(models.User.id == int(user_id)).first()
 
-    if user is None or not user.is_active:
+    if user is None or not user.is_active or user.is_suspended:
         return None
 
     return user

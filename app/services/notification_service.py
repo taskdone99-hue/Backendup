@@ -28,6 +28,24 @@ from app.ws_manager import notification_manager
 
 logger = logging.getLogger(__name__)
 
+# Which preference field gates a given notification type — see
+# models.NotificationPreference / GET+PUT /api/notifications/preferences.
+# Types with no entry here (share, brand_collaboration_*, moderation_warning,
+# other) always go through: there's no matching toggle for them, and a few
+# of those (moderation_warning) shouldn't be opt-out-able at all.
+_PREFERENCE_FIELD_BY_TYPE = {
+    models.NotificationType.like: "likes_enabled",
+    models.NotificationType.comment: "comments_enabled",
+    models.NotificationType.follow: "follows_enabled",
+    models.NotificationType.follow_request: "follows_enabled",
+    models.NotificationType.mention: "mentions_enabled",
+    models.NotificationType.message: "messages_enabled",
+    models.NotificationType.collaboration_request: "collaboration_requests_enabled",
+    models.NotificationType.collaboration_accepted: "collaboration_requests_enabled",
+    models.NotificationType.collaboration_rejected: "collaboration_requests_enabled",
+    models.NotificationType.collaboration_cancelled: "collaboration_requests_enabled",
+}
+
 
 async def notify_user(
     db: Session,
@@ -47,6 +65,18 @@ async def notify_user(
     given, is used for the FCM push body instead (e.g. a message preview) —
     defaults to `message` when omitted."""
     if actor.id == user_id:
+        return None
+
+    prefs = (
+        db.query(models.NotificationPreference)
+        .filter(models.NotificationPreference.user_id == user_id)
+        .first()
+    )
+    # No row yet = defaults = everything enabled (see
+    # notification_routes._get_or_create_preferences, which only
+    # materializes the row on first read/write of the endpoint).
+    pref_field = _PREFERENCE_FIELD_BY_TYPE.get(notif_type)
+    if prefs is not None and pref_field is not None and not getattr(prefs, pref_field):
         return None
 
     notification = models.Notification(
@@ -78,7 +108,7 @@ async def notify_user(
         for row in db.query(models.DeviceToken.token)
         .filter(models.DeviceToken.user_id == user_id)
         .all()
-    ]
+    ] if (prefs is None or prefs.push_enabled) else []
     if tokens:
         try:
             await run_in_threadpool(
