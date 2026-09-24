@@ -15,6 +15,7 @@ from app.ws_manager import manager
 from app.services.notification_service import notify_user
 from app.services.privacy_service import is_blocked, is_conversation_muted
 from app.services.media_service import save_upload_file
+from app.routers.content_routes import _require_author_visible
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -99,11 +100,60 @@ def _validate_reply_target(
     return reply_to_message_id
 
 
-def _to_message_out(db: Session, message: models.Message) -> schemas.MessageOut:
+def _reel_visible_to(db: Session, reel: models.Reel, viewer_id: int | None) -> bool:
+    """Same visibility rule as GET /api/reels/{id} (block either way, or a
+    private account the viewer doesn't follow), as a yes/no."""
+    try:
+        _require_author_visible(db, reel.user, viewer_id)
+    except HTTPException:
+        return False
+    return True
+
+
+def _build_shared_reel_out(
+    db: Session, reel_id: int, viewer_id: int | None
+) -> schemas.SharedReelOut:
+    """Preview for a reel shared in chat, resolved for one viewer. A deleted
+    or not-visible-to-this-viewer reel comes back as is_available=False with
+    no details, so a share can't expose a private account's reel to someone
+    who couldn't open it directly. viewer_id=None is treated as a logged-out
+    viewer (public accounts only)."""
+    reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
+    if reel is None or not _reel_visible_to(db, reel, viewer_id):
+        return schemas.SharedReelOut(reel_id=reel_id, is_available=False)
+    return schemas.SharedReelOut(
+        reel_id=reel.id,
+        is_available=True,
+        video_url=reel.video_url,
+        thumbnail_url=reel.thumbnail_url,
+        caption=reel.caption,
+        duration_seconds=reel.duration_seconds,
+        user=schemas.UserSummaryOut.model_validate(reel.user),
+    )
+
+
+def _get_shareable_reel_or_404(db: Session, reel_id: int, sender_id: int) -> models.Reel:
+    reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
+    if reel is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reel not found")
+    # You can only share what you could open yourself (404 if blocked, 403
+    # if private and not followed) — same responses as GET /api/reels/{id}.
+    _require_author_visible(db, reel.user, sender_id)
+    return reel
+
+
+def _to_message_out(
+    db: Session, message: models.Message, viewer_id: int | None = None
+) -> schemas.MessageOut:
+    """`viewer_id` only matters for shared-reel messages, whose preview depends
+    on who's looking (see _build_shared_reel_out)."""
     out = schemas.MessageOut.model_validate(message)
     if message.is_deleted:
         out.content = "This message was deleted"
         out.media_url = None
+        out.shared_reel_id = None
+    elif message.shared_reel_id is not None:
+        out.shared_reel = _build_shared_reel_out(db, message.shared_reel_id, viewer_id)
 
     if message.reply_to_message_id is not None:
         original = (
@@ -118,6 +168,7 @@ def _to_message_out(db: Session, message: models.Message) -> schemas.MessageOut:
                 content="This message was deleted" if original.is_deleted else original.content,
                 media_type=original.media_type,
                 is_deleted=original.is_deleted,
+                is_reel_share=original.shared_reel_id is not None and not original.is_deleted,
             )
 
     out.reactions = [
@@ -175,7 +226,7 @@ def _to_conversation_out(
         title=conversation.title,
         created_at=conversation.created_at,
         participants=participants,
-        last_message=_to_message_out(db, last_message) if last_message else None,
+        last_message=_to_message_out(db, last_message, viewer_id) if last_message else None,
         unread_count=unread_count,
         status=my_status,
         is_muted=is_muted,
@@ -550,7 +601,7 @@ def get_messages(
                 s.delivered_at = now
             db.commit()
 
-    items = [_to_message_out(db, m) for m in messages]
+    items = [_to_message_out(db, m, current_user.id) for m in messages]
     return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
 
 
@@ -584,8 +635,29 @@ def get_conversation_media(
 
     total = query.count()
     messages = query.order_by(models.Message.created_at.desc()).offset(offset).limit(limit).all()
-    items = [_to_message_out(db, m) for m in messages]
+    items = [_to_message_out(db, m, current_user.id) for m in messages]
     return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+async def _push_message_event(
+    db: Session,
+    recipient_ids: list[int],
+    message: models.Message,
+    event_type: str,
+    default_out: schemas.MessageOut,
+) -> None:
+    """Send a "message" / "message_edited" socket event. Normally every
+    recipient gets the same payload; a shared reel's preview depends on who's
+    looking, so those are built and sent per recipient."""
+    base = {"type": event_type, "conversation_id": message.conversation_id}
+    if message.shared_reel_id is None:
+        await manager.send_to_users(
+            recipient_ids, {**base, "message": default_out.model_dump(mode="json")}
+        )
+        return
+    for uid in recipient_ids:
+        out = _to_message_out(db, message, viewer_id=uid)
+        await manager.send_to_users([uid], {**base, "message": out.model_dump(mode="json")})
 
 
 async def _create_and_dispatch_message(
@@ -621,12 +693,9 @@ async def _create_and_dispatch_message(
         ))
     db.commit()
 
-    message_out = _to_message_out(db, message)
+    message_out = _to_message_out(db, message, current_user.id)
 
-    await manager.send_to_users(
-        recipient_ids,
-        {"type": "message", "conversation_id": conversation_id, "message": message_out.model_dump(mode="json")},
-    )
+    await _push_message_event(db, recipient_ids, message, "message", message_out)
 
     offline_ids = [uid for uid in recipient_ids if not manager.is_online(uid)]
     # Muted-conversation participants still get delivery/WS updates above
@@ -666,13 +735,19 @@ async def send_message(
 
     reply_to_id = _validate_reply_target(db, conversation_id, payload.reply_to_message_id)
 
+    if payload.shared_reel_id is not None:
+        # Share a reel as a card (optionally with a note in `content`).
+        _get_shareable_reel_or_404(db, payload.shared_reel_id, current_user.id)
+
     message = models.Message(
         conversation_id=conversation_id,
         sender_id=current_user.id,
         content=payload.content,
         reply_to_message_id=reply_to_id,
+        shared_reel_id=payload.shared_reel_id,
     )
-    preview = payload.content if len(payload.content) <= 80 else payload.content[:77] + "..."
+    text = payload.content or "Sent a reel"
+    preview = text if len(text) <= 80 else text[:77] + "..."
     return await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
 
 
@@ -817,19 +892,12 @@ async def edit_message(
     db.commit()
     db.refresh(message)
 
-    message_out = _to_message_out(db, message)
+    message_out = _to_message_out(db, message, current_user.id)
     other_ids = [
         uid for uid in _conversation_participant_ids(db, message.conversation_id)
         if uid != current_user.id
     ]
-    await manager.send_to_users(
-        other_ids,
-        {
-            "type": "message_edited",
-            "conversation_id": message.conversation_id,
-            "message": message_out.model_dump(mode="json"),
-        },
-    )
+    await _push_message_event(db, other_ids, message, "message_edited", message_out)
     return message_out
 
 
@@ -901,7 +969,7 @@ async def react_to_message(
     db.commit()
     db.refresh(message)
 
-    message_out = _to_message_out(db, message)
+    message_out = _to_message_out(db, message, current_user.id)
     other_ids = [
         uid for uid in _conversation_participant_ids(db, message.conversation_id)
         if uid != current_user.id
@@ -955,7 +1023,7 @@ async def remove_message_reaction(
             },
         )
 
-    return _to_message_out(db, message)
+    return _to_message_out(db, message, current_user.id)
 
 
 # ==========================================================================

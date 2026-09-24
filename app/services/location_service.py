@@ -6,15 +6,10 @@ This is explicitly NOT continuous user-location tracking: a Location row is
 only ever created because a user attached one to a specific piece of
 content, and no history of anyone's movements is kept anywhere.
 
-No external geocoding/places provider is currently configured anywhere in
-this project (no provider API key in .env.example, no existing
-"geocoding"/"places" service module) — so this module only searches and
-dedupes against locations already saved by users of this app, rather than
-hard-coding fake place data or silently faking a provider integration.
-reverse_geocode() is written as a clean extension point: plug a real
-provider's HTTP call in there (reading its API key from an environment
-variable, never hard-coded, never returned to the frontend) when one is
-chosen, without needing to touch any of the callers below.
+This module only searches and dedupes against locations already saved by
+users of this app. Searching real-world places and reverse geocoding through
+an external provider lives in app/services/geocoding_service.py (exposed at
+GET /api/locations/places/search and GET /api/locations/reverse-geocode).
 """
 
 from sqlalchemy import func, or_
@@ -156,15 +151,6 @@ def resolve_location_from_form(
             place_id=location_place_id,
         )
 
-    return None
-
-    """
-    Extension point for turning raw GPS coordinates into a place name via a
-    real geocoding provider. Not implemented — no provider is configured in
-    this project (see module docstring) — returns None so callers can fall
-    back to treating the location as a plain pair of coordinates with no
-    name, rather than silently fabricating a place.
-    """
     return None
 
 

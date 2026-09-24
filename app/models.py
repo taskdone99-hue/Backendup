@@ -1329,6 +1329,14 @@ class Message(Base):
     reply_to_story_id = Column(
         Integer, ForeignKey("stories.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Set when this message is a shared reel (Instagram-style share card in
+    # chat, instead of pasting a reel URL as text); `content` then holds the
+    # optional note sent along with it. Deliberately NOT a ForeignKey, same
+    # reasoning as Reel.remixed_from_id: a real FK would block deleting the
+    # reel, and SET NULL would turn the message into a blank text bubble.
+    # Instead the message keeps its id and the API reports the reel as
+    # unavailable once it's gone (see chat_routes._build_shared_reel_out).
+    shared_reel_id = Column(Integer, nullable=True, index=True)
     # True for the one-time auto-intro DM sent on a brand-new 1:1
     # conversation (see chat_routes.create_conversation) — lets a client
     # style/skip it differently from a message the sender actually typed.

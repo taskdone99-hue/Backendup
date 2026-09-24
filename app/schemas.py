@@ -587,6 +587,28 @@ class PaginatedLocationSearchResponse(BaseModel):
     items: list[LocationOut]
 
 
+class PlaceOut(BaseModel):
+    """A real-world place from the external places/geocoding provider — used
+    by GET /api/locations/places/search and GET /api/locations/reverse-geocode.
+    The name/address/city/state/country/latitude/longitude/place_id fields
+    line up with LocationCreate, so a client can pass a result straight to
+    POST /api/locations (or the location_* fields on post/story creation).
+    `place_id` is namespaced by provider ("google:...", "osm:N123")."""
+    place_id: str | None = None
+    name: str
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    country: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    provider: str
+
+
+class PlaceSearchResponse(BaseModel):
+    items: list[PlaceOut]
+
+
 # ---- Stories ----
 
 class StoryOut(BaseModel):
@@ -1411,18 +1433,28 @@ class ConversationCreate(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    content: str = Field(..., min_length=1, max_length=2200)
+    """Text message, or a shared reel. With `shared_reel_id`, `content` is an
+    optional note sent alongside the reel; without it, `content` is required."""
+    content: str | None = Field(default=None, min_length=1, max_length=2200)
     reply_to_message_id: int | None = Field(
         default=None, gt=0, description="Reply to another message in this conversation"
+    )
+    shared_reel_id: int | None = Field(
+        default=None, gt=0, description="Share this reel into the conversation"
     )
 
     @field_validator("content")
     @classmethod
-    def strip_content(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
+    def strip_content(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v.strip() or None
+
+    @model_validator(mode="after")
+    def require_content_or_reel(self):
+        if self.content is None and self.shared_reel_id is None:
             raise ValueError("Message can't be empty")
-        return v
+        return self
 
 
 class MessageEditRequest(BaseModel):
@@ -1457,6 +1489,20 @@ class MessageReactionOut(BaseModel):
         from_attributes = True
 
 
+class SharedReelOut(BaseModel):
+    """Preview card for a reel shared in chat, resolved per viewer: if the
+    reel was deleted, or the viewer can't see it (private account they don't
+    follow, or a block), `is_available` is False and only `reel_id` is set.
+    Full detail is GET /api/reels/{reel_id}."""
+    reel_id: int
+    is_available: bool = True
+    video_url: str | None = None
+    thumbnail_url: str | None = None
+    caption: str | None = None
+    duration_seconds: float | None = None
+    user: UserSummaryOut | None = None
+
+
 class MessageOut(BaseModel):
     id: int
     conversation_id: int
@@ -1467,6 +1513,10 @@ class MessageOut(BaseModel):
     reply_to_message_id: int | None = None
     reply_to: "MessageRepliedToOut | None" = None
     reply_to_story_id: int | None = None
+    # Non-null `shared_reel` means this message is a shared reel; `content`
+    # is then just the optional note.
+    shared_reel_id: int | None = None
+    shared_reel: SharedReelOut | None = None
     is_auto_message: bool = False
     edited_at: datetime | None = None
     is_deleted: bool = False
@@ -2037,6 +2087,7 @@ class MessageRepliedToOut(BaseModel):
     content: str | None
     media_type: MediaType | None
     is_deleted: bool
+    is_reel_share: bool = False
 
     class Config:
         from_attributes = True
