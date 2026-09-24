@@ -98,6 +98,9 @@ def _to_story_out(
         )
         for m in story.mentions
     ]
+    approved_tags = [t for t in story.tag_rows if t.is_approved]
+    out.tags_count = len(approved_tags)
+    out.tags = [schemas.StoryTagOut.model_validate(t) for t in approved_tags]
     if story.poll is not None:
         out.poll = story_extras_service.to_poll_out(story.poll, viewer_id)
     if story.question is not None:

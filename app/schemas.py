@@ -13,6 +13,7 @@ from app.models import (
     MembershipInterval,
     MembershipStatus,
     NotificationType,
+    TagPermission,
     OTPChannel,
     OTPPurpose,
     PaymentProvider,
@@ -626,6 +627,9 @@ class StoryOut(BaseModel):
     my_reaction: str | None = None
     location: LocationOut | None = None
     mentions: "list[StoryMentionOut]" = []
+    # Tap-to-tag bubbles (POST /api/stories/{id}/tags) — approved tags only.
+    tags_count: int = 0
+    tags: "list[StoryTagOut]" = []
     poll: "StoryPollOut | None" = None
     question: "StoryQuestionOut | None" = None
     close_friends_only: bool = False
@@ -889,6 +893,9 @@ class PostTagOut(BaseModel):
     x_position: float | None
     y_position: float | None
     tagged_at: datetime
+    # False = waiting on the tagged user's approval; only the content owner
+    # and the tagged user are ever shown such a tag.
+    is_approved: bool = True
 
     class Config:
         from_attributes = True
@@ -905,6 +912,7 @@ class ReelTagOut(BaseModel):
     x_position: float | None
     y_position: float | None
     tagged_at: datetime
+    is_approved: bool = True
 
     class Config:
         from_attributes = True
@@ -913,6 +921,23 @@ class ReelTagOut(BaseModel):
 class ReelTagsResponse(BaseModel):
     message: str
     tags: list[ReelTagOut]
+
+
+class StoryTagOut(BaseModel):
+    id: int
+    user: UserSummaryOut
+    x_position: float | None
+    y_position: float | None
+    tagged_at: datetime
+    is_approved: bool = True
+
+    class Config:
+        from_attributes = True
+
+
+class StoryTagsResponse(BaseModel):
+    message: str
+    tags: list[StoryTagOut]
 
 
 class PostMemberAddRequest(BaseModel):
@@ -1026,6 +1051,58 @@ class PaginatedReelDetailResponse(BaseModel):
     limit: int
     offset: int
     items: list[ReelDetailOut]
+
+
+# ---- Tag controls, tagged feed, pending tags ----
+
+class TagSettingsOut(BaseModel):
+    approve_tags_manually: bool = False
+    allow_tags_from: TagPermission = TagPermission.everyone
+
+
+class TagSettingsUpdate(BaseModel):
+    """PUT /api/tags/settings — send only what you want to change."""
+    approve_tags_manually: bool | None = None
+    allow_tags_from: TagPermission | None = None
+
+    @model_validator(mode="after")
+    def at_least_one(self):
+        if self.approve_tags_manually is None and self.allow_tags_from is None:
+            raise ValueError("Send approve_tags_manually and/or allow_tags_from")
+        return self
+
+
+class TaggedItemOut(BaseModel):
+    """One entry in a user's Tagged tab: exactly one of `post` / `reel` is set,
+    matching `content_type`."""
+    content_type: str
+    tagged_at: datetime
+    post: PostDetailOut | None = None
+    reel: ReelDetailOut | None = None
+
+
+class PaginatedTaggedResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[TaggedItemOut]
+
+
+class PendingTagOut(BaseModel):
+    """A tag waiting on the caller's approval. `owner` is who tagged them
+    (tags are owner-made)."""
+    content_type: str
+    content_id: int
+    owner: UserSummaryOut
+    preview_url: str | None = None
+    tagged_at: datetime
+
+
+class PaginatedPendingTagsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[PendingTagOut]
 
 
 class VideoMetadataUpdate(BaseModel):

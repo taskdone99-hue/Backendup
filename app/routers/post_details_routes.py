@@ -14,7 +14,9 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app import models, schemas
-from app.auth import get_current_user
+from app.auth import get_current_user, get_current_user_optional
+from app.routers.content_routes import _require_author_visible
+from app.services import tag_service
 from app.services.location_service import find_or_create_location
 
 router = APIRouter(prefix="/api/posts", tags=["post-details"])
@@ -39,6 +41,7 @@ def _get_owned_post_or_404(db: Session, post_id: int, current_user: models.User)
 
 
 def _all_tags(db: Session, post_id: int) -> list[models.PostTag]:
+    """Every tag incl. pending ones — only for the post owner's own view."""
     return (
         db.query(models.PostTag)
         .filter(models.PostTag.post_id == post_id)
@@ -63,50 +66,41 @@ def _all_members(db: Session, post_id: int) -> list[models.PostMember]:
 @router.post(
     "/{post_id}/tags", response_model=schemas.PostTagsResponse, status_code=status.HTTP_201_CREATED
 )
-def tag_people(
+async def tag_people(
     post_id: int,
     payload: schemas.TagPeopleRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """Tag people on your post. All-or-nothing: 404 for an unknown user, 403
+    if any of them can't be tagged (blocked either way, their "who can tag
+    me" setting, or they couldn't see this post anyway). Users with "approve
+    tags manually" on get a pending tag (`is_approved: false`) and a
+    `tag_request` notification; everyone else a live tag and a `tag` one."""
     post = _get_owned_post_or_404(db, post_id, current_user)
 
-    user_ids = [t.user_id for t in payload.tags]
-    found_ids = {
-        u.id for u in db.query(models.User.id).filter(models.User.id.in_(user_ids)).all()
-    }
-    missing = [uid for uid in user_ids if uid not in found_ids]
-    if missing:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User(s) not found: {', '.join(str(m) for m in missing)}",
-        )
-
-    already_tagged = {
-        t.user_id
-        for t in db.query(models.PostTag.user_id)
-        .filter(models.PostTag.post_id == post_id, models.PostTag.user_id.in_(user_ids))
-        .all()
-    }
-
-    for tag in payload.tags:
-        if tag.user_id in already_tagged:
-            continue
-        db.add(models.PostTag(
-            post_id=post.id,
-            user_id=tag.user_id,
-            x_position=tag.x_position,
-            y_position=tag.y_position,
-        ))
+    created = tag_service.add_tags(
+        db, "post", post, current_user,
+        [(t.user_id, t.x_position, t.y_position) for t in payload.tags],
+    )
     db.commit()
+    await tag_service.notify_new_tags(db, "post", post.id, current_user, created)
 
     return schemas.PostTagsResponse(message="Tagged", tags=_all_tags(db, post_id))
 
 
 @router.get("/{post_id}/tags", response_model=schemas.PostTagsResponse)
-def get_tags(post_id: int, db: Session = Depends(get_db)):
-    _get_post_or_404(db, post_id)
-    return schemas.PostTagsResponse(message="", tags=_all_tags(db, post_id))
+def get_tags(
+    post_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
+    post = _get_post_or_404(db, post_id)
+    viewer_id = current_user.id if current_user else None
+    _require_author_visible(db, post.user, viewer_id)
+    return schemas.PostTagsResponse(
+        message="", tags=tag_service.visible_tags(db, "post", post, viewer_id)
+    )
 
 
 @router.delete("/{post_id}/tags/{user_id}", response_model=schemas.MessageResponse)

@@ -16,6 +16,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql import expression
 
 from app.database import Base
 
@@ -92,7 +93,19 @@ class NotificationType(str, enum.Enum):
     brand_collaboration_offer = "brand_collaboration_offer"
     brand_collaboration_accepted = "brand_collaboration_accepted"
     brand_collaboration_rejected = "brand_collaboration_rejected"
+    # Someone tagged you in a post/reel/story ("tag"), or wants to and is
+    # waiting on your approval because you have "approve tags manually" on
+    # ("tag_request") — see app/services/tag_service.py.
+    tag = "tag"
+    tag_request = "tag_request"
     other = "other"
+
+
+class TagPermission(str, enum.Enum):
+    """Who is allowed to tag a user — models.UserTagSettings.allow_tags_from."""
+    everyone = "everyone"
+    following = "following"  # only people this user follows
+    no_one = "no_one"
 
 
 class MembershipInterval(str, enum.Enum):
@@ -516,6 +529,13 @@ class PostTag(Base):
     x_position = Column(Float, nullable=True)
     y_position = Column(Float, nullable=True)
     tagged_at = Column(DateTime(timezone=True), server_default=func.now())
+    # False while waiting on the tagged user's approval (they have "approve
+    # tags manually" on) — a pending tag isn't shown on the post to anyone but
+    # the owner and the tagged user. Existing rows read as approved.
+    is_approved = Column(Boolean, default=True, nullable=False, server_default=expression.true())
+    # The tagged user hid this from their profile's Tagged tab; the tag itself
+    # stays on the post.
+    hidden_from_profile = Column(Boolean, default=False, nullable=False, server_default=expression.false())
 
     post = relationship("Post", back_populates="tag_rows")
     user = relationship("User", foreign_keys=[user_id])
@@ -623,9 +643,52 @@ class ReelTag(Base):
     x_position = Column(Float, nullable=True)
     y_position = Column(Float, nullable=True)
     tagged_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Same meaning as PostTag.is_approved / hidden_from_profile.
+    is_approved = Column(Boolean, default=True, nullable=False, server_default=expression.true())
+    hidden_from_profile = Column(Boolean, default=False, nullable=False, server_default=expression.false())
 
     reel = relationship("Reel", foreign_keys=[reel_id])
     user = relationship("User", foreign_keys=[user_id])
+
+
+class StoryTag(Base):
+    """A user tagged on a story with a tap-to-tag bubble (position optional,
+    same 0.0-1.0 convention as PostTag). Distinct from StoryMention, which is
+    an @mention parsed out of the story caption. Rows go away with the story
+    (ORM cascade on Story.tag_rows)."""
+
+    __tablename__ = "story_tags"
+    __table_args__ = (
+        UniqueConstraint("story_id", "user_id", name="uq_story_tag"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    story_id = Column(Integer, ForeignKey("stories.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    x_position = Column(Float, nullable=True)
+    y_position = Column(Float, nullable=True)
+    tagged_at = Column(DateTime(timezone=True), server_default=func.now())
+    is_approved = Column(Boolean, default=True, nullable=False, server_default=expression.true())
+    hidden_from_profile = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+
+    story = relationship("Story", back_populates="tag_rows")
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class UserTagSettings(Base):
+    """Per-user tag controls (GET/PUT /api/tags/settings). No row = defaults:
+    anyone can tag you and tags go live without approval. Created lazily on
+    first update, same pattern as NotificationPreference."""
+
+    __tablename__ = "user_tag_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    approve_tags_manually = Column(Boolean, default=False, nullable=False)
+    allow_tags_from = Column(
+        Enum(TagPermission), default=TagPermission.everyone, nullable=False
+    )
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class ReelRevenueShare(Base):
@@ -967,6 +1030,7 @@ class Story(Base):
     reactions = relationship("StoryReaction", back_populates="story", cascade="all, delete-orphan")
     location = relationship("Location", foreign_keys=[location_id])
     mentions = relationship("StoryMention", back_populates="story", cascade="all, delete-orphan")
+    tag_rows = relationship("StoryTag", back_populates="story", cascade="all, delete-orphan")
     poll = relationship(
         "StoryPoll", back_populates="story", uselist=False, cascade="all, delete-orphan"
     )

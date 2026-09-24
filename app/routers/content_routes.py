@@ -8,6 +8,7 @@ app has a rom asingle video-content type).
 """
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import and_, func, or_
@@ -24,7 +25,7 @@ from app.services.media_service import (
     get_video_duration,
     save_upload_file,
 )
-from app.services import engagement
+from app.services import engagement, tag_service
 from app.services.location_service import resolve_location_from_form, find_or_create_location
 from app.services.hashtag_service import extract_hashtags, sync_post_hashtags
 from app.services.mention_service import sync_mentions
@@ -85,16 +86,13 @@ def _to_post_detail(
             latitude=post.location_latitude,
             longitude=post.location_longitude,
         )
-    detail.tags_count = (
-        db.query(models.PostTag).filter(models.PostTag.post_id == post.id).count()
-    )
+    # Pending (not-yet-approved) tags aren't on the post yet — see tag_service.
+    post_tags = tag_service.approved_tags(db, "post", post.id)
+    detail.tags_count = len(post_tags)
     detail.members_count = (
         db.query(models.PostMember).filter(models.PostMember.post_id == post.id).count()
     )
-    detail.tags = [
-        schemas.UserSummaryOut.model_validate(t.user)
-        for t in db.query(models.PostTag).filter(models.PostTag.post_id == post.id).all()
-    ]
+    detail.tags = [schemas.UserSummaryOut.model_validate(t.user) for t in post_tags]
     detail.members = [
         schemas.UserSummaryOut.model_validate(m.user)
         for m in db.query(models.PostMember).filter(models.PostMember.post_id == post.id).all()
@@ -102,28 +100,26 @@ def _to_post_detail(
     return detail
 
 
-def _replace_post_tags(db: Session, post: models.Post, user_ids: list[int]) -> None:
-    """Full replace: tags the given users, untags anyone left off the list."""
-    user_ids = list(dict.fromkeys(user_ids))  # de-dupe, keep order
-    if user_ids:
-        found = db.query(models.User.id).filter(models.User.id.in_(user_ids)).all()
-        found_ids = {row[0] for row in found}
-        missing = set(user_ids) - found_ids
-        if missing:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User id(s) not found: {sorted(missing)}",
-            )
+def _parse_ids(raw: str | None, field_name: str) -> list[int]:
+    """Multipart form fields can't carry lists, so ids arrive as "12,15,20"."""
+    if not raw or not raw.strip():
+        return []
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must be comma-separated integers, e.g. '12,15,20'",
+        )
 
-    existing = {
-        t.user_id: t
-        for t in db.query(models.PostTag).filter(models.PostTag.post_id == post.id).all()
-    }
-    for uid in set(existing) - set(user_ids):
-        db.delete(existing[uid])
-    for uid in user_ids:
-        if uid not in existing:
-            db.add(models.PostTag(post_id=post.id, user_id=uid))
+
+def _replace_post_tags(
+    db: Session, post: models.Post, user_ids: list[int], tagger: models.User
+) -> list[models.PostTag]:
+    """Full replace: tags the given users (through the same block / tag
+    setting / visibility checks as POST /api/posts/:id/tags), untags anyone
+    left off the list. Returns newly created tags to notify after commit."""
+    return tag_service.replace_post_tags(db, post, user_ids, tagger)
 
 
 def _replace_post_members(db: Session, post: models.Post, user_ids: list[int]) -> None:
@@ -178,9 +174,7 @@ def _to_reel_detail(
     detail.collaborators = [
         schemas.CollaboratorOut.model_validate(c) for c in reel.collaborators
     ]
-    reel_tags = (
-        db.query(models.ReelTag).filter(models.ReelTag.reel_id == reel.id).all()
-    )
+    reel_tags = tag_service.approved_tags(db, "reel", reel.id)
     detail.tags_count = len(reel_tags)
     detail.tags = [schemas.UserSummaryOut.model_validate(t.user) for t in reel_tags]
     if reel.audio_id and reel.audio is not None:
@@ -319,17 +313,6 @@ async def create_post(
     plain comma-separated strings here rather than JSON arrays (multipart
     can't carry nested types) — e.g. "12,15,20".
     """
-    def _parse_ids(raw: str | None, field_name: str) -> list[int]:
-        if not raw or not raw.strip():
-            return []
-        try:
-            return [int(x.strip()) for x in raw.split(",") if x.strip()]
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{field_name} must be comma-separated integers, e.g. '12,15,20'",
-            )
-
     # Accept either the original single-file field or the new multi-file
     # one, but not neither/both — keeps the multipart contract unambiguous
     # while leaving existing single-`file` clients untouched.
@@ -349,6 +332,13 @@ async def create_post(
 
     tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
     member_ids = _parse_ids(member_user_ids, "member_user_ids")
+    # Reject un-taggable users up front, before any file is saved or the post
+    # row exists — otherwise a 403 here would leave an untagged post behind.
+    # (The post doesn't exist yet, so only its owner matters for the checks.)
+    if tag_ids:
+        tag_service.assert_can_tag(
+            db, current_user, "post", SimpleNamespace(user=current_user), tag_ids
+        )
 
     if location_latitude is not None and not (-90 <= location_latitude <= 90):
         raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
@@ -417,12 +407,12 @@ async def create_post(
             target_id=post.id,
         )
 
-    if tag_ids:
-        _replace_post_tags(db, post, tag_ids)
+    new_tags = _replace_post_tags(db, post, tag_ids, current_user) if tag_ids else []
     if member_ids:
         _replace_post_members(db, post, member_ids)
 
     db.commit()
+    await tag_service.notify_new_tags(db, "post", post.id, current_user, new_tags)
     db.refresh(post)
     return _to_post_detail(db, post, current_user.id)
 
@@ -620,13 +610,15 @@ async def update_post(
             post.location_longitude = loc_row.longitude
             post.location_id = loc_row.id
 
+    new_tags = []
     if updates.get("tag_user_ids") is not None:
-        _replace_post_tags(db, post, updates["tag_user_ids"])
+        new_tags = _replace_post_tags(db, post, updates["tag_user_ids"], current_user)
 
     if updates.get("member_user_ids") is not None:
         _replace_post_members(db, post, updates["member_user_ids"])
 
     db.commit()
+    await tag_service.notify_new_tags(db, "post", post.id, current_user, new_tags)
     db.refresh(post)
     return _to_post_detail(db, post, current_user.id)
 
@@ -823,10 +815,20 @@ async def create_reel(
         description="Optional. Use an existing saved sound (see GET /api/audio/{id}) as this "
         "reel's audio track. Leave unset for a reel with its own original audio."
     ) = None,
+    tag_user_ids: str | None = Form(
+        default=None, description="Comma-separated user ids to tag, e.g. '12,15,20'"
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """
+    `tag_user_ids` tags people as the reel is created (same rules as POST
+    /api/reels/{id}/tags: no blocked users, respects each person's "who can
+    tag me" / approve-manually settings, they get notified). The whole
+    request is rejected up front if anyone can't be tagged, so no reel is
+    created. To place a tag at a position on the video, or to add/remove
+    tags later, use POST/DELETE /api/reels/{id}/tags.
+
     `thumbnail` is optional — send a poster-frame image alongside the video
     in the same multipart request and it's used as thumbnail_url as-is.
     If you don't send one, the backend automatically extracts a frame from
@@ -846,6 +848,14 @@ async def create_reel(
         raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
     if location_longitude is not None and not (-180 <= location_longitude <= 180):
         raise HTTPException(status_code=400, detail="location_longitude must be between -180 and 180")
+
+    tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
+    if tag_ids:
+        # Before anything is saved: the reel doesn't exist yet, so only its
+        # owner matters for the visibility checks.
+        tag_service.assert_can_tag(
+            db, current_user, "reel", SimpleNamespace(user=current_user), tag_ids
+        )
 
     audio = None
     if audio_id is not None:
@@ -917,7 +927,16 @@ async def create_reel(
             target_type="reel",
             target_id=reel.id,
         )
+
+    new_tags = (
+        tag_service.add_tags(
+            db, "reel", reel, current_user, [(uid, None, None) for uid in tag_ids]
+        )
+        if tag_ids
+        else []
+    )
     db.commit()
+    await tag_service.notify_new_tags(db, "reel", reel.id, current_user, new_tags)
 
     return _to_reel_detail(db, reel, current_user.id)
 
@@ -1286,54 +1305,41 @@ def _all_reel_tags(db: Session, reel_id: int) -> list[models.ReelTag]:
 @reels_router.post(
     "/{reel_id}/tags", response_model=schemas.ReelTagsResponse, status_code=status.HTTP_201_CREATED
 )
-def tag_reel_people(
+async def tag_reel_people(
     reel_id: int,
     payload: schemas.TagPeopleRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """Same rules as tagging people on a post — see tag_service."""
     reel = _get_reel_or_404(db, reel_id)
     if reel.user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="You can only tag people on your own reels"
         )
 
-    user_ids = [t.user_id for t in payload.tags]
-    found_ids = {
-        u.id for u in db.query(models.User.id).filter(models.User.id.in_(user_ids)).all()
-    }
-    missing = [uid for uid in user_ids if uid not in found_ids]
-    if missing:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User(s) not found: {', '.join(str(m) for m in missing)}",
-        )
-
-    already_tagged = {
-        t.user_id
-        for t in db.query(models.ReelTag.user_id)
-        .filter(models.ReelTag.reel_id == reel_id, models.ReelTag.user_id.in_(user_ids))
-        .all()
-    }
-
-    for tag in payload.tags:
-        if tag.user_id in already_tagged:
-            continue
-        db.add(models.ReelTag(
-            reel_id=reel.id,
-            user_id=tag.user_id,
-            x_position=tag.x_position,
-            y_position=tag.y_position,
-        ))
+    created = tag_service.add_tags(
+        db, "reel", reel, current_user,
+        [(t.user_id, t.x_position, t.y_position) for t in payload.tags],
+    )
     db.commit()
+    await tag_service.notify_new_tags(db, "reel", reel.id, current_user, created)
 
     return schemas.ReelTagsResponse(message="Tagged", tags=_all_reel_tags(db, reel_id))
 
 
 @reels_router.get("/{reel_id}/tags", response_model=schemas.ReelTagsResponse)
-def get_reel_tags(reel_id: int, db: Session = Depends(get_db)):
-    _get_reel_or_404(db, reel_id)
-    return schemas.ReelTagsResponse(message="", tags=_all_reel_tags(db, reel_id))
+def get_reel_tags(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
+):
+    reel = _get_reel_or_404(db, reel_id)
+    viewer_id = current_user.id if current_user else None
+    _require_author_visible(db, reel.user, viewer_id)
+    return schemas.ReelTagsResponse(
+        message="", tags=tag_service.visible_tags(db, "reel", reel, viewer_id)
+    )
 
 
 @reels_router.delete("/{reel_id}/tags/{user_id}", response_model=schemas.MessageResponse)

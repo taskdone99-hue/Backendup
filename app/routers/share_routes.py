@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app import models, schemas
-from app.auth import get_current_user
+from app.auth import get_current_user, get_current_user_optional
+from app.routers.content_routes import _require_author_visible
 
 router = APIRouter(prefix="/api/share", tags=["share"])
 
@@ -73,9 +74,15 @@ def share_internal(
 def get_share_link(
     post_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    """Generate a shareable deep-link URL for a post."""
-    _get_content_or_404(db, models.ShareContentType.post, post_id)
+    """Generate a shareable link for a post. Opening it in a browser (or a
+    chat app's link preview) is served by GET /p/{id} — see
+    public_share_routes.py. Only handed out for content the caller could
+    open themselves: 403 for a private account they don't follow, 404 if
+    blocked either way."""
+    post = _get_content_or_404(db, models.ShareContentType.post, post_id)
+    _require_author_visible(db, post.user, current_user.id if current_user else None)
 
     base = PUBLIC_BASE_URL or "https://app.example.com"
     return schemas.ShareLinkResponse(post_id=post_id, url=f"{base}/p/{post_id}")
@@ -85,11 +92,14 @@ def get_share_link(
 def get_reel_share_link(
     reel_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User | None = Depends(get_current_user_optional),
 ):
     """Generate a shareable deep-link URL for a reel — the reels page only
     had the post version of this (get_share_link above), so a reel share
-    button had nowhere to fetch its link from."""
-    _get_content_or_404(db, models.ShareContentType.reel, reel_id)
+    button had nowhere to fetch its link from. Same visibility rule as the
+    post version; the link opens GET /r/{id}."""
+    reel = _get_content_or_404(db, models.ShareContentType.reel, reel_id)
+    _require_author_visible(db, reel.user, current_user.id if current_user else None)
 
     base = PUBLIC_BASE_URL or "https://app.example.com"
     return schemas.ReelShareLinkResponse(reel_id=reel_id, url=f"{base}/r/{reel_id}")

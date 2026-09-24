@@ -38,6 +38,8 @@ from app.routers import (
     audio_routes,
     live_routes,
     report_routes,
+    tag_routes,
+    public_share_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -141,6 +143,8 @@ app.include_router(audio_routes.router)
 app.include_router(live_routes.router)
 app.include_router(report_routes.router)
 app.include_router(report_routes.admin_router)
+app.include_router(tag_routes.router)
+app.include_router(public_share_routes.router)
 
 
 @app.get("/")

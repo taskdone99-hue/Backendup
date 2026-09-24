@@ -39,6 +39,9 @@ _PREFERENCE_FIELD_BY_TYPE = {
     models.NotificationType.follow: "follows_enabled",
     models.NotificationType.follow_request: "follows_enabled",
     models.NotificationType.mention: "mentions_enabled",
+    # Being tagged is treated like being mentioned for opt-out purposes.
+    models.NotificationType.tag: "mentions_enabled",
+    models.NotificationType.tag_request: "mentions_enabled",
     models.NotificationType.message: "messages_enabled",
     models.NotificationType.collaboration_request: "collaboration_requests_enabled",
     models.NotificationType.collaboration_accepted: "collaboration_requests_enabled",
