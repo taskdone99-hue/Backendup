@@ -142,6 +142,45 @@ def _get_shareable_reel_or_404(db: Session, reel_id: int, sender_id: int) -> mod
     return reel
 
 
+def _post_visible_to(db: Session, post: models.Post, viewer_id: int | None) -> bool:
+    """Same visibility rule as GET /api/posts/{id} (block either way, or a
+    private account the viewer doesn't follow), as a yes/no — mirrors
+    _reel_visible_to above."""
+    try:
+        _require_author_visible(db, post.user, viewer_id)
+    except HTTPException:
+        return False
+    return True
+
+
+def _build_shared_post_out(
+    db: Session, post_id: int, viewer_id: int | None
+) -> schemas.SharedPostOut:
+    """Preview for a post shared in chat, resolved for one viewer — same
+    is_available fallback as _build_shared_reel_out, for the same reasons."""
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if post is None or not _post_visible_to(db, post, viewer_id):
+        return schemas.SharedPostOut(post_id=post_id, is_available=False)
+    return schemas.SharedPostOut(
+        post_id=post.id,
+        is_available=True,
+        media_url=post.media_url,
+        media_type=post.media_type,
+        caption=post.caption,
+        user=schemas.UserSummaryOut.model_validate(post.user),
+    )
+
+
+def _get_shareable_post_or_404(db: Session, post_id: int, sender_id: int) -> models.Post:
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if post is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
+    # Same visibility rule as reels above — you can only share what you
+    # could open yourself.
+    _require_author_visible(db, post.user, sender_id)
+    return post
+
+
 def _to_message_out(
     db: Session, message: models.Message, viewer_id: int | None = None
 ) -> schemas.MessageOut:
@@ -152,8 +191,11 @@ def _to_message_out(
         out.content = "This message was deleted"
         out.media_url = None
         out.shared_reel_id = None
+        out.shared_post_id = None
     elif message.shared_reel_id is not None:
         out.shared_reel = _build_shared_reel_out(db, message.shared_reel_id, viewer_id)
+    elif message.shared_post_id is not None:
+        out.shared_post = _build_shared_post_out(db, message.shared_post_id, viewer_id)
 
     if message.reply_to_message_id is not None:
         original = (
@@ -169,6 +211,7 @@ def _to_message_out(
                 media_type=original.media_type,
                 is_deleted=original.is_deleted,
                 is_reel_share=original.shared_reel_id is not None and not original.is_deleted,
+                is_post_share=original.shared_post_id is not None and not original.is_deleted,
             )
 
     out.reactions = [
@@ -255,6 +298,92 @@ def _build_intro_message(other_user: models.User) -> str:
 # Conversations
 # ==========================================================================
 
+def _find_existing_direct_conversation(
+    db: Session, user_id: int, other_id: int
+) -> models.Conversation | None:
+    """A 1:1 (non-group) conversation already containing exactly these two
+    people, if one exists."""
+    my_conversation_ids = select(models.ConversationParticipant.conversation_id).where(
+        models.ConversationParticipant.user_id == user_id
+    )
+    candidates = (
+        db.query(models.Conversation)
+        .filter(
+            models.Conversation.is_group.is_(False),
+            models.Conversation.id.in_(my_conversation_ids),
+        )
+        .all()
+    )
+    for conv in candidates:
+        participant_ids = {p.user_id for p in conv.participants}
+        if participant_ids == {user_id, other_id}:
+            return conv
+    return None
+
+
+def get_or_create_direct_conversation(
+    db: Session, current_user: models.User, other_user: models.User
+) -> tuple[models.Conversation, bool]:
+    """Reuses an existing 1:1 thread with `other_user`, or starts one
+    (message-request gating + the other person's auto-intro DM, exactly
+    like POST /conversations below) — factored out so callers that need a
+    conversation to send into, without going through that endpoint, get the
+    same behavior. Used by create_conversation itself for the 1:1 case, and
+    by share_routes.share_internal when sharing a post/reel to someone
+    there's no existing thread with yet. Returns (conversation, is_new)."""
+    if is_blocked(db, current_user.id, other_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Can't message this user"
+        )
+
+    existing = _find_existing_direct_conversation(db, current_user.id, other_user.id)
+    if existing is not None:
+        return existing, False
+
+    conversation = models.Conversation(is_group=False, title=None)
+    db.add(conversation)
+    db.flush()
+
+    # Message requests: for a brand-new 1:1 thread, if the recipient
+    # doesn't already follow the sender, the thread lands in the
+    # recipient's Message Requests (GET /api/chat/requests) instead of
+    # their main inbox until they accept/decline — same as Instagram.
+    recipient_follows_sender = (
+        db.query(models.Follow)
+        .filter(
+            models.Follow.follower_id == other_user.id,
+            models.Follow.following_id == current_user.id,
+        )
+        .first()
+        is not None
+    )
+    recipient_status = (
+        models.ParticipantStatus.accepted if recipient_follows_sender
+        else models.ParticipantStatus.pending
+    )
+    db.add(models.ConversationParticipant(
+        conversation_id=conversation.id, user_id=current_user.id,
+        status=models.ParticipantStatus.accepted,
+    ))
+    db.add(models.ConversationParticipant(
+        conversation_id=conversation.id, user_id=other_user.id, status=recipient_status,
+    ))
+
+    # Brand-new 1:1 thread — send the other person's auto-intro DM, as if
+    # it came from them, before either side has typed anything.
+    intro_text = _build_intro_message(other_user)
+    db.add(models.Message(
+        conversation_id=conversation.id,
+        sender_id=other_user.id,
+        content=intro_text,
+        is_auto_message=True,
+    ))
+
+    db.commit()
+    db.refresh(conversation)
+    return conversation, True
+
+
 @router.post(
     "/conversations", response_model=schemas.ConversationOut, status_code=status.HTTP_201_CREATED
 )
@@ -279,99 +408,44 @@ def create_conversation(
             detail=f"User(s) not found: {', '.join(str(m) for m in missing)}",
         )
 
+    is_group = len(other_ids) > 1
+
+    if not is_group:
+        conversation, is_new = get_or_create_direct_conversation(db, current_user, others[0])
+        out = _to_conversation_out(db, conversation, viewer_id=current_user.id)
+        out.is_new_conversation = is_new
+        out.profile_message = (
+            schemas.ProfileMessageOut(
+                message=_build_intro_message(others[0]),
+                profile_id=others[0].id,
+                account_type=others[0].account_type,
+            )
+            if is_new else None
+        )
+        return out
+
     for uid in other_ids:
         if is_blocked(db, current_user.id, uid):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="Can't message this user"
             )
 
-    is_group = len(other_ids) > 1
-
-    # For a 1:1 chat, reuse an existing conversation between the same two
-    # people instead of creating a duplicate thread every time. Finding one
-    # here IS the "have they ever messaged before?" check — if a thread
-    # already exists (even an empty one), the intro DM has already had its
-    # chance to go out, so it never fires twice.
-    if not is_group:
-        other_id = other_ids[0]
-        my_conversation_ids = select(models.ConversationParticipant.conversation_id).where(
-            models.ConversationParticipant.user_id == current_user.id
-        )
-        candidates = (
-            db.query(models.Conversation)
-            .filter(
-                models.Conversation.is_group.is_(False),
-                models.Conversation.id.in_(my_conversation_ids),
-            )
-            .all()
-        )
-        for conv in candidates:
-            participant_ids = {p.user_id for p in conv.participants}
-            if participant_ids == {current_user.id, other_id}:
-                out = _to_conversation_out(db, conv, viewer_id=current_user.id)
-                out.is_new_conversation = False
-                out.profile_message = None
-                return out
-
-    conversation = models.Conversation(is_group=is_group, title=payload.title if is_group else None)
+    conversation = models.Conversation(is_group=True, title=payload.title)
     db.add(conversation)
     db.flush()
 
-    # Message requests: for a brand-new 1:1 thread, if the recipient
-    # doesn't already follow the sender, the thread lands in the
-    # recipient's Message Requests (GET /api/chat/requests) instead of
-    # their main inbox until they accept/decline — same as Instagram.
-    # Group threads and re-used existing 1:1 threads (handled above,
-    # before this point) are never gated this way.
-    recipient_status = models.ParticipantStatus.accepted
-    if not is_group:
-        recipient_follows_sender = (
-            db.query(models.Follow)
-            .filter(
-                models.Follow.follower_id == other_ids[0],
-                models.Follow.following_id == current_user.id,
-            )
-            .first()
-            is not None
-        )
-        if not recipient_follows_sender:
-            recipient_status = models.ParticipantStatus.pending
-
     all_participant_ids = {current_user.id, *other_ids}
     for uid in all_participant_ids:
-        participant_status = (
-            recipient_status if (uid != current_user.id and not is_group)
-            else models.ParticipantStatus.accepted
-        )
         db.add(models.ConversationParticipant(
-            conversation_id=conversation.id, user_id=uid, status=participant_status
+            conversation_id=conversation.id, user_id=uid, status=models.ParticipantStatus.accepted
         ))
-
-    profile_message_out = None
-    if not is_group:
-        # Brand-new 1:1 thread — send the other person's auto-intro DM,
-        # as if it came from them, before either side has typed anything.
-        other_user = others[0]
-        intro_text = _build_intro_message(other_user)
-        intro = models.Message(
-            conversation_id=conversation.id,
-            sender_id=other_user.id,
-            content=intro_text,
-            is_auto_message=True,
-        )
-        db.add(intro)
-        profile_message_out = schemas.ProfileMessageOut(
-            message=intro_text,
-            profile_id=other_user.id,
-            account_type=other_user.account_type,
-        )
 
     db.commit()
     db.refresh(conversation)
 
     out = _to_conversation_out(db, conversation, viewer_id=current_user.id)
     out.is_new_conversation = True
-    out.profile_message = profile_message_out
+    out.profile_message = None
     return out
 
 
@@ -647,10 +721,10 @@ async def _push_message_event(
     default_out: schemas.MessageOut,
 ) -> None:
     """Send a "message" / "message_edited" socket event. Normally every
-    recipient gets the same payload; a shared reel's preview depends on who's
-    looking, so those are built and sent per recipient."""
+    recipient gets the same payload; a shared reel/post's preview depends on
+    who's looking, so those are built and sent per recipient."""
     base = {"type": event_type, "conversation_id": message.conversation_id}
-    if message.shared_reel_id is None:
+    if message.shared_reel_id is None and message.shared_post_id is None:
         await manager.send_to_users(
             recipient_ids, {**base, "message": default_out.model_dump(mode="json")}
         )
@@ -738,6 +812,9 @@ async def send_message(
     if payload.shared_reel_id is not None:
         # Share a reel as a card (optionally with a note in `content`).
         _get_shareable_reel_or_404(db, payload.shared_reel_id, current_user.id)
+    elif payload.shared_post_id is not None:
+        # Share a post as a card (optionally with a note in `content`).
+        _get_shareable_post_or_404(db, payload.shared_post_id, current_user.id)
 
     message = models.Message(
         conversation_id=conversation_id,
@@ -745,8 +822,14 @@ async def send_message(
         content=payload.content,
         reply_to_message_id=reply_to_id,
         shared_reel_id=payload.shared_reel_id,
+        shared_post_id=payload.shared_post_id,
     )
-    text = payload.content or "Sent a reel"
+    default_preview = (
+        "Sent a reel" if payload.shared_reel_id is not None
+        else "Sent a post" if payload.shared_post_id is not None
+        else ""
+    )
+    text = payload.content or default_preview
     preview = text if len(text) <= 80 else text[:77] + "..."
     return await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
 

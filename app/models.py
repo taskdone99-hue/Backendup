@@ -1401,6 +1401,11 @@ class Message(Base):
     # Instead the message keeps its id and the API reports the reel as
     # unavailable once it's gone (see chat_routes._build_shared_reel_out).
     shared_reel_id = Column(Integer, nullable=True, index=True)
+    # Same idea as shared_reel_id above, but for a shared post (Instagram's
+    # "Send" on a feed post, instead of a reel). Also deliberately not a
+    # ForeignKey, same reasoning. Only one of shared_reel_id / shared_post_id
+    # is ever set on a given message — enforced in schemas.MessageCreate.
+    shared_post_id = Column(Integer, nullable=True, index=True)
     # True for the one-time auto-intro DM sent on a brand-new 1:1
     # conversation (see chat_routes.create_conversation) — lets a client
     # style/skip it differently from a message the sender actually typed.

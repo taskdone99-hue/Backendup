@@ -1415,23 +1415,45 @@ class AddToCollectionRequest(BaseModel):
 # ==========================================================================
 
 class InternalShareRequest(BaseModel):
+    """Instagram-style Share sheet: send a post or reel into chat as a rich
+    preview card (never a raw link). `recipient_ids` are people — a direct
+    (1:1) conversation is reused if one already exists, or started fresh
+    otherwise, same as tapping a person's name in the Share sheet.
+    `conversation_ids` are existing threads (including group chats) to send
+    the same share into directly, for picking a group from the sheet.
+    At least one of the two is required; a single request can target both
+    at once (Instagram lets you multi-select people and groups together)."""
     content_type: ShareContentType
     content_id: int = Field(..., gt=0)
-    recipient_ids: list[int] = Field(..., min_length=1, description="User ids to share with")
+    recipient_ids: list[int] = Field(
+        default_factory=list, description="User ids to send a 1:1 share to"
+    )
+    conversation_ids: list[int] = Field(
+        default_factory=list, description="Existing conversation ids (1:1 or group) to share into"
+    )
     message: str | None = Field(default=None, max_length=500)
 
     @field_validator("recipient_ids")
     @classmethod
     def dedupe_recipients(cls, v: list[int]) -> list[int]:
-        deduped = list(dict.fromkeys(v))
-        if not deduped:
-            raise ValueError("At least one recipient is required")
-        return deduped
+        return list(dict.fromkeys(v))
+
+    @field_validator("conversation_ids")
+    @classmethod
+    def dedupe_conversations(cls, v: list[int]) -> list[int]:
+        return list(dict.fromkeys(v))
 
     @field_validator("message")
     @classmethod
     def strip_message(cls, v: str | None) -> str | None:
-        return v.strip() if v is not None else v
+        v = v.strip() if v is not None else v
+        return v or None
+
+    @model_validator(mode="after")
+    def require_a_target(self):
+        if not self.recipient_ids and not self.conversation_ids:
+            raise ValueError("At least one recipient or conversation is required")
+        return self
 
 
 class ShareOut(BaseModel):
@@ -1450,6 +1472,10 @@ class ShareOut(BaseModel):
 class InternalShareResponse(BaseModel):
     message: str
     shares: list[ShareOut]
+    # The chat message actually created in each target conversation (one
+    # per recipient/conversation) — the rich preview card the recipient(s)
+    # see, same shape as any other chat message.
+    messages: list["MessageOut"]
 
 
 class ShareLinkResponse(BaseModel):
@@ -1510,14 +1536,19 @@ class ConversationCreate(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    """Text message, or a shared reel. With `shared_reel_id`, `content` is an
-    optional note sent alongside the reel; without it, `content` is required."""
+    """Text message, or a shared reel/post. With `shared_reel_id` or
+    `shared_post_id`, `content` is an optional note sent alongside the
+    share; without either, `content` is required. Only one of the two
+    share ids may be set on a given message."""
     content: str | None = Field(default=None, min_length=1, max_length=2200)
     reply_to_message_id: int | None = Field(
         default=None, gt=0, description="Reply to another message in this conversation"
     )
     shared_reel_id: int | None = Field(
         default=None, gt=0, description="Share this reel into the conversation"
+    )
+    shared_post_id: int | None = Field(
+        default=None, gt=0, description="Share this post into the conversation"
     )
 
     @field_validator("content")
@@ -1528,9 +1559,11 @@ class MessageCreate(BaseModel):
         return v.strip() or None
 
     @model_validator(mode="after")
-    def require_content_or_reel(self):
-        if self.content is None and self.shared_reel_id is None:
+    def require_content_or_share(self):
+        if self.content is None and self.shared_reel_id is None and self.shared_post_id is None:
             raise ValueError("Message can't be empty")
+        if self.shared_reel_id is not None and self.shared_post_id is not None:
+            raise ValueError("A message can only share one reel or post, not both")
         return self
 
 
@@ -1580,6 +1613,19 @@ class SharedReelOut(BaseModel):
     user: UserSummaryOut | None = None
 
 
+class SharedPostOut(BaseModel):
+    """Preview card for a post shared in chat, resolved per viewer — same
+    is_available/visibility semantics as SharedReelOut (deleted post, or a
+    private/blocked author, both come back unavailable). Full detail is
+    GET /api/posts/{post_id}."""
+    post_id: int
+    is_available: bool = True
+    media_url: str | None = None
+    media_type: MediaType | None = None
+    caption: str | None = None
+    user: UserSummaryOut | None = None
+
+
 class MessageOut(BaseModel):
     id: int
     conversation_id: int
@@ -1590,10 +1636,13 @@ class MessageOut(BaseModel):
     reply_to_message_id: int | None = None
     reply_to: "MessageRepliedToOut | None" = None
     reply_to_story_id: int | None = None
-    # Non-null `shared_reel` means this message is a shared reel; `content`
-    # is then just the optional note.
+    # Non-null `shared_reel`/`shared_post` means this message is a shared
+    # reel/post (mutually exclusive); `content` is then just the optional
+    # note.
     shared_reel_id: int | None = None
     shared_reel: SharedReelOut | None = None
+    shared_post_id: int | None = None
+    shared_post: SharedPostOut | None = None
     is_auto_message: bool = False
     edited_at: datetime | None = None
     is_deleted: bool = False
@@ -2165,6 +2214,7 @@ class MessageRepliedToOut(BaseModel):
     media_type: MediaType | None
     is_deleted: bool
     is_reel_share: bool = False
+    is_post_share: bool = False
 
     class Config:
         from_attributes = True

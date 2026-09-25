@@ -147,6 +147,18 @@ def make_reel(db):
 
 
 @pytest.fixture()
+def make_post(db):
+    def _make(owner, caption="hello", media_url="/static/posts/a.jpg", **kwargs):
+        post = models.Post(user_id=owner.id, media_url=media_url, caption=caption, **kwargs)
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+        return post
+
+    return _make
+
+
+@pytest.fixture()
 def follow(db):
     def _follow(follower, following):
         db.add(models.Follow(follower_id=follower.id, following_id=following.id))
