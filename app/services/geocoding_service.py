@@ -9,7 +9,12 @@ Providers (chosen with the GEOCODING_PROVIDER env var):
              server (nominatim.openstreetmap.org) has a usage policy of
              max ~1 request/second and no heavy autocomplete traffic — fine
              for development, but for production point NOMINATIM_BASE_URL at
-             a self-hosted or paid Nominatim-compatible service.
+             a self-hosted or paid Nominatim-compatible service. Set
+             NOMINATIM_EMAIL to an identifying contact address (optional,
+             sent as the `email` param) — the public instance's own policy
+             asks for this so they can reach out instead of silently
+             blocking traffic, which is a common real-world cause of empty
+             results/errors from a cloud server IP with no other symptom.
   google     Google Places API (New) Text Search for place search, and the
              Geocoding API for reverse geocoding. Needs GOOGLE_MAPS_API_KEY
              with both APIs enabled.
@@ -170,6 +175,15 @@ def _nominatim_base() -> str:
     return os.getenv("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org").rstrip("/")
 
 
+def _nominatim_email() -> str | None:
+    # Nominatim's usage policy (https://operations.osmfoundation.org/policies/nominatim/)
+    # asks for an identifying contact so they can reach out instead of
+    # silently blocking a misbehaving client — a big real-world cause of
+    # "the provider returns nothing" for the public instance, especially
+    # from a cloud/datacenter IP. Optional: only sent if configured.
+    return os.getenv("NOMINATIM_EMAIL", "").strip() or None
+
+
 def _nominatim_headers() -> dict:
     # Nominatim's usage policy requires an identifying User-Agent.
     return {
@@ -225,6 +239,9 @@ def _nominatim_search(query, latitude, longitude, limit) -> list[Place]:
             f"{longitude - 0.5},{latitude + 0.5},{longitude + 0.5},{latitude - 0.5}"
         )
         params["bounded"] = 0
+    email = _nominatim_email()
+    if email:
+        params["email"] = email
     data = _request_json(
         "GET", f"{_nominatim_base()}/search",
         provider="nominatim", params=params, headers=_nominatim_headers(),
@@ -238,11 +255,14 @@ def _nominatim_search(query, latitude, longitude, limit) -> list[Place]:
 
 
 def _nominatim_reverse(latitude, longitude) -> Place | None:
+    params = {"lat": latitude, "lon": longitude, "format": "jsonv2", "addressdetails": 1, "zoom": 18}
+    email = _nominatim_email()
+    if email:
+        params["email"] = email
     data = _request_json(
         "GET", f"{_nominatim_base()}/reverse",
         provider="nominatim",
-        params={"lat": latitude, "lon": longitude, "format": "jsonv2",
-                "addressdetails": 1, "zoom": 18},
+        params=params,
         headers=_nominatim_headers(),
     )
     if not isinstance(data, dict):
