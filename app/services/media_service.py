@@ -23,7 +23,7 @@ logger = logging.getLogger("media_service")
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
 
 # Keep uploads modest — these are avatars/posts/reels/stories, not raw video masters.
-MAX_IMAGE_BYTES = 10 * 1024 * 1024   # 10 MB
+MAX_IMAGE_BYTES = 50 * 1024 * 1024   # 50 MB
 MAX_VIDEO_BYTES = 100 * 1024 * 1024  # 100 MB
 MAX_AUDIO_BYTES = 25 * 1024 * 1024   # 25 MB — voice notes, not music tracks
 
