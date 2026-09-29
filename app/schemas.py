@@ -2057,6 +2057,7 @@ class SearchAllResult(BaseModel):
     users: list[SearchUserOut]
     songs: list[SearchSongOut]
     locations: list[LocationOut]
+    hashtags: list[HashtagOut]
 
 
 class PaginatedSearchUsersResponse(BaseModel):

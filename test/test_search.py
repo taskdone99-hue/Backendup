@@ -131,7 +131,26 @@ def seeded_data():
     loc2 = models.Location(name="Gateway of India", city="Mumbai", country="India")
     db.add_all([loc1, loc2])
 
+    # Hashtags. "anjali_wedding" vs "anjalixwedding" exist to prove '_' in a
+    # query is matched literally rather than acting as a LIKE wildcard.
+    tag_anjali = models.Hashtag(name="anjali")
+    tag_wedding = models.Hashtag(name="anjali_wedding")
+    tag_lookalike = models.Hashtag(name="anjalixwedding")
+    tag_food = models.Hashtag(name="hyderabadfood")
+    db.add_all([tag_anjali, tag_wedding, tag_lookalike, tag_food])
     db.commit()
+
+    post1 = models.Post(user_id=anjali.id, media_url="/static/posts/1.jpg", caption="#anjali")
+    post2 = models.Post(user_id=rahul.id, media_url="/static/posts/2.jpg", caption="#anjali #anjali_wedding")
+    db.add_all([post1, post2])
+    db.commit()
+    db.add_all([
+        models.PostHashtag(post_id=post1.id, hashtag_id=tag_anjali.id),
+        models.PostHashtag(post_id=post2.id, hashtag_id=tag_anjali.id),
+        models.PostHashtag(post_id=post2.id, hashtag_id=tag_wedding.id),
+    ])
+    db.commit()
+
     ids = {
         "searcher": searcher.id,
         "anjali": anjali.id,
@@ -216,7 +235,7 @@ def test_search_all_returns_grouped_results(seeded_data):
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body.keys()) == {"users", "songs", "locations"}
+    assert set(body.keys()) == {"users", "songs", "locations", "hashtags"}
     # "rahul" matches the user rahul99 and the song artist "Rahul Sipligunj"
     assert any(u["username"] == "rahul99" for u in body["users"])
     assert any(s["artist"] == "Rahul Sipligunj" for s in body["songs"])
@@ -242,3 +261,84 @@ def test_search_pagination(seeded_data):
     body = resp.json()
     assert body["limit"] == 1
     assert len(body["items"]) <= 1
+
+
+# ---------------------------------------------------------------- hashtags
+
+def _search(seeded_data, **params):
+    return client.get(
+        "/api/search", params=params, headers=_auth_headers(seeded_data["searcher"])
+    )
+
+
+def test_search_all_for_anjali_returns_every_group(seeded_data):
+    """The exact request that was returning HTTP 500 in production."""
+    resp = _search(seeded_data, q="anjali")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body.keys()) == {"users", "songs", "locations", "hashtags"}
+    assert [u["username"] for u in body["users"]] == ["anjali_r"]
+    assert body["songs"] == [] and body["locations"] == []
+    assert {h["name"] for h in body["hashtags"]} == {"anjali", "anjali_wedding", "anjalixwedding"}
+
+
+def test_search_all_keeps_users_songs_and_locations_alongside_hashtags(seeded_data):
+    resp = _search(seeded_data, q="rahul")
+    body = resp.json()
+    assert any(u["username"] == "rahul99" for u in body["users"])
+    assert any(s["artist"] == "Rahul Sipligunj" for s in body["songs"])
+    assert body["hashtags"] == []
+
+    resp = _search(seeded_data, q="hyderabad")
+    body = resp.json()
+    assert any(loc["name"] == "Charminar" for loc in body["locations"])
+    assert [h["name"] for h in body["hashtags"]] == ["hyderabadfood"]
+
+
+def test_search_hashtags_type_is_paginated_with_post_counts(seeded_data):
+    resp = _search(seeded_data, q="anjali", type="hashtags")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3 and body["limit"] == 10 and body["offset"] == 0
+    counts = {h["name"]: h["posts_count"] for h in body["items"]}
+    assert counts == {"anjali": 2, "anjali_wedding": 1, "anjalixwedding": 0}
+    # Same item shape as GET /api/hashtags/{name}: exactly name + posts_count.
+    assert all(set(h.keys()) == {"name", "posts_count"} for h in body["items"])
+
+
+def test_search_hashtags_ignores_leading_hash_and_case(seeded_data):
+    plain = _search(seeded_data, q="anjali", type="hashtags").json()
+    hashed = _search(seeded_data, q="#Anjali", type="hashtags").json()
+    assert hashed == plain
+
+
+def test_search_hashtags_pagination(seeded_data):
+    first = _search(seeded_data, q="anjali", type="hashtags", limit=2, offset=0).json()
+    second = _search(seeded_data, q="anjali", type="hashtags", limit=2, offset=2).json()
+    assert first["total"] == second["total"] == 3
+    assert len(first["items"]) == 2 and len(second["items"]) == 1
+    names = [h["name"] for h in first["items"] + second["items"]]
+    assert names == sorted(names) and len(set(names)) == 3
+
+
+def test_search_all_hashtags_group_is_capped_to_limit(seeded_data):
+    body = _search(seeded_data, q="anjali", limit=1).json()
+    assert len(body["hashtags"]) == 1
+
+
+def test_search_hashtags_underscore_and_percent_are_literal(seeded_data):
+    # '_' is a LIKE wildcard unless escaped: "anjali_" must NOT match "anjalixwedding".
+    body = _search(seeded_data, q="anjali_", type="hashtags").json()
+    assert [h["name"] for h in body["items"]] == ["anjali_wedding"]
+    # '%' must not turn into match-everything.
+    assert _search(seeded_data, q="%", type="hashtags").json()["total"] == 0
+
+
+def test_search_hashtags_bare_hash_matches_nothing(seeded_data):
+    body = _search(seeded_data, q="#", type="hashtags").json()
+    assert body["total"] == 0 and body["items"] == []
+    assert _search(seeded_data, q="#").json()["hashtags"] == []
+
+
+def test_search_rejects_unknown_type(seeded_data):
+    assert _search(seeded_data, q="anjali", type="bogus").status_code == 400
