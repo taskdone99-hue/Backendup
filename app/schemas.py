@@ -5,6 +5,8 @@ from datetime import date, datetime
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.services import admob_service
+
 from app.models import (
     DevicePlatform,
     Gender,
@@ -1872,27 +1874,54 @@ class DiscordWebhookResponse(BaseModel):
 # Ads
 # ==========================================================================
 
-class AdImpressionRequest(BaseModel):
-    ad_id: str = Field(..., min_length=1, max_length=100)
-    placement: str | None = Field(default=None, max_length=50)
+class AdEventRequest(BaseModel):
+    """Body for POST /api/ads/impression and /api/ads/click."""
+
+    placement: str = Field(..., max_length=50)
+    platform: str | None = Field(default=None, max_length=10)
+    ad_unit_id: str | None = Field(default=None, max_length=100)
+    ad_id: str | None = Field(default=None, max_length=100)
+
+    @field_validator("placement")
+    @classmethod
+    def _valid_placement(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in admob_service.PLACEMENTS:
+            raise ValueError(
+                "Invalid placement. Must be one of: " + ", ".join(admob_service.PLACEMENTS)
+            )
+        return v
+
+    @field_validator("platform")
+    @classmethod
+    def _valid_platform(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if v not in admob_service.PLATFORMS:
+            raise ValueError("Invalid platform. Must be one of: " + ", ".join(admob_service.PLATFORMS))
+        return v
 
 
-class AdImpressionResponse(BaseModel):
+class AdEventResponse(BaseModel):
     message: str
-    ad_id: str
-    placement: str | None
-
-
-class AdSlotOut(BaseModel):
     placement: str
+    platform: str | None = None
+    ad_unit_id: str | None = None
+    ad_id: str | None = None
+
+
+class AdMobPlacementConfig(BaseModel):
     enabled: bool
-    frequency: int  # show one ad every N feed/reel items in this placement
+    ad_format: str  # native | banner | interstitial | app_open
+    ad_unit_id: str | None
 
 
-class AdConfigResponse(BaseModel):
-    ad_network: str | None
-    test_mode: bool
-    slots: list[AdSlotOut]
+class AdMobConfigResponse(BaseModel):
+    enabled: bool
+    platform: str
+    app_id: str | None
+    placements: dict[str, AdMobPlacementConfig]
 
 
 # ==========================================================================

@@ -1740,14 +1740,37 @@ class BrandCollaboration(Base):
 # ==========================================================================
 
 class AdImpression(Base):
-    """One recorded ad view/impression, used for basic delivery analytics."""
+    """One recorded ad impression, used for backend delivery analytics only.
+
+    Ads are served client-side by Google AdMob; this table never stores
+    revenue/earnings (AdMob reports those itself). `ad_id` is an optional
+    client-supplied identifier and `ad_unit_id` the AdMob unit that rendered.
+    """
 
     __tablename__ = "ad_impressions"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    ad_id = Column(String(100), nullable=False, index=True)
-    placement = Column(String(50), nullable=True)
+    ad_id = Column(String(100), nullable=True, index=True)
+    placement = Column(String(50), nullable=True, index=True)
+    platform = Column(String(10), nullable=True)
+    ad_unit_id = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+class AdClick(Base):
+    """One recorded ad click. Same shape as AdImpression, analytics only."""
+
+    __tablename__ = "ad_clicks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    ad_id = Column(String(100), nullable=True, index=True)
+    placement = Column(String(50), nullable=True, index=True)
+    platform = Column(String(10), nullable=True)
+    ad_unit_id = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", foreign_keys=[user_id])
