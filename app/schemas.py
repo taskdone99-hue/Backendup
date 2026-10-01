@@ -1,6 +1,7 @@
 import os
 import re
 from datetime import date, datetime
+from typing import Any
 
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -655,6 +656,30 @@ class StoryDraftOut(BaseModel):
     caption: str | None
     location: LocationOut | None = None
     close_friends_only: bool
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Opaque JSON object saved by the story editor so the draft can be "
+            "reopened exactly as it was left (background, media shape, text "
+            "layers, positions, effects, stickers, filters, ...). Stored and "
+            "returned verbatim - the server never interprets or reshapes it. "
+            "`null` for drafts that have no editor state (including every "
+            "draft created before this field existed)."
+        ),
+        examples=[
+            {
+                "version": 1,
+                "background": {"type": "gradient", "colors": ["#833ab4", "#fd1d1d"]},
+                "media": {"shape": "rounded", "x": 0.5, "y": 0.45, "scale": 0.9, "rotation": 0},
+                "texts": [
+                    {"text": "Hello", "x": 0.5, "y": 0.2, "font": "classic", "color": "#ffffff"}
+                ],
+                "stickers": [{"type": "emoji", "value": "🔥", "x": 0.8, "y": 0.7, "scale": 1.2}],
+                "filter": {"name": "warm", "intensity": 0.6},
+                "effects": [],
+            }
+        ],
+    )
     created_at: datetime
     updated_at: datetime
 

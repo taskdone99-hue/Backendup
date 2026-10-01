@@ -56,6 +56,7 @@ from app.routers import (
 #   python -m app.add_dm_media_and_request_columns   (adds media/reply/request columns to messages + conversation_participants)
 #   python -m app.add_post_media_caption_column      (adds per-photo caption to the existing post_media table)
 #   python -m app.add_audio_track_columns            (adds duration_seconds/created_by_user_id to the existing audio_tracks table; idempotent)
+#   python -m app.add_story_draft_editor_state_column (adds the nullable JSON editor_state column to the existing story_drafts table; idempotent)
 Base.metadata.create_all(bind=engine)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")

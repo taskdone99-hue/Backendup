@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -1049,6 +1050,14 @@ class StoryDraft(Base):
     question) that live on Story — a draft is "finish this later", not a
     parallel copy of every attachable extra. Flag if drafts should carry
     those too.
+
+    `editor_state` is the one exception to "core fields only": it is an
+    opaque JSON blob owned by the client's story editor (background, media
+    shape, text layers, positions, effects, stickers, filters, ...) so the
+    editor can be reopened exactly as it was left. The backend stores and
+    returns it verbatim and never interprets it. NULL for drafts created
+    before the column existed. It is NOT carried over to the Story row on
+    publish — the published story is the flattened media.
     """
 
     __tablename__ = "story_drafts"
@@ -1063,6 +1072,10 @@ class StoryDraft(Base):
     location_longitude = Column(Float, nullable=True)
     location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
     close_friends_only = Column(Boolean, default=False, nullable=False)
+    # JSON on MySQL (native JSON type), JSON-as-text on SQLite (tests).
+    # none_as_null=True: Python None is stored as SQL NULL, not the JSON
+    # literal `null`, so "no editor state" is one thing in the database.
+    editor_state = Column(JSON(none_as_null=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

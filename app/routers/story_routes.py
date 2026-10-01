@@ -1,7 +1,8 @@
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
@@ -733,6 +734,106 @@ def get_story_archive(
 # Publishing turns it into a real Story row (same expires_at logic as
 # POST /api/stories) and deletes the draft.
 
+# Ceiling on the serialized size of a draft's editor_state. The blob is
+# stored verbatim and unvalidated, so without a cap one request could park an
+# arbitrarily large document in the database. 2 MB is far above any real
+# editor payload (text/sticker/filter parameters, not pixels); media itself
+# goes through the `file` upload, never through editor_state.
+MAX_EDITOR_STATE_BYTES = 2 * 1024 * 1024
+
+EDITOR_STATE_FORM_DESCRIPTION = (
+    "The story editor's full state as a JSON-encoded object (a string in this "
+    "multipart form): background, media shape, text layers, positions, effects, "
+    "stickers, filters, etc. Stored verbatim and returned as `editor_state` on "
+    "every draft response; the server never interprets it. Omit it for a draft "
+    "with no editor state (returned as null)."
+)
+
+
+def _reject_json_constant(name: str):
+    # json.loads accepts NaN / Infinity / -Infinity by default, but they are
+    # not valid JSON and MySQL's JSON column would reject them at commit time
+    # (a 500). Refuse them up front instead.
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _parse_editor_state(raw: str | None) -> dict | None:
+    """Turns the `editor_state` form field into the object to store.
+
+    "" / missing / the JSON literal null -> None (stored as SQL NULL).
+    Anything else must be a JSON *object*; the parsed value is returned
+    untouched so every key the editor sent survives the round trip.
+    """
+    if raw is None or not raw.strip():
+        return None
+
+    if len(raw.encode("utf-8")) > MAX_EDITOR_STATE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"editor_state must be at most {MAX_EDITOR_STATE_BYTES} bytes",
+        )
+
+    try:
+        parsed = json.loads(raw, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="editor_state must be valid JSON",
+        )
+
+    if parsed is None:
+        return None
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="editor_state must be a JSON object",
+        )
+    return parsed
+
+
+def _draft_location_fields(
+    db: Session,
+    *,
+    location_id: str | None,
+    location_name: str | None,
+    location_address: str | None,
+    location_city: str | None,
+    location_state: str | None,
+    location_country: str | None,
+    location_latitude: str | None,
+    location_longitude: str | None,
+    location_place_id: str | None,
+) -> dict:
+    """Resolves the location_* form fields into the StoryDraft columns they
+    populate. Shared by create and update so both behave identically."""
+    parsed_location_id = _optional_int(location_id, "location_id")
+    parsed_location_latitude = _optional_float(location_latitude, "location_latitude")
+    parsed_location_longitude = _optional_float(location_longitude, "location_longitude")
+
+    try:
+        location = resolve_location_from_form(
+            db,
+            location_id=parsed_location_id,
+            location_name=location_name,
+            location_address=location_address,
+            location_city=location_city,
+            location_state=location_state,
+            location_country=location_country,
+            location_latitude=parsed_location_latitude,
+            location_longitude=parsed_location_longitude,
+            location_place_id=location_place_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    return {
+        "location_name": location.name if location else location_name,
+        "location_latitude": location.latitude if location else parsed_location_latitude,
+        "location_longitude": location.longitude if location else parsed_location_longitude,
+        "location_id": location.id if location else None,
+    }
+
+
 def _to_draft_out(draft: models.StoryDraft) -> schemas.StoryDraftOut:
     out = schemas.StoryDraftOut.model_validate(draft)
     if draft.location_id and draft.location is not None:
@@ -771,28 +872,30 @@ def create_story_draft(
     location_longitude: str | None = Form(default=None),
     location_place_id: str | None = Form(default=None),
     close_friends_only: bool = Form(default=False),
+    editor_state: str | None = Form(
+        default=None,
+        description=EDITOR_STATE_FORM_DESCRIPTION,
+        examples=['{"version": 1, "texts": [{"text": "Hello", "x": 0.5, "y": 0.2}]}'],
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    parsed_location_id = _optional_int(location_id, "location_id")
-    parsed_location_latitude = _optional_float(location_latitude, "location_latitude")
-    parsed_location_longitude = _optional_float(location_longitude, "location_longitude")
+    # Validate editor_state before the upload is written to disk, so a bad
+    # value can't leave an orphaned file behind.
+    parsed_editor_state = _parse_editor_state(editor_state)
 
-    try:
-        location = resolve_location_from_form(
-            db,
-            location_id=parsed_location_id,
-            location_name=location_name,
-            location_address=location_address,
-            location_city=location_city,
-            location_state=location_state,
-            location_country=location_country,
-            location_latitude=parsed_location_latitude,
-            location_longitude=parsed_location_longitude,
-            location_place_id=location_place_id,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    location_fields = _draft_location_fields(
+        db,
+        location_id=location_id,
+        location_name=location_name,
+        location_address=location_address,
+        location_city=location_city,
+        location_state=location_state,
+        location_country=location_country,
+        location_latitude=location_latitude,
+        location_longitude=location_longitude,
+        location_place_id=location_place_id,
+    )
 
     url, kind = save_upload_file(file, "stories", allow_video=True)
 
@@ -801,11 +904,9 @@ def create_story_draft(
         media_url=url,
         media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
         caption=caption,
-        location_name=location.name if location else location_name,
-        location_latitude=location.latitude if location else parsed_location_latitude,
-        location_longitude=location.longitude if location else parsed_location_longitude,
-        location_id=location.id if location else None,
         close_friends_only=close_friends_only,
+        editor_state=parsed_editor_state,
+        **location_fields,
     )
     db.add(draft)
     db.commit()
@@ -835,6 +936,99 @@ def get_story_draft(
     current_user: models.User = Depends(get_current_user),
 ):
     draft = _get_own_draft_or_404(db, draft_id, current_user)
+    return _to_draft_out(draft)
+
+
+@router.patch("/drafts/{draft_id}", response_model=schemas.StoryDraftOut)
+def update_story_draft(
+    draft_id: int,
+    file: UploadFile | None = File(
+        default=None,
+        description="Optional. Replaces the draft's media (e.g. the re-rendered image after an edit).",
+    ),
+    caption: str | None = Form(
+        default=None,
+        description="Omit to keep the current caption; send an empty value to clear it.",
+    ),
+    location_id: str | None = Form(default=None),
+    location_name: str | None = Form(default=None),
+    location_address: str | None = Form(default=None),
+    location_city: str | None = Form(default=None),
+    location_state: str | None = Form(default=None),
+    location_country: str | None = Form(default=None),
+    location_latitude: str | None = Form(default=None),
+    location_longitude: str | None = Form(default=None),
+    location_place_id: str | None = Form(default=None),
+    close_friends_only: bool | None = Form(default=None),
+    editor_state: str | None = Form(
+        default=None,
+        description=(
+            EDITOR_STATE_FORM_DESCRIPTION
+            + " On update, the object REPLACES the stored one as a whole (it is "
+            "not merged key by key). Omit or leave empty to keep the stored "
+            "value; send the JSON literal `null` to clear it."
+        ),
+        examples=['{"version": 1, "texts": [{"text": "Hello", "x": 0.5, "y": 0.2}]}'],
+    ),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Partial update of one of your own drafts. Every field is optional and
+    only the ones you send change. Location fields, when any is sent, replace
+    the draft's location as a whole (same resolution rules as create)."""
+    draft = _get_own_draft_or_404(db, draft_id, current_user)
+
+    # Validate everything first so a bad field can't leave a half-applied
+    # update or an orphaned upload behind.
+    change_editor_state = editor_state is not None and bool(editor_state.strip())
+    parsed_editor_state = _parse_editor_state(editor_state) if change_editor_state else None
+
+    location_inputs = dict(
+        location_id=location_id,
+        location_name=location_name,
+        location_address=location_address,
+        location_city=location_city,
+        location_state=location_state,
+        location_country=location_country,
+        location_latitude=location_latitude,
+        location_longitude=location_longitude,
+        location_place_id=location_place_id,
+    )
+    location_fields = None
+    if any(v is not None and v.strip() for v in location_inputs.values()):
+        location_fields = _draft_location_fields(db, **location_inputs)
+
+    old_media_url = None
+    new_media_url = None
+    if file is not None and file.filename:
+        new_media_url, kind = save_upload_file(file, "stories", allow_video=True)
+        old_media_url = draft.media_url
+        draft.media_url = new_media_url
+        draft.media_type = models.MediaType.video if kind == "video" else models.MediaType.image
+
+    if caption is not None:
+        draft.caption = caption or None
+    if close_friends_only is not None:
+        draft.close_friends_only = close_friends_only
+    if change_editor_state:
+        draft.editor_state = parsed_editor_state
+    if location_fields is not None:
+        for column, value in location_fields.items():
+            setattr(draft, column, value)
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        if new_media_url is not None:
+            delete_media_file(new_media_url)
+        raise
+
+    # Only now that the new row is durable is it safe to drop the old file.
+    if old_media_url is not None:
+        delete_media_file(old_media_url)
+
+    db.refresh(draft)
     return _to_draft_out(draft)
 
 
