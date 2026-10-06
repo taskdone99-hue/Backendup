@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user
+from app.services.video_settings_service import require_reel_viewable, viewer_can_view
 
 router = APIRouter(prefix="/api/saved", tags=["saved"])
 
@@ -84,7 +85,9 @@ def _to_saved_item_out(
         out.post = _to_post_detail(db, post, viewer_id)
     elif item.target_type == models.SavedItemType.reel:
         reel = db.query(models.Reel).filter(models.Reel.id == item.target_id).first()
-        if reel is None:
+        # A saved reel the owner has since made private / members-only (or
+        # that is still waiting on its schedule) drops out of the saved list.
+        if reel is None or not viewer_can_view(db, reel, viewer_id):
             return None
         out.reel = _to_reel_detail(db, reel, viewer_id)
     elif item.target_type == models.SavedItemType.audio:
@@ -114,6 +117,8 @@ def save_item(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"{payload.target_type.value.capitalize()} not found",
         )
+    if payload.target_type == models.SavedItemType.reel:
+        require_reel_viewable(db, _get_reel_or_404(db, payload.target_id), current_user.id)
 
     existing = (
         db.query(models.SavedItem)

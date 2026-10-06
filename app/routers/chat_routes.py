@@ -16,6 +16,7 @@ from app.services.notification_service import notify_user
 from app.services.privacy_service import is_blocked, is_conversation_muted
 from app.services.media_service import save_upload_file
 from app.routers.content_routes import _require_author_visible
+from app.services.video_settings_service import require_reel_viewable, viewer_can_view
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -107,7 +108,9 @@ def _reel_visible_to(db: Session, reel: models.Reel, viewer_id: int | None) -> b
         _require_author_visible(db, reel.user, viewer_id)
     except HTTPException:
         return False
-    return True
+    # Private / members-only / not-yet-published reels follow the owner's
+    # upload-page settings (video_settings_service).
+    return viewer_can_view(db, reel, viewer_id)
 
 
 def _build_shared_reel_out(
@@ -139,6 +142,7 @@ def _get_shareable_reel_or_404(db: Session, reel_id: int, sender_id: int) -> mod
     # You can only share what you could open yourself (404 if blocked, 403
     # if private and not followed) — same responses as GET /api/reels/{id}.
     _require_author_visible(db, reel.user, sender_id)
+    require_reel_viewable(db, reel, sender_id)
     return reel
 
 

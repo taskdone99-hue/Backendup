@@ -14,6 +14,7 @@ from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.services import geocoding_service
+from app.services.video_settings_service import visible_reels_clause
 from app.services.location_service import (
     find_or_create_location,
     get_location_or_404,
@@ -314,6 +315,7 @@ def get_location_reels(
         .join(models.User, models.Reel.user_id == models.User.id)
         .filter(models.Reel.location_id == location_id)
         .filter(_visible_authors_clause(db, viewer_id))
+        .filter(visible_reels_clause(db, viewer_id))
     )
 
     total = query.count()

@@ -8,6 +8,7 @@ from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.services.privacy_service import is_blocked
 from app.routers.content_routes import _require_author_visible
+from app.services.video_settings_service import require_reel_viewable
 from app.routers.chat_routes import (
     _get_participant_or_403,
     _conversation_participant_ids,
@@ -73,6 +74,8 @@ async def share_internal(
     # don't follow. Also doubles as the "deleted content" check: a
     # deleted post/reel is simply gone from the table, so this 404s too.
     _require_author_visible(db, content.user, current_user.id)
+    if payload.content_type == models.ShareContentType.reel:
+        require_reel_viewable(db, content, current_user.id)
 
     # ---- resolve + validate every target before sending anything ----
 
@@ -195,6 +198,7 @@ def get_reel_share_link(
     post version; the link opens GET /r/{id}."""
     reel = _get_content_or_404(db, models.ShareContentType.reel, reel_id)
     _require_author_visible(db, reel.user, current_user.id if current_user else None)
+    require_reel_viewable(db, reel, current_user.id if current_user else None)
 
     base = PUBLIC_BASE_URL or "https://app.example.com"
     return schemas.ReelShareLinkResponse(reel_id=reel_id, url=f"{base}/r/{reel_id}")

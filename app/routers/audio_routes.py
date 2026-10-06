@@ -19,6 +19,7 @@ from app.database import get_db
 from app import models, schemas
 from app.routers.content_routes import _to_reel_detail, _visible_authors_clause
 from app.services.media_service import save_upload_file
+from app.services.video_settings_service import visible_reels_clause
 
 router = APIRouter(prefix="/api/audio", tags=["audio"])
 
@@ -200,6 +201,7 @@ def get_reels_using_audio(
         .join(models.User, models.Reel.user_id == models.User.id)
         .filter(models.Reel.audio_id == audio_id)
         .filter(_visible_authors_clause(db, viewer_id))
+        .filter(visible_reels_clause(db, viewer_id))
     )
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()

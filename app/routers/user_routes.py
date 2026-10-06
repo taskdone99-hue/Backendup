@@ -8,6 +8,7 @@ from app.auth import get_current_user, get_current_user_optional
 from app.services.media_service import delete_media_file, save_upload_file
 from app.services.notification_service import notify_user
 from app.routers.content_routes import _to_post_detail
+from app.services.video_settings_service import visible_reels_clause
 
 router = APIRouter(tags=["users"])
 
@@ -62,14 +63,22 @@ def _to_summary(db: Session, user: models.User, viewer_id: int | None) -> schema
     return summary
 
 
-def _content_counts(db: Session, user_id: int) -> tuple[int, int, int, int]:
+def _content_counts(
+    db: Session, user_id: int, viewer_id: int | None = None
+) -> tuple[int, int, int, int]:
     """Returns (posts_count, reels_count, followers_count, following_count).
     posts_count is total content — normal posts + reels — matching how a
     profile's post count is usually shown on Instagram (reels count toward
     the grid total too); reels_count stays as just reels, for whatever
     surface shows that separately (e.g. a Reels tab count)."""
     normal_posts_count = db.query(models.Post).filter(models.Post.user_id == user_id).count()
-    reels_count = db.query(models.Reel).filter(models.Reel.user_id == user_id).count()
+    # Only reels this viewer could actually open — a private, members-only or
+    # not-yet-published reel must not show up in someone else's count.
+    reels_count = (
+        db.query(models.Reel)
+        .filter(models.Reel.user_id == user_id, visible_reels_clause(db, viewer_id))
+        .count()
+    )
     posts_count = normal_posts_count + reels_count
     followers_count = (
         db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
@@ -97,7 +106,7 @@ def get_user_profile(
         profile.reels_count,
         profile.followers_count,
         profile.following_count,
-    ) = _content_counts(db, user_id)
+    ) = _content_counts(db, user_id, current_user.id if current_user else None)
     if current_user is not None and current_user.id != user_id:
         profile.is_following = _is_following(db, current_user.id, user_id)
         profile.is_followed_by = _is_following(db, user_id, current_user.id)
@@ -237,7 +246,8 @@ def get_user_reels(
         models.ReelCollaborator.user_id == user_id
     )
     query = db.query(models.Reel).filter(
-        or_(models.Reel.user_id == user_id, models.Reel.id.in_(collab_reel_ids))
+        or_(models.Reel.user_id == user_id, models.Reel.id.in_(collab_reel_ids)),
+        visible_reels_clause(db, viewer_id),
     )
     total = query.count()
     reels = (
@@ -279,6 +289,7 @@ def get_saved_reels(
             & (models.SavedItem.target_id == models.Reel.id),
         )
         .filter(models.SavedItem.user_id == user_id)
+        .filter(visible_reels_clause(db, current_user.id))
     )
     total = query.count()
     rows = query.order_by(models.SavedItem.created_at.desc()).offset(offset).limit(limit).all()

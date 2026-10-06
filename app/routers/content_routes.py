@@ -26,6 +26,12 @@ from app.services.media_service import (
     save_upload_file,
 )
 from app.services import engagement, tag_service
+from app.services.video_settings_service import (
+    as_utc,
+    likes_hidden_from,
+    require_reel_viewable,
+    visible_reels_clause,
+)
 from app.services.location_service import resolve_location_from_form, find_or_create_location
 from app.services.hashtag_service import extract_hashtags, sync_post_hashtags
 from app.services.mention_service import sync_mentions
@@ -151,7 +157,12 @@ def _to_reel_detail(
 ) -> schemas.ReelDetailOut:
     detail = schemas.ReelDetailOut.model_validate(reel)
     detail.user = schemas.UserSummaryOut.model_validate(reel.user)
-    detail.likes_count = engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
+    detail.likes_count = (
+        None
+        if likes_hidden_from(reel, viewer_id)
+        else engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
+    )
+    detail.scheduled_at = as_utc(reel.scheduled_at)
     detail.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.reel, reel.id)
     detail.is_liked = detail.like_id is not None
     detail.comments_count = engagement.comments_count(db, reel_id=reel.id)
@@ -960,7 +971,10 @@ def get_reels_home_feed(
     author_ids = _following_ids(db, current_user.id) + [current_user.id]
     muted_ids = set(muted_user_ids(db, current_user.id, for_stories=False))
     author_ids = [uid for uid in author_ids if uid not in muted_ids]
-    query = db.query(models.Reel).filter(models.Reel.user_id.in_(author_ids))
+    query = db.query(models.Reel).filter(
+        models.Reel.user_id.in_(author_ids),
+        visible_reels_clause(db, current_user.id),
+    )
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_reel_detail(db, r, current_user.id) for r in reels]
@@ -982,6 +996,7 @@ def get_reels_feed(
     viewer_id = current_user.id if current_user else None
     query = db.query(models.Reel).join(models.User, models.Reel.user_id == models.User.id)
     query = query.filter(_visible_authors_clause(db, viewer_id))
+    query = query.filter(visible_reels_clause(db, viewer_id))
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_reel_detail(db, r, viewer_id) for r in reels]
@@ -1039,6 +1054,7 @@ def get_trending_reels(
         .outerjoin(watch_subq, models.Reel.id == watch_subq.c.reel_id)
         .filter(score > 0)
         .filter(_visible_authors_clause(db, viewer_id))
+        .filter(visible_reels_clause(db, viewer_id))
         .order_by(score.desc(), models.Reel.created_at.desc())
     )
 
@@ -1057,6 +1073,7 @@ def get_reel(
     reel = _get_reel_or_404(db, reel_id)
     viewer_id = current_user.id if current_user else None
     _require_author_visible(db, reel.user, viewer_id)
+    require_reel_viewable(db, reel, viewer_id)
     return _to_reel_detail(db, reel, viewer_id)
 
 
@@ -1200,6 +1217,7 @@ def remix_reel_audio(
     the same shape as a "use this audio" remix.
     """
     original = _get_reel_or_404(db, reel_id)
+    require_reel_viewable(db, original, current_user.id)
 
     # If the original doesn't already have a saved Audio row (e.g. it was
     # uploaded with its own baked-in sound, never explicitly "used" an
@@ -1254,10 +1272,13 @@ def get_reel_remixes(
     """All reels remixed from this one (models.Reel.remixed_from_id), newest
     first — the "N remixes" list a client shows under a reel's audio/remix
     button."""
-    _get_reel_or_404(db, reel_id)
+    original = _get_reel_or_404(db, reel_id)
     viewer_id = current_user.id if current_user else None
+    require_reel_viewable(db, original, viewer_id)
 
-    query = db.query(models.Reel).filter(models.Reel.remixed_from_id == reel_id)
+    query = db.query(models.Reel).filter(
+        models.Reel.remixed_from_id == reel_id, visible_reels_clause(db, viewer_id)
+    )
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_reel_detail(db, r, viewer_id) for r in reels]
@@ -1270,7 +1291,8 @@ def save_reel(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    _get_reel_or_404(db, reel_id)
+    reel = _get_reel_or_404(db, reel_id)
+    require_reel_viewable(db, reel, current_user.id)
     _save_target(db, current_user.id, models.SavedItemType.reel, reel_id)
     return schemas.MessageResponse(message="Reel saved")
 
@@ -1337,6 +1359,7 @@ def get_reel_tags(
     reel = _get_reel_or_404(db, reel_id)
     viewer_id = current_user.id if current_user else None
     _require_author_visible(db, reel.user, viewer_id)
+    require_reel_viewable(db, reel, viewer_id)
     return schemas.ReelTagsResponse(
         message="", tags=tag_service.visible_tags(db, "reel", reel, viewer_id)
     )

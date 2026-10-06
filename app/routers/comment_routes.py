@@ -15,6 +15,12 @@ from app.services import engagement
 from app.services.mention_service import sync_mentions
 from app.services.notification_service import notify_user
 from app.services.privacy_service import restricted_user_ids, is_blocked
+from app.services.video_settings_service import (
+    likes_hidden_from,
+    require_comments_open,
+    require_comments_visible,
+    require_reel_viewable,
+)
 
 router = APIRouter(tags=["comments"])
 
@@ -56,6 +62,29 @@ def _get_comment_or_404(db: Session, comment_id: int) -> models.Comment:
     if comment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found")
     return comment
+
+
+def _guard_reel_comment(
+    db: Session,
+    comment: models.Comment,
+    viewer_id: int | None,
+    *,
+    writing: bool = False,
+    reading_thread: bool = False,
+) -> None:
+    """Applies the reel's upload-page settings to an action on one of its
+    comments. No-op for comments on posts. `writing` = adding a reply
+    (refused while comments are off); `reading_thread` = listing replies
+    (refused while comments are hidden). Either way the reel itself must be
+    viewable (private / not-yet-published reels 404)."""
+    if comment.reel_id is None:
+        return
+    reel = _get_reel_or_404(db, comment.reel_id)
+    require_reel_viewable(db, reel, viewer_id)
+    if writing:
+        require_comments_open(reel)
+    if reading_thread:
+        require_comments_visible(reel, viewer_id)
 
 
 def _to_comment_out(
@@ -165,6 +194,8 @@ async def add_reel_comment(
     reel = _get_reel_or_404(db, reel_id)
     if is_blocked(db, current_user.id, reel.user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not found")
+    require_reel_viewable(db, reel, current_user.id)
+    require_comments_open(reel)
     comment = models.Comment(reel_id=reel_id, user_id=current_user.id, content=payload.content)
     db.add(comment)
     db.commit()
@@ -187,6 +218,8 @@ def get_reel_comments(
     )
     viewer_id = current_user.id if current_user else None
     reel = _get_reel_or_404(db, reel_id)
+    require_reel_viewable(db, reel, viewer_id)
+    require_comments_visible(reel, viewer_id)
     query = _restrict_filtered(query, reel.user_id, viewer_id, db)
     total = query.count()
     comments = query.order_by(models.Comment.created_at.asc()).offset(offset).limit(limit).all()
@@ -206,6 +239,7 @@ async def reply_to_comment(
     current_user: models.User = Depends(get_current_user),
 ):
     parent = _get_comment_or_404(db, comment_id)
+    _guard_reel_comment(db, parent, current_user.id, writing=True)
     if parent.parent_id is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Replies can only be made to top-level comments")
@@ -231,7 +265,10 @@ def get_comment_replies(
     db: Session = Depends(get_db),
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    _get_comment_or_404(db, comment_id)
+    comment = _get_comment_or_404(db, comment_id)
+    _guard_reel_comment(
+        db, comment, current_user.id if current_user else None, reading_thread=True
+    )
     query = db.query(models.Comment).options(joinedload(models.Comment.user)).filter(
         models.Comment.parent_id == comment_id
     )
@@ -249,7 +286,8 @@ def like_comment(
     current_user: models.User = Depends(get_current_user),
 ):
     """Idempotent — liking an already-liked comment just returns the existing like."""
-    _get_comment_or_404(db, comment_id)
+    comment = _get_comment_or_404(db, comment_id)
+    _guard_reel_comment(db, comment, current_user.id)
     existing = (
         db.query(models.Like)
         .filter(
@@ -339,6 +377,15 @@ def like_target(
             detail=f"{payload.target_type.value.capitalize()} not found",
         )
 
+    liked_reel = None
+    if payload.target_type == models.LikeTargetType.reel:
+        liked_reel = _get_reel_or_404(db, payload.target_id)
+        require_reel_viewable(db, liked_reel, current_user.id)
+    elif payload.target_type == models.LikeTargetType.comment:
+        _guard_reel_comment(
+            db, _get_comment_or_404(db, payload.target_id), current_user.id
+        )
+
     existing = (
         db.query(models.Like)
         .filter(
@@ -377,6 +424,8 @@ def like_target(
             db.refresh(existing)
 
     count = engagement.likes_count(db, payload.target_type, payload.target_id)
+    if liked_reel is not None and likes_hidden_from(liked_reel, current_user.id):
+        count = None  # owner hid the like count — the liker doesn't get it back either
     like_out = schemas.LikeOut.model_validate(existing)
     like_out.user = schemas.UserSummaryOut.model_validate(existing.user)
     return schemas.LikeActionResponse(message="Liked", like=like_out, likes_count=count)
@@ -480,7 +529,13 @@ def get_reel_likes(
     db: Session = Depends(get_db),
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    _get_reel_or_404(db, reel_id)
+    reel = _get_reel_or_404(db, reel_id)
+    viewer_id = current_user.id if current_user else None
+    require_reel_viewable(db, reel, viewer_id)
+    if likes_hidden_from(reel, viewer_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Likes are hidden on this reel"
+        )
     query = (
         db.query(models.User)
         .join(models.Like, models.Like.user_id == models.User.id)

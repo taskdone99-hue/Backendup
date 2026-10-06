@@ -561,6 +561,29 @@ class PostMember(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+class ReelVisibility(str, enum.Enum):
+    """Who may view a reel/video (PUT /api/videos/:id/visibility).
+
+    `members` is stored and validated, but the app has no creator-scoped
+    membership relation yet (UserMembership is a platform subscription, not
+    "subscribed to creator X"), so until one exists only the owner and
+    credited collaborators can open a members-only reel — it fails closed.
+    See app/services/video_settings_service.viewer_is_member.
+    """
+
+    public = "public"
+    private = "private"
+    members = "members"
+
+
+class ReelAudience(str, enum.Enum):
+    """Audience label chosen on the upload page (PUT /api/videos/:id/audience).
+    Exactly the two options the upload page offers — nothing else is valid."""
+
+    adult = "18_plus"
+    below_18 = "below_18"
+
+
 class Reel(Base):
     __tablename__ = "reels"
 
@@ -598,6 +621,24 @@ class Reel(Base):
     location_latitude = Column(Float, nullable=True)
     location_longitude = Column(Float, nullable=True)
     location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
+
+    # ---- Upload-page settings (Phase 1 of the video upload flow) ----
+    # Every column is additive and defaults so rows created before this
+    # existed keep behaving exactly as they did: public, comments on, no
+    # schedule. language/audience stay NULL = "never set".
+    language = Column(String(50), nullable=True)
+    ai_generated = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    comments_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
+    hide_like_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    hide_comments = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    audience = Column(String(20), nullable=True)
+    visibility = Column(
+        String(20), default=ReelVisibility.public.value, nullable=False,
+        server_default=ReelVisibility.public.value, index=True,
+    )
+    schedule_enabled = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    # Stored as a naive UTC datetime (see video_settings_service.to_storage_utc).
+    scheduled_at = Column(DateTime, nullable=True, index=True)
 
     user = relationship("User", back_populates="reels")
     location = relationship("Location", foreign_keys=[location_id])

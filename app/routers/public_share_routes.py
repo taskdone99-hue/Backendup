@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.database import get_db
+from app.services.video_settings_service import viewer_can_view
 
 router = APIRouter(tags=["public-share"], include_in_schema=False)
 
@@ -204,6 +205,10 @@ def reel_landing(reel_id: int, db: Session = Depends(get_db)):
     if reel is None:
         return _unavailable(404, None, open_url)
     if not _author_publicly_visible(reel.user):
+        return _unavailable(200, None, open_url)
+    # The web landing page is anonymous: private, members-only and
+    # not-yet-published reels are never rendered here.
+    if not viewer_can_view(db, reel, None):
         return _unavailable(200, None, open_url)
 
     name = _app_name()

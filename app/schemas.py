@@ -7,12 +7,15 @@ import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.services import admob_service
+from app.services.video_settings_service import normalize_language
 
 from app.models import (
     DevicePlatform,
     Gender,
     LikeTargetType,
     MediaType,
+    ReelAudience,
+    ReelVisibility,
     MembershipInterval,
     MembershipStatus,
     NotificationType,
@@ -1058,7 +1061,10 @@ class ReelDetailOut(ReelOut):
     title: str | None = None
     remixed_from_id: int | None = None
     user: UserSummaryOut | None = None
-    likes_count: int = 0
+    likes_count: int | None = Field(
+        default=0,
+        description="`null` when the owner turned on `hide_like_count` and the viewer is not the owner.",
+    )
     comments_count: int = 0
     is_liked: bool = False
     like_id: int | None = None
@@ -1071,6 +1077,21 @@ class ReelDetailOut(ReelOut):
     tags_count: int = 0
     tags: list[UserSummaryOut] = []
     audio: AudioOut | None = None
+    # Upload-page settings (see /api/videos/{id}/language|ai-content|
+    # engagement-settings|audience|visibility|schedule). Rows that predate
+    # them read as: language/audience null, comments on, nothing hidden,
+    # public, no schedule.
+    language: str | None = None
+    ai_generated: bool = False
+    comments_enabled: bool = True
+    hide_like_count: bool = False
+    hide_comments: bool = False
+    audience: ReelAudience | None = None
+    visibility: ReelVisibility = ReelVisibility.public
+    schedule_enabled: bool = False
+    scheduled_at: datetime | None = Field(
+        default=None, description="UTC. Null unless a schedule is set."
+    )
 
 
 class PaginatedReelDetailResponse(BaseModel):
@@ -1155,6 +1176,112 @@ class VideoMetadataUpdate(BaseModel):
 class ThumbnailUploadResponse(BaseModel):
     message: str
     thumbnail_url: str
+
+
+# ---- Upload-page settings: PUT /api/videos/{id}/language | ai-content |
+#      engagement-settings | audience | visibility | schedule ----
+
+class VideoLanguageUpdate(BaseModel):
+    """PUT /api/videos/:id/language"""
+    language: str = Field(
+        ...,
+        max_length=50,
+        description="Language name ('English', 'Hindi', 'Telugu'...) or ISO 639-1 code ('en'). "
+        "Stored and returned as the canonical name.",
+        examples=["English"],
+    )
+
+    @field_validator("language")
+    @classmethod
+    def check_language(cls, v: str) -> str:
+        return normalize_language(v)  # ValueError -> 400 {"message": ...}
+
+
+class VideoAIContentUpdate(BaseModel):
+    """PUT /api/videos/:id/ai-content"""
+    ai_generated: bool = Field(..., description="The upload page's 'AI-Generated Content' switch")
+
+
+class VideoEngagementSettingsUpdate(BaseModel):
+    """PUT /api/videos/:id/engagement-settings — send all three, or only the
+    ones you want to change (omitted ones keep their current value)."""
+    comments_enabled: bool | None = Field(default=None, description="false = nobody can add new comments")
+    hide_like_count: bool | None = Field(default=None, description="true = like count/likers hidden from everyone but the owner")
+    hide_comments: bool | None = Field(default=None, description="true = comment thread hidden from everyone but the owner")
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        sent = self.model_fields_set & {"comments_enabled", "hide_like_count", "hide_comments"}
+        if not sent:
+            raise ValueError(
+                "Send at least one of comments_enabled, hide_like_count, hide_comments"
+            )
+        for name in sent:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} must be true or false, not null")
+        return self
+
+
+class VideoAudienceUpdate(BaseModel):
+    """PUT /api/videos/:id/audience"""
+    audience: ReelAudience = Field(..., description="'18_plus' or 'below_18'")
+
+
+class VideoVisibilityUpdate(BaseModel):
+    """PUT /api/videos/:id/visibility"""
+    visibility: ReelVisibility = Field(..., description="'public', 'private' or 'members'")
+
+
+class VideoScheduleUpdate(BaseModel):
+    """PUT /api/videos/:id/schedule — `scheduled_at` is read as UTC when it
+    carries no timezone offset, converted to UTC when it does."""
+    schedule_enabled: bool
+    scheduled_at: datetime | None = Field(
+        default=None,
+        description="Required when schedule_enabled is true; must be in the future. "
+        "Ignored (and cleared) when schedule_enabled is false.",
+        examples=["2026-10-10T18:30:00"],
+    )
+
+    @model_validator(mode="after")
+    def require_time_when_enabled(self):
+        if self.schedule_enabled and self.scheduled_at is None:
+            raise ValueError("scheduled_at is required when schedule_enabled is true")
+        return self
+
+
+class VideoSettingResponse(BaseModel):
+    """Common envelope: what was saved plus the full, updated video."""
+    message: str
+    video_id: int
+    video: ReelDetailOut
+
+
+class VideoLanguageResponse(VideoSettingResponse):
+    language: str
+
+
+class VideoAIContentResponse(VideoSettingResponse):
+    ai_generated: bool
+
+
+class VideoEngagementSettingsResponse(VideoSettingResponse):
+    comments_enabled: bool
+    hide_like_count: bool
+    hide_comments: bool
+
+
+class VideoAudienceResponse(VideoSettingResponse):
+    audience: ReelAudience
+
+
+class VideoVisibilityResponse(VideoSettingResponse):
+    visibility: ReelVisibility
+
+
+class VideoScheduleResponse(VideoSettingResponse):
+    schedule_enabled: bool
+    scheduled_at: datetime | None = None
 
 
 class CollaboratorAddRequest(BaseModel):
@@ -1261,7 +1388,10 @@ class LikeOut(BaseModel):
 class LikeActionResponse(BaseModel):
     message: str
     like: LikeOut | None = None
-    likes_count: int
+    likes_count: int | None = Field(
+        default=None,
+        description="`null` when liking a reel whose owner hid its like count (and you're not the owner).",
+    )
 
 
 class PaginatedLikesResponse(BaseModel):

@@ -33,6 +33,7 @@ from app.routers.content_routes import (
 from app.routers.story_routes import _active_story_query, _get_active_story_or_404
 from app.routers.user_routes import _get_user_or_404, _require_content_visible
 from app.services import tag_service
+from app.services.video_settings_service import visible_reels_clause
 from app.services.privacy_service import blocked_user_ids, is_blocked
 
 router = APIRouter(tags=["tags"])
@@ -235,6 +236,8 @@ def get_user_tagged(
             )
             .filter(_visible_authors_clause(db, viewer_id))
         )
+        if Content is models.Reel:
+            query = query.filter(visible_reels_clause(db, viewer_id))
         if not show_hidden:
             query = query.filter(Tag.hidden_from_profile.is_(False))
         return query
