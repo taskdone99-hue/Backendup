@@ -17,6 +17,7 @@ from app.services.privacy_service import is_blocked, is_conversation_muted
 from app.services.media_service import save_upload_file
 from app.routers.content_routes import _require_author_visible
 from app.services.video_settings_service import require_reel_viewable, viewer_can_view
+from app.services import chat_option_service
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -220,6 +221,10 @@ def _to_message_out(
 
     out.reactions = [
         schemas.MessageReactionOut(user_id=r.user_id, emoji=r.emoji) for r in message.reactions
+    ]
+    out.options = [
+        schemas.ChatOptionOut.model_validate(o)
+        for o in chat_option_service.visible_options(message, viewer_id)
     ]
 
     # status: "sent" (default) until every recipient's row clears each bar.
@@ -744,6 +749,7 @@ async def _create_and_dispatch_message(
     message: models.Message,
     current_user: models.User,
     preview: str,
+    options: list[schemas.ChatOptionIn] | None = None,
 ) -> schemas.MessageOut:
     """Shared by send_message (text) and send_media_message (image/video/
     voice): persist the message, mark it read for the sender, create
@@ -752,6 +758,10 @@ async def _create_and_dispatch_message(
     short text used in that notification (e.g. the caption, or "Sent a
     photo" for a caption-less media message)."""
     db.add(message)
+    for position, option in enumerate(options or []):
+        message.options.append(models.ChatMessageOption(
+            title=option.title, action=option.action, display_order=position
+        ))
     db.commit()
     db.refresh(message)
 
@@ -813,6 +823,10 @@ async def send_message(
 
     reply_to_id = _validate_reply_target(db, conversation_id, payload.reply_to_message_id)
 
+    if payload.options:
+        # Backend-enforced: only Business / active-Premium accounts may attach buttons.
+        chat_option_service.require_eligible_sender(db, current_user)
+
     if payload.shared_reel_id is not None:
         # Share a reel as a card (optionally with a note in `content`).
         _get_shareable_reel_or_404(db, payload.shared_reel_id, current_user.id)
@@ -835,7 +849,9 @@ async def send_message(
     )
     text = payload.content or default_preview
     preview = text if len(text) <= 80 else text[:77] + "..."
-    return await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
+    return await _create_and_dispatch_message(
+        db, conversation_id, message, current_user, preview, options=payload.options
+    )
 
 
 @router.post(

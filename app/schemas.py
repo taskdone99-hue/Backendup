@@ -6,7 +6,7 @@ from typing import Any
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.services import admob_service
+from app.services import admob_service, chat_option_service
 from app.services.video_settings_service import normalize_language
 
 from app.models import (
@@ -1692,6 +1692,153 @@ class ConversationCreate(BaseModel):
         return deduped
 
 
+# ---- Interactive chat options (Business / Premium quick-reply buttons) ----
+
+_OPTION_ACTION_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def _clean_option_title(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Option title can't be empty")
+    if len(v) > chat_option_service.TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"Option title can be at most {chat_option_service.TITLE_MAX_LENGTH} characters"
+        )
+    if not v.isprintable():
+        raise ValueError("Option title can't contain line breaks or control characters")
+    return v
+
+
+def _clean_option_action(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Option action can't be empty")
+    if len(v) > chat_option_service.ACTION_MAX_LENGTH:
+        raise ValueError(
+            f"Option action can be at most {chat_option_service.ACTION_MAX_LENGTH} characters"
+        )
+    if not _OPTION_ACTION_RE.match(v):
+        raise ValueError(
+            "Option action may only contain letters, digits, '_', '-', '.' and ':' (e.g. 'track_order')"
+        )
+    return v
+
+
+class ChatOptionIn(BaseModel):
+    """One button to create."""
+    title: str = Field(..., description="Button label, 1-24 characters", examples=["Today's Deals"])
+    action: str = Field(
+        ...,
+        description="Machine-readable id the client acts on, 1-50 chars of letters, digits, _ - . :",
+        examples=["deals"],
+    )
+
+    @field_validator("title")
+    @classmethod
+    def check_title(cls, v: str) -> str:
+        return _clean_option_title(v)
+
+    @field_validator("action")
+    @classmethod
+    def check_action(cls, v: str) -> str:
+        return _clean_option_action(v)
+
+
+def _reject_duplicate_options(options: list["ChatOptionIn"]) -> None:
+    titles = [o.title.casefold() for o in options]
+    actions = [o.action.casefold() for o in options]
+    if len(set(titles)) != len(titles):
+        raise ValueError("Option titles must be unique within a message")
+    if len(set(actions)) != len(actions):
+        raise ValueError("Option actions must be unique within a message")
+
+
+class ChatOptionsCreate(BaseModel):
+    """POST /api/chat/options"""
+    message_id: int = Field(..., gt=0)
+    options: list[ChatOptionIn] = Field(
+        ..., min_length=1, max_length=chat_option_service.MAX_OPTIONS_PER_MESSAGE
+    )
+
+    @model_validator(mode="after")
+    def no_duplicates(self):
+        _reject_duplicate_options(self.options)
+        return self
+
+
+class ChatOptionUpdate(BaseModel):
+    """PUT /api/chat/options/{option_id} — send only what changes."""
+    title: str | None = None
+    action: str | None = None
+    is_enabled: bool | None = Field(
+        default=None, description="false hides the button from recipients and stops it being selectable"
+    )
+
+    @field_validator("title")
+    @classmethod
+    def check_title(cls, v: str | None) -> str | None:
+        return None if v is None else _clean_option_title(v)
+
+    @field_validator("action")
+    @classmethod
+    def check_action(cls, v: str | None) -> str | None:
+        return None if v is None else _clean_option_action(v)
+
+    @model_validator(mode="after")
+    def at_least_one(self):
+        sent = self.model_fields_set & {"title", "action", "is_enabled"}
+        if not sent:
+            raise ValueError("Send at least one of title, action, is_enabled")
+        for name in sent:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} can't be null")
+        return self
+
+
+class ChatOptionOut(BaseModel):
+    id: int
+    title: str
+    action: str
+    is_enabled: bool = True
+
+    class Config:
+        from_attributes = True
+
+
+class ChatMessageOptionsOut(BaseModel):
+    """A message's text together with its buttons — what the client renders."""
+    message_id: int
+    text: str | None = None
+    options: list[ChatOptionOut] = []
+
+
+class PaginatedChatOptionsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[ChatMessageOptionsOut]
+
+
+class ChatOptionSelectRequest(BaseModel):
+    option_id: int = Field(..., gt=0)
+
+
+class ChatOptionSelectionOut(BaseModel):
+    message_id: int
+    option_id: int
+    title: str
+    action: str
+    selected: bool = True
+
+
+class ChatOptionAnalyticsOut(BaseModel):
+    option_id: int
+    title: str
+    action: str
+    selection_count: int = Field(..., description="Distinct users who selected this option")
+
+
 class MessageCreate(BaseModel):
     """Text message, or a shared reel/post. With `shared_reel_id` or
     `shared_post_id`, `content` is an optional note sent alongside the
@@ -1707,6 +1854,12 @@ class MessageCreate(BaseModel):
     shared_post_id: int | None = Field(
         default=None, gt=0, description="Share this post into the conversation"
     )
+    options: list[ChatOptionIn] | None = Field(
+        default=None,
+        max_length=chat_option_service.MAX_OPTIONS_PER_MESSAGE,
+        description="Optional clickable buttons (max 5) sent with a text message. "
+        "Business / Premium accounts only (403 otherwise); needs `content`.",
+    )
 
     @field_validator("content")
     @classmethod
@@ -1719,6 +1872,12 @@ class MessageCreate(BaseModel):
     def require_content_or_share(self):
         if self.content is None and self.shared_reel_id is None and self.shared_post_id is None:
             raise ValueError("Message can't be empty")
+        if self.options:
+            if self.content is None:
+                raise ValueError("A message with options needs text in `content`")
+            if self.shared_reel_id is not None or self.shared_post_id is not None:
+                raise ValueError("Options can't be attached to a shared reel or post")
+            _reject_duplicate_options(self.options)
         if self.shared_reel_id is not None and self.shared_post_id is not None:
             raise ValueError("A message can only share one reel or post, not both")
         return self
@@ -1804,6 +1963,9 @@ class MessageOut(BaseModel):
     edited_at: datetime | None = None
     is_deleted: bool = False
     reactions: list[MessageReactionOut] = []
+    # Clickable buttons (Business / Premium senders). Always present; [] for an
+    # ordinary message. Recipients only get enabled options.
+    options: list[ChatOptionOut] = []
     # "sent" | "delivered" | "read" — see models.MessageStatus. Always
     # "sent" from the sender's own point of view isn't tracked separately;
     # this reflects the furthest state any recipient has reached.

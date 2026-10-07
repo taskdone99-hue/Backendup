@@ -1483,6 +1483,59 @@ class Message(Base):
     statuses = relationship(
         "MessageStatus", back_populates="message", cascade="all, delete-orphan"
     )
+    options = relationship(
+        "ChatMessageOption",
+        back_populates="message",
+        cascade="all, delete-orphan",
+        order_by="ChatMessageOption.display_order, ChatMessageOption.id",
+    )
+
+
+class ChatMessageOption(Base):
+    """One clickable quick-reply button attached to a chat message (WhatsApp
+    Business style). Only Business / active-Premium senders can create them —
+    see services/chat_option_service.py. A message has at most
+    MAX_OPTIONS_PER_MESSAGE; display_order is the left-to-right / top-to-bottom
+    order the client renders them in."""
+
+    __tablename__ = "chat_message_options"
+    __table_args__ = (
+        UniqueConstraint("message_id", "action", name="uq_chat_option_message_action"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(24), nullable=False)
+    action = Column(String(50), nullable=False)
+    display_order = Column(Integer, default=0, nullable=False)
+    is_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    message = relationship("Message", back_populates="options")
+    selections = relationship(
+        "ChatMessageOptionSelection", back_populates="option", cascade="all, delete-orphan"
+    )
+
+
+class ChatMessageOptionSelection(Base):
+    """A user tapping an option — one row per (option, user): tapping the same
+    option again is a no-op, so selection counts are unique users."""
+
+    __tablename__ = "chat_message_option_selections"
+    __table_args__ = (
+        UniqueConstraint("option_id", "user_id", name="uq_chat_option_selection"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    option_id = Column(
+        Integer, ForeignKey("chat_message_options.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    selected_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    option = relationship("ChatMessageOption", back_populates="selections")
+    user = relationship("User", foreign_keys=[user_id])
 
 
 class MessageReaction(Base):

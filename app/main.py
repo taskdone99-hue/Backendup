@@ -21,6 +21,7 @@ from app.routers import (
     share_routes,
     snap_routes,
     chat_routes,
+    chat_option_routes,
     notification_routes,
     post_details_routes,
     membership_routes,
@@ -57,6 +58,7 @@ from app.routers import (
 #   python -m app.add_post_media_caption_column      (adds per-photo caption to the existing post_media table)
 #   python -m app.add_audio_track_columns            (adds duration_seconds/created_by_user_id to the existing audio_tracks table; idempotent)
 #   python -m app.add_story_draft_editor_state_column (adds the nullable JSON editor_state column to the existing story_drafts table; idempotent)
+#   python -m app.add_chat_message_options_tables   (creates chat_message_options + chat_message_option_selections; create-only, idempotent)
 #   python -m app.add_video_upload_settings_columns  (adds language/ai_generated/comments_enabled/hide_*/audience/visibility/schedule_* to the existing reels table; idempotent)
 Base.metadata.create_all(bind=engine)
 
@@ -128,6 +130,7 @@ app.include_router(saved_routes.router)
 app.include_router(share_routes.router)
 app.include_router(snap_routes.router)
 app.include_router(chat_routes.router)
+app.include_router(chat_option_routes.router)
 app.include_router(notification_routes.router)
 app.include_router(post_details_routes.router)
 app.include_router(membership_routes.router)
