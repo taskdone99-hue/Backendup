@@ -743,6 +743,65 @@ async def _push_message_event(
         await manager.send_to_users([uid], {**base, "message": out.model_dump(mode="json")})
 
 
+async def _maybe_send_default_menu(
+    db: Session,
+    conversation_id: int,
+    customer: models.User,
+    customer_message: models.Message,
+) -> schemas.MessageOut | None:
+    """Automatic default menu. Called right after `customer` sent
+    `customer_message`; if the other person in this 1:1 conversation is a
+    Business / Premium account with an enabled default menu and the
+    conversation has been inactive, sends that account's greeting — from
+    them, flagged `is_auto_message` — with the menu attached as ordinary
+    message options (so selection and analytics work as usual).
+
+    Returns the greeting as the *customer* sees it (for the `auto_reply`
+    field of their send response), or None. It never fails the customer's
+    send: the customer's message is already saved, so any error here is
+    logged and swallowed.
+    """
+    try:
+        conversation = db.get(models.Conversation, conversation_id)
+        if conversation is None or conversation.is_group:
+            return None
+        participant_ids = _conversation_participant_ids(db, conversation_id)
+        if len(participant_ids) != 2 or customer.id not in participant_ids:
+            return None
+        business = db.get(models.User, next(uid for uid in participant_ids if uid != customer.id))
+        if business is None:
+            return None
+
+        menu = chat_option_service.active_default_menu(db, business)
+        if menu is None:
+            return None
+        if not chat_option_service.conversation_is_inactive(db, conversation_id, customer_message.id):
+            return None
+
+        greeting = models.Message(
+            conversation_id=conversation_id,
+            sender_id=business.id,
+            content=chat_option_service.effective_greeting(menu),
+            is_auto_message=True,
+        )
+        business_view = await _create_and_dispatch_message(
+            db,
+            conversation_id,
+            greeting,
+            business,
+            greeting.content[:80],
+            options=[schemas.ChatOptionIn(title=o["title"], action=o["action"]) for o in menu.options],
+            mark_sender_read=False,  # the customer's message is still unread for the business
+        )
+        # The business's own open chat screen should show it too.
+        await _push_message_event(db, [business.id], greeting, "message", business_view)
+        return _to_message_out(db, greeting, customer.id)
+    except Exception:  # noqa: BLE001 - must never break the customer's send
+        logger.exception("default menu auto-send failed for conversation %s", conversation_id)
+        db.rollback()
+        return None
+
+
 async def _create_and_dispatch_message(
     db: Session,
     conversation_id: int,
@@ -750,6 +809,7 @@ async def _create_and_dispatch_message(
     current_user: models.User,
     preview: str,
     options: list[schemas.ChatOptionIn] | None = None,
+    mark_sender_read: bool = True,
 ) -> schemas.MessageOut:
     """Shared by send_message (text) and send_media_message (image/video/
     voice): persist the message, mark it read for the sender, create
@@ -766,8 +826,9 @@ async def _create_and_dispatch_message(
     db.refresh(message)
 
     my_participant = _get_participant_or_403(db, conversation_id, current_user.id)
-    my_participant.last_read_message_id = message.id
-    db.commit()
+    if mark_sender_read:
+        my_participant.last_read_message_id = message.id
+        db.commit()
 
     participant_ids = _conversation_participant_ids(db, conversation_id)
     recipient_ids = [uid for uid in participant_ids if uid != current_user.id]
@@ -849,9 +910,11 @@ async def send_message(
     )
     text = payload.content or default_preview
     preview = text if len(text) <= 80 else text[:77] + "..."
-    return await _create_and_dispatch_message(
+    message_out = await _create_and_dispatch_message(
         db, conversation_id, message, current_user, preview, options=payload.options
     )
+    message_out.auto_reply = await _maybe_send_default_menu(db, conversation_id, current_user, message)
+    return message_out
 
 
 @router.post(
@@ -899,7 +962,9 @@ async def send_media_message(
     )
     preview = caption or {"image": "Sent a photo", "video": "Sent a video", "audio": "Sent a voice message"}[kind]
     message_out = await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
+    auto_reply = await _maybe_send_default_menu(db, conversation_id, current_user, message)
     return schemas.MediaMessageResponse(
+        auto_reply=auto_reply,
         id=message_out.id,
         conversation_id=message_out.conversation_id,
         sender_id=message_out.sender_id,

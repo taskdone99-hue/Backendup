@@ -25,9 +25,11 @@ from app.services.media_service import (
     get_video_duration,
     save_upload_file,
 )
-from app.services import engagement, tag_service
+from app.services import editor_state_service, engagement, tag_service
 from app.services.video_settings_service import (
     as_utc,
+    comments_hidden,
+    like_count_hidden,
     likes_hidden_from,
     require_reel_viewable,
     visible_reels_clause,
@@ -49,7 +51,13 @@ def _to_post_detail(
 ) -> schemas.PostDetailOut:
     detail = schemas.PostDetailOut.model_validate(post)
     detail.user = schemas.UserSummaryOut.model_validate(post.user)
-    detail.likes_count = engagement.likes_count(db, models.LikeTargetType.post, post.id)
+    detail.likes_count = (
+        None
+        if likes_hidden_from(post, viewer_id)
+        else engagement.likes_count(db, models.LikeTargetType.post, post.id)
+    )
+    detail.like_count_hidden = like_count_hidden(post)
+    detail.comments_hidden = comments_hidden(post)
     detail.comments_count = engagement.comments_count(db, post.id)
     detail.share_count = engagement.shares_count(db, models.ShareContentType.post, post.id)
     detail.hashtags = extract_hashtags(post.caption)
@@ -163,6 +171,8 @@ def _to_reel_detail(
         else engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
     )
     detail.scheduled_at = as_utc(reel.scheduled_at)
+    detail.like_count_hidden = like_count_hidden(reel)
+    detail.comments_hidden = comments_hidden(reel)
     detail.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.reel, reel.id)
     detail.is_liked = detail.like_id is not None
     detail.comments_count = engagement.comments_count(db, reel_id=reel.id)
@@ -302,6 +312,9 @@ async def create_post(
     member_user_ids: str | None = Form(
         default=None, description="Comma-separated user ids, e.g. '12,15,20'"
     ),
+    editor_state: str | None = Form(
+        default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -372,10 +385,14 @@ async def create_post(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    # Validated before any file is written, so a bad editor_state leaves no orphan upload.
+    parsed_editor_state = editor_state_service.parse_form_value(editor_state)
+
     saved = [save_upload_file(f, "posts", allow_video=True) for f in upload_files]
     first_url, first_kind = saved[0]
     post = models.Post(
         user_id=current_user.id,
+        editor_state=parsed_editor_state,
         caption=caption,
         media_url=first_url,
         media_type=models.MediaType.video if first_kind == "video" else models.MediaType.image,
@@ -588,6 +605,9 @@ async def update_post(
 
     if "ai_generated" in updates and updates["ai_generated"] is not None:
         post.ai_generated = updates["ai_generated"]
+
+    if "editor_state" in updates:
+        post.editor_state = editor_state_service.check_object(updates["editor_state"])
 
     if "music" in updates:
         music = updates["music"]
@@ -826,6 +846,9 @@ async def create_reel(
         description="Optional. Use an existing saved sound (see GET /api/audio/{id}) as this "
         "reel's audio track. Leave unset for a reel with its own original audio."
     ) = None,
+    editor_state: str | None = Form(
+        default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION
+    ),
     tag_user_ids: str | None = Form(
         default=None, description="Comma-separated user ids to tag, e.g. '12,15,20'"
     ),
@@ -890,6 +913,9 @@ async def create_reel(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    # Validated before the file is written, so a bad editor_state leaves no orphan upload.
+    parsed_editor_state = editor_state_service.parse_form_value(editor_state)
+
     url, kind = save_upload_file(file, "reels", allow_video=True)
     if kind != "video":
         raise HTTPException(
@@ -913,6 +939,7 @@ async def create_reel(
 
     reel = models.Reel(
         user_id=current_user.id,
+        editor_state=parsed_editor_state,
         caption=caption,
         video_url=url,
         thumbnail_url=thumbnail_url,

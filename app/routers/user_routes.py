@@ -93,6 +93,60 @@ def _content_counts(
 # 2. User Profile
 # ==========================================================================
 
+@router.get(
+    "/api/users/me/engagement-settings",
+    response_model=schemas.UserEngagementSettingsOut,
+    summary="Get my global like-count / comments hiding settings",
+)
+def get_my_engagement_settings(current_user: models.User = Depends(get_current_user)):
+    """
+    Your **global** engagement switches. Requires authentication.
+
+    They apply to *every* post and reel you own (not a single one), and add to
+    any per-reel setting from `PUT /api/videos/{id}/engagement-settings` —
+    if either is on, it's hidden. Both default to `false`.
+    """
+    return schemas.UserEngagementSettingsOut(
+        hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments
+    )
+
+
+@router.put(
+    "/api/users/me/engagement-settings",
+    response_model=schemas.UserEngagementSettingsOut,
+    summary="Hide like counts / comments on all my posts and reels",
+    responses={400: {"description": "Neither field sent, or a field is null / not a boolean"}},
+)
+def update_my_engagement_settings(
+    payload: schemas.UserEngagementSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Send either or both fields; omitted ones keep their value. Takes effect
+    immediately on every existing and future post and reel of yours.
+
+    - `hide_like_count: true` — other users see `likes_count: null` (and
+      `like_count_hidden: true`) on your posts and reels, get `null` back when
+      they like one, and get 403 from `GET /api/posts|reels/{id}/likes`.
+    - `hide_comments: true` — other users get 403 from the comment list and
+      replies endpoints of your posts and reels (`comments_hidden: true`).
+      New comments are still accepted; use the per-reel
+      `comments_enabled` switch to stop those.
+
+    You, the owner, always see everything.
+    """
+    updates = payload.model_dump(exclude_unset=True)
+    for field in ("hide_like_count", "hide_comments"):
+        if field in updates:
+            setattr(current_user, field, updates[field])
+    db.commit()
+    db.refresh(current_user)
+    return schemas.UserEngagementSettingsOut(
+        hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments
+    )
+
+
 @router.get("/api/users/{user_id}", response_model=schemas.UserProfileOut)
 def get_user_profile(
     user_id: int,

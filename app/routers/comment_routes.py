@@ -78,6 +78,9 @@ def _guard_reel_comment(
     (refused while comments are hidden). Either way the reel itself must be
     viewable (private / not-yet-published reels 404)."""
     if comment.reel_id is None:
+        if comment.post_id is not None and reading_thread:
+            # Posts: only the owner's GLOBAL hide-comments switch applies.
+            require_comments_visible(_get_post_or_404(db, comment.post_id), viewer_id)
         return
     reel = _get_reel_or_404(db, comment.reel_id)
     require_reel_viewable(db, reel, viewer_id)
@@ -173,6 +176,7 @@ def get_comments(
     )
     viewer_id = current_user.id if current_user else None
     post = _get_post_or_404(db, post_id)
+    require_comments_visible(post, viewer_id)
     query = _restrict_filtered(query, post.user_id, viewer_id, db)
     total = query.count()
     comments = query.order_by(models.Comment.created_at.asc()).offset(offset).limit(limit).all()
@@ -378,7 +382,9 @@ def like_target(
         )
 
     liked_reel = None
-    if payload.target_type == models.LikeTargetType.reel:
+    if payload.target_type == models.LikeTargetType.post:
+        liked_reel = _get_post_or_404(db, payload.target_id)  # (a post: only its like-hiding is used below)
+    elif payload.target_type == models.LikeTargetType.reel:
         liked_reel = _get_reel_or_404(db, payload.target_id)
         require_reel_viewable(db, liked_reel, current_user.id)
     elif payload.target_type == models.LikeTargetType.comment:
@@ -489,7 +495,11 @@ def get_post_likes(
     db: Session = Depends(get_db),
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
-    _get_post_or_404(db, post_id)
+    post = _get_post_or_404(db, post_id)
+    if likes_hidden_from(post, current_user.id if current_user else None):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Likes are hidden on this post"
+        )
     query = (
         db.query(models.User)
         .join(models.Like, models.Like.user_id == models.User.id)

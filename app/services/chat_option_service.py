@@ -11,7 +11,7 @@ never from a client-supplied flag:
 Either one is enough; having both is fine.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -21,6 +21,13 @@ from app import models
 MAX_OPTIONS_PER_MESSAGE = 5
 TITLE_MAX_LENGTH = 24  # WhatsApp list-row title limit
 ACTION_MAX_LENGTH = 50
+
+# ---- default menu (automatic first-contact menu) ----
+DEFAULT_GREETING = "How can we help you?"
+GREETING_MAX_LENGTH = 1000
+# A conversation counts as "inactive" — so the menu is sent again — when
+# nothing a person wrote in it (auto-messages don't count) is newer than this.
+DEFAULT_MENU_INACTIVITY_HOURS = 24
 
 
 def is_business_user(user: models.User) -> bool:
@@ -82,3 +89,57 @@ def find_duplicate(
         if o.action.casefold() == action.casefold():
             return f"This message already has an option with action '{o.action}'"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Default menu — sent automatically to a customer who messages the business
+# ---------------------------------------------------------------------------
+
+def get_default_menu(db: Session, user_id: int) -> models.ChatDefaultMenu | None:
+    return (
+        db.query(models.ChatDefaultMenu)
+        .filter(models.ChatDefaultMenu.user_id == user_id)
+        .first()
+    )
+
+
+def effective_greeting(menu: models.ChatDefaultMenu | None) -> str:
+    return (menu.greeting if menu is not None and menu.greeting else DEFAULT_GREETING)
+
+
+def active_default_menu(db: Session, business: models.User) -> models.ChatDefaultMenu | None:
+    """The menu to send on behalf of `business`, or None. Needs ALL of: the
+    account is *currently* Business/active-Premium (a lapsed account stops
+    sending), the menu is enabled, and it has at least one option."""
+    if not is_eligible_sender(db, business):
+        return None
+    menu = get_default_menu(db, business.id)
+    if menu is None or not menu.is_enabled or not menu.options:
+        return None
+    return menu
+
+
+def conversation_is_inactive(db: Session, conversation_id: int, before_message_id: int) -> bool:
+    """True if, before message `before_message_id`, nobody had written in this
+    conversation within DEFAULT_MENU_INACTIVITY_HOURS (or ever).
+
+    Automatic messages (the account's welcome DM, earlier menus) and deleted
+    messages are ignored, so a brand-new thread — which already holds the
+    business's auto-intro — still counts as first contact."""
+    previous = (
+        db.query(models.Message)
+        .filter(
+            models.Message.conversation_id == conversation_id,
+            models.Message.id < before_message_id,
+            models.Message.is_deleted.is_(False),
+            models.Message.is_auto_message.is_(False),
+        )
+        .order_by(models.Message.id.desc())
+        .first()
+    )
+    if previous is None or previous.created_at is None:
+        return True
+    created = previous.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created < datetime.now(timezone.utc) - timedelta(hours=DEFAULT_MENU_INACTIVITY_HOURS)

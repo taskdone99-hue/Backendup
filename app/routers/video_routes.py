@@ -39,7 +39,7 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.services.media_service import generate_video_thumbnail, save_upload_file
 from app.services.location_service import find_or_create_location
-from app.services import video_settings_service as vss
+from app.services import editor_state_service, video_settings_service as vss
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
@@ -65,9 +65,13 @@ def upload_video(
     file: UploadFile,
     title: str | None = Form(default=None),
     caption: str | None = Form(default=None),
+    editor_state: str | None = Form(
+        default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    parsed_editor_state = editor_state_service.parse_form_value(editor_state)  # before the file is written
     url, kind = save_upload_file(file, "reels", allow_video=True)
     if kind != "video":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be a video")
@@ -76,7 +80,7 @@ def upload_video(
 
     video = models.Reel(
         user_id=current_user.id, title=title, caption=caption, video_url=url,
-        thumbnail_url=thumbnail_url,
+        thumbnail_url=thumbnail_url, editor_state=parsed_editor_state,
     )
     db.add(video)
     db.commit()
@@ -111,6 +115,9 @@ def update_video_metadata(
         video.title = updates["title"]
     if "description" in updates:
         video.caption = updates["description"]
+
+    if "editor_state" in updates:
+        video.editor_state = editor_state_service.check_object(updates["editor_state"])
 
     if "location" in updates:
         location = updates["location"]

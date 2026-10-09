@@ -809,6 +809,11 @@ class PostUpdate(BaseModel):
     # gets removed. Omit the field entirely to leave tags/members untouched.
     tag_user_ids: list[int] | None = None
     member_user_ids: list[int] | None = None
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="Replace the stored editor state with this JSON object (any structure, max 2 MB); "
+        "`null` clears it; omit to leave it unchanged.",
+    )
 
     @field_validator("caption", "alt_text")
     @classmethod
@@ -846,8 +851,23 @@ class NearbyLocationsResponse(BaseModel):
 
 class PostDetailOut(PostOut):
     user: UserSummaryOut | None = None
-    likes_count: int = 0
+    likes_count: int | None = Field(
+        default=0,
+        description="`null` when the owner hides like counts (their global setting) and the viewer is not the owner.",
+    )
     comments_count: int = 0
+    like_count_hidden: bool = Field(
+        default=False,
+        description="The owner hides like counts on this post: others get `likes_count: null` and no likers list.",
+    )
+    comments_hidden: bool = Field(
+        default=False,
+        description="The owner hides comments on this post: only the owner can read the thread (others get 403).",
+    )
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="The client editor's full state, stored and returned verbatim. `null` if none was saved.",
+    )
     share_count: int = 0
     hashtags: list[str] = []
     # All media attached to the post, in upload order. `media_url`/
@@ -1092,6 +1112,21 @@ class ReelDetailOut(ReelOut):
     scheduled_at: datetime | None = Field(
         default=None, description="UTC. Null unless a schedule is set."
     )
+    # EFFECTIVE hide state = the owner's global setting OR this reel's own
+    # `hide_like_count` / `hide_comments` above (which keep meaning "this
+    # reel's own switch" and are unchanged).
+    like_count_hidden: bool = Field(
+        default=False,
+        description="Like count is hidden from everyone but the owner (global setting or this reel's own).",
+    )
+    comments_hidden: bool = Field(
+        default=False,
+        description="Comment thread is hidden from everyone but the owner (global setting or this reel's own).",
+    )
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="The client editor's full state, stored and returned verbatim. `null` if none was saved.",
+    )
 
 
 class PaginatedReelDetailResponse(BaseModel):
@@ -1102,6 +1137,32 @@ class PaginatedReelDetailResponse(BaseModel):
 
 
 # ---- Tag controls, tagged feed, pending tags ----
+
+class UserEngagementSettingsOut(BaseModel):
+    """GLOBAL engagement switches — apply to every post and reel the user owns."""
+    hide_like_count: bool = Field(
+        False, description="Hide like counts (and who liked) on all my posts and reels from other users"
+    )
+    hide_comments: bool = Field(
+        False, description="Hide the comment thread on all my posts and reels from other users"
+    )
+
+
+class UserEngagementSettingsUpdate(BaseModel):
+    """PUT /api/users/me/engagement-settings — send either or both."""
+    hide_like_count: bool | None = None
+    hide_comments: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        sent = self.model_fields_set & {"hide_like_count", "hide_comments"}
+        if not sent:
+            raise ValueError("Send hide_like_count and/or hide_comments")
+        for name in sent:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} must be true or false, not null")
+        return self
+
 
 class TagSettingsOut(BaseModel):
     approve_tags_manually: bool = False
@@ -1161,6 +1222,11 @@ class VideoMetadataUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=150)
     description: str | None = Field(default=None, max_length=2200, description="Stored as the reel's caption")
     location: LocationIn | None = None
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="Replace the stored editor state with this JSON object (any structure, max 2 MB); "
+        "`null` clears it; omit to leave it unchanged.",
+    )
 
     @field_validator("title")
     @classmethod
@@ -1725,6 +1791,15 @@ def _clean_option_action(v: str) -> str:
     return v
 
 
+def _clean_greeting(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Greeting can't be empty (send null to use the default greeting)")
+    if len(v) > chat_option_service.GREETING_MAX_LENGTH:
+        raise ValueError(f"Greeting can be at most {chat_option_service.GREETING_MAX_LENGTH} characters")
+    return v
+
+
 class ChatOptionIn(BaseModel):
     """One button to create."""
     title: str = Field(..., description="Button label, 1-24 characters", examples=["Today's Deals"])
@@ -1804,6 +1879,58 @@ class ChatOptionOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ChatDefaultMenuUpdate(BaseModel):
+    """PUT /api/chat/options/default-menu — send only what changes."""
+    is_enabled: bool | None = Field(
+        default=None, description="Turn the automatic menu on/off. Needs at least one option to turn on."
+    )
+    greeting: str | None = Field(
+        default=None,
+        description="Text of the automatic message (max 1000 chars). `null` resets to the default greeting.",
+        examples=["Hi! Welcome to our shop. How can we help you?"],
+    )
+    options: list[ChatOptionIn] | None = Field(
+        default=None,
+        max_length=chat_option_service.MAX_OPTIONS_PER_MESSAGE,
+        description="The full menu, replacing the saved one (0-5 buttons, in display order).",
+    )
+
+    @field_validator("greeting")
+    @classmethod
+    def check_greeting(cls, v: str | None) -> str | None:
+        return None if v is None else _clean_greeting(v)
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        sent = self.model_fields_set & {"is_enabled", "greeting", "options"}
+        if not sent:
+            raise ValueError("Send at least one of is_enabled, greeting, options")
+        for name in ("is_enabled", "options"):
+            if name in sent and getattr(self, name) is None:
+                raise ValueError(f"{name} can't be null")
+        if self.options:
+            _reject_duplicate_options(self.options)
+        return self
+
+
+class ChatDefaultMenuOptionOut(BaseModel):
+    title: str
+    action: str
+
+
+class ChatDefaultMenuOut(BaseModel):
+    is_enabled: bool = False
+    greeting: str = Field(
+        chat_option_service.DEFAULT_GREETING,
+        description="The text that will be sent (the default greeting if you haven't set one).",
+    )
+    options: list[ChatDefaultMenuOptionOut] = []
+    inactivity_hours: int = Field(
+        chat_option_service.DEFAULT_MENU_INACTIVITY_HOURS,
+        description="The menu is (re)sent when a customer writes after this many hours of silence.",
+    )
 
 
 class ChatMessageOptionsOut(BaseModel):
@@ -1966,6 +2093,10 @@ class MessageOut(BaseModel):
     # Clickable buttons (Business / Premium senders). Always present; [] for an
     # ordinary message. Recipients only get enabled options.
     options: list[ChatOptionOut] = []
+    # Set only on the response to *your* send when it triggered the recipient's
+    # automatic default menu: the business's greeting message (with `options`),
+    # already created in the conversation. Otherwise null.
+    auto_reply: "MessageOut | None" = None
     # "sent" | "delivered" | "read" — see models.MessageStatus. Always
     # "sent" from the sender's own point of view isn't tracked separately;
     # this reflects the furthest state any recipient has reached.
@@ -2579,6 +2710,8 @@ class MediaMessageResponse(BaseModel):
     media_type: MediaType | None
     reply_to_message_id: int | None
     created_at: datetime
+    # The recipient's automatic default menu, if this send triggered it (see MessageOut.auto_reply).
+    auto_reply: MessageOut | None = None
 
     class Config:
         from_attributes = True

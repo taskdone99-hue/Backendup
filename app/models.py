@@ -193,6 +193,12 @@ class User(Base):
     # Nullable/free-form on purpose: the client owns the list of valid font
     # names, same way it owns theme names, so the API doesn't hardcode one.
     chat_font = Column(String(50), nullable=True)
+    # GLOBAL engagement switches (GET/PUT /api/users/me/engagement-settings):
+    # they apply to every post and reel this user owns, on top of any
+    # per-reel setting (Reel.hide_like_count / Reel.hide_comments) — either one
+    # being on is enough to hide.
+    hide_like_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    hide_comments = Column(Boolean, default=False, nullable=False, server_default=expression.false())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     refresh_tokens = relationship(
@@ -449,6 +455,10 @@ class Post(Base):
     # "AI info" disclosure label — whether the post's media was created or
     # edited with AI (Instagram's "AI-generated content" toggle).
     ai_generated = Column(Boolean, default=False, nullable=False)
+    # The client editor's complete state (trim/crop/zoom/rotation/filters/
+    # effects/text/stickers/media position & shape...). Opaque to the server:
+    # stored and returned verbatim. JSON on MySQL, JSON-as-text on SQLite.
+    editor_state = Column(JSON(none_as_null=True), nullable=True)
 
     user = relationship("User", back_populates="posts")
     saves = relationship("SavedPost", back_populates="post", cascade="all, delete-orphan")
@@ -639,6 +649,8 @@ class Reel(Base):
     schedule_enabled = Column(Boolean, default=False, nullable=False, server_default=expression.false())
     # Stored as a naive UTC datetime (see video_settings_service.to_storage_utc).
     scheduled_at = Column(DateTime, nullable=True, index=True)
+    # Same opaque editor blob as Post.editor_state.
+    editor_state = Column(JSON(none_as_null=True), nullable=True)
 
     user = relationship("User", back_populates="reels")
     location = relationship("Location", foreign_keys=[location_id])
@@ -1516,6 +1528,29 @@ class ChatMessageOption(Base):
     selections = relationship(
         "ChatMessageOptionSelection", back_populates="option", cascade="all, delete-orphan"
     )
+
+
+class ChatDefaultMenu(Base):
+    """A Business / Premium account's saved quick-reply menu. When a customer
+    messages them and the conversation has been inactive (see
+    chat_option_service.DEFAULT_MENU_INACTIVITY_HOURS), the backend sends
+    `greeting` from the business automatically with `options` attached as
+    ordinary message options. One row per account. `options` is a JSON list of
+    {"title", "action"} in display order (max MAX_OPTIONS_PER_MESSAGE)."""
+
+    __tablename__ = "chat_default_menus"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    is_enabled = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    greeting = Column(String(1000), nullable=True)  # NULL = DEFAULT_GREETING
+    options = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", foreign_keys=[user_id])
 
 
 class ChatMessageOptionSelection(Base):

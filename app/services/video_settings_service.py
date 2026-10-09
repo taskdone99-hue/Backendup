@@ -222,14 +222,36 @@ def require_comments_open(reel: models.Reel) -> None:
         )
 
 
-def require_comments_visible(reel: models.Reel, viewer_id: int | None) -> None:
-    """With `hide_comments`, only the owner can read the comment thread."""
-    if reel.hide_comments and viewer_id != reel.user_id:
+# The two hide switches exist at two levels: the owner's GLOBAL setting
+# (User.hide_like_count / hide_comments — covers every post and reel they
+# own) and, for reels only, the per-reel setting (Reel.hide_*). Hidden if
+# EITHER is on. Posts have no per-post switch, so for them only the global
+# one counts. These work on a Reel or a Post.
+
+def like_count_hidden(content) -> bool:
+    """Is this post/reel's like count hidden from everyone but the owner?"""
+    return bool(getattr(content, "hide_like_count", False)) or bool(
+        content.user is not None and content.user.hide_like_count
+    )
+
+
+def comments_hidden(content) -> bool:
+    """Is this post/reel's comment thread hidden from everyone but the owner?"""
+    return bool(getattr(content, "hide_comments", False)) or bool(
+        content.user is not None and content.user.hide_comments
+    )
+
+
+def require_comments_visible(content, viewer_id: int | None) -> None:
+    """When comments are hidden (globally or on this reel), only the owner can
+    read the thread."""
+    if comments_hidden(content) and viewer_id != content.user_id:
+        kind = "reel" if isinstance(content, models.Reel) else "post"
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Comments are hidden on this reel"
+            status_code=status.HTTP_403_FORBIDDEN, detail=f"Comments are hidden on this {kind}"
         )
 
 
-def likes_hidden_from(reel: models.Reel, viewer_id: int | None) -> bool:
-    """True when `viewer_id` must not be shown this reel's like count / likers."""
-    return bool(reel.hide_like_count) and viewer_id != reel.user_id
+def likes_hidden_from(content, viewer_id: int | None) -> bool:
+    """True when `viewer_id` must not be shown this post/reel's like count / likers."""
+    return like_count_hidden(content) and viewer_id != content.user_id

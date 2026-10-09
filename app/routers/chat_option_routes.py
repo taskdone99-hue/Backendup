@@ -8,6 +8,11 @@ so the client renders buttons straight from the normal message list / socket
 event. The endpoints here create, edit and remove them, record taps, and
 report how often each is used.
 
+Default menu: a Business/Premium account can save one menu
+(GET/PUT /api/chat/options/default-menu); the backend then attaches it
+automatically when a customer messages them (see
+chat_routes._maybe_send_default_menu).
+
 Authentication: every endpoint needs the usual `Authorization: Bearer <token>`.
 Eligibility is decided server-side (Business account, or active Premium
 membership) — see services/chat_option_service.py.
@@ -94,6 +99,104 @@ async def _push_options_changed(db: Session, message: models.Message, actor: mod
                 "message": out.model_dump(mode="json"),
             },
         )
+
+
+# ---- default menu (automatic first-contact menu) ----
+# NOTE: declared BEFORE the "/options/{conversation_id}" and "/options/{option_id}"
+# routes below on purpose: "default-menu" would otherwise be matched as their
+# integer path parameter and rejected.
+
+def _default_menu_out(menu: models.ChatDefaultMenu | None) -> schemas.ChatDefaultMenuOut:
+    return schemas.ChatDefaultMenuOut(
+        is_enabled=bool(menu.is_enabled) if menu is not None else False,
+        greeting=svc.effective_greeting(menu),
+        options=[
+            schemas.ChatDefaultMenuOptionOut(title=o["title"], action=o["action"])
+            for o in (menu.options if menu is not None else [])
+        ],
+    )
+
+
+@router.get(
+    "/options/default-menu",
+    response_model=schemas.ChatDefaultMenuOut,
+    summary="Get my automatic default menu",
+    responses={403: {"description": "Not a Business or Premium account"}},
+)
+def get_default_menu(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Your saved automatic menu. **Business and Premium accounts only** (403
+    otherwise — checked on the server). If you've never saved one you get the
+    defaults: disabled, the default greeting, no options.
+
+    **How it's used:** when a customer messages you and the conversation has
+    been quiet for `inactivity_hours` (first contact, or they come back after
+    a day), the backend automatically sends `greeting` from your account with
+    these `options` attached. The customer's own send response carries it in
+    `auto_reply`, and it arrives over the chat socket like any message. The
+    customer sends nothing special — a plain "Hi" is enough.
+    """
+    svc.require_eligible_sender(db, current_user)
+    return _default_menu_out(svc.get_default_menu(db, current_user.id))
+
+
+@router.put(
+    "/options/default-menu",
+    response_model=schemas.ChatDefaultMenuOut,
+    summary="Save my automatic default menu",
+    responses={
+        **_NOT_ELIGIBLE,
+        400: {"description": "Invalid title/action/greeting, more than 5 options, duplicates, "
+                             "or turning it on with no options"},
+    },
+)
+def update_default_menu(
+    payload: schemas.ChatDefaultMenuUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Create or update your menu — send only what changes.
+
+    - `is_enabled` — on/off. It can only be turned on when the menu has at
+      least one option (400 otherwise).
+    - `greeting` — the automatic message text (max 1000 chars); `null` resets
+      it to the default (*"How can we help you?"*).
+    - `options` — the **complete** menu, replacing what was saved: up to **5**
+      buttons, each with a `title` (1-24 chars) and an `action` (1-50 chars of
+      letters, digits, `_ - . :`), unique within the menu. `[]` clears it.
+
+    **Business and Premium accounts only** (403 otherwise). If your account
+    stops being Business/Premium the menu stays saved but is no longer sent.
+    Each automatic greeting is an ordinary message of yours with its own
+    option rows, so taps are recorded and selectable exactly like options you
+    attach by hand (`POST /api/chat/messages/{id}/option`).
+    """
+    svc.require_eligible_sender(db, current_user)
+    menu = svc.get_default_menu(db, current_user.id)
+    if menu is None:
+        menu = models.ChatDefaultMenu(user_id=current_user.id, is_enabled=False, options=[])
+        db.add(menu)
+
+    sent = payload.model_fields_set
+    if "options" in sent:
+        menu.options = [{"title": o.title, "action": o.action} for o in payload.options]
+    if "greeting" in sent:
+        menu.greeting = payload.greeting  # None -> back to the default text
+    if "is_enabled" in sent:
+        menu.is_enabled = payload.is_enabled
+    if menu.is_enabled and not menu.options:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Add at least one option before enabling the default menu",
+        )
+    db.commit()
+    db.refresh(menu)
+    return _default_menu_out(menu)
 
 
 # ---- create ----
