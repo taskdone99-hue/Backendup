@@ -663,6 +663,63 @@ class Reel(Base):
     )
 
 
+class ReelCaptionTrack(Base):
+    """Uploaded subtitle/caption file for a reel (SRT or WebVTT)."""
+    __tablename__ = "reel_caption_tracks"
+    __table_args__ = (UniqueConstraint("reel_id", "language", name="uq_reel_caption_language"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id", ondelete="CASCADE"), nullable=False, index=True)
+    language = Column(String(50), nullable=False)
+    format = Column(String(8), nullable=False)
+    file_url = Column(String(500), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ReelCommentDMAutomation(Base):
+    """Per-reel comment-to-DM configuration. Dispatch is intentionally separate."""
+    __tablename__ = "reel_comment_dm_automations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    enabled = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    greeting = Column(String(500), nullable=True)
+    message = Column(Text, nullable=True)
+    link_url = Column(String(1000), nullable=True)
+    button_label = Column(String(80), nullable=True)
+    button_url = Column(String(1000), nullable=True)
+    follow_gate_enabled = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    follow_message = Column(Text, nullable=True)
+    follow_link_url = Column(String(1000), nullable=True)
+    follow_button_label = Column(String(80), nullable=True)
+    follow_button_url = Column(String(1000), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ReelDraft(Base):
+    """Unpublished reel draft; it is separate from reels so normal feeds never expose it."""
+    __tablename__ = "reel_drafts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    video_url = Column(String(500), nullable=False)
+    thumbnail_url = Column(String(500), nullable=True)
+    title = Column(String(150), nullable=True)
+    caption = Column(Text, nullable=True)
+    language = Column(String(50), nullable=True)
+    ai_generated = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    audience = Column(String(20), nullable=True)
+    visibility = Column(String(20), nullable=False, default=ReelVisibility.public.value, server_default=ReelVisibility.public.value)
+    comments_enabled = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    hide_like_count = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    hide_comments = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    editor_state = Column(JSON(none_as_null=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class ReelCollaborator(Base):
     """A user tagged as a co-creator on a reel — powers POST /api/videos/:id/collaborators."""
 

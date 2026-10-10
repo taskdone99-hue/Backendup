@@ -31,13 +31,16 @@ that module's docstring for how to swap it for a real S3 `put_object` call
 in production — nothing in the routes below needs to change either way).
 """
 
+from pathlib import Path
+import uuid
+
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.auth import get_current_user
 from app.database import get_db
-from app.services.media_service import generate_video_thumbnail, save_upload_file
+from app.services.media_service import generate_video_thumbnail, save_upload_file, STATIC_ROOT, _public_url
 from app.services.location_service import find_or_create_location
 from app.services import editor_state_service, video_settings_service as vss
 
@@ -494,3 +497,215 @@ def delete_video_schedule(
         scheduled_at=None,
         video=_detail(db, video, current_user),
     )
+
+
+# ==========================================================================
+# Additional Krizil upload-page workflows: captions, drafts, comment-to-DM
+# ==========================================================================
+
+def _get_owned_draft_or_404(db: Session, draft_id: int, current_user: models.User) -> models.ReelDraft:
+    draft = db.query(models.ReelDraft).filter(models.ReelDraft.id == draft_id).first()
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only manage your own drafts")
+    return draft
+
+
+@router.post("/{video_id}/captions", response_model=schemas.ReelCaptionTrackOut, status_code=status.HTTP_201_CREATED)
+def upload_reel_captions(
+    video_id: int,
+    file: UploadFile,
+    language: str = Form(..., min_length=2, max_length=50),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Upload an SRT or VTT subtitle track. One track per language; re-upload replaces it."""
+    video = _get_owned_video_or_404(db, video_id, current_user)
+    filename = (file.filename or "").lower()
+    extension = Path(filename).suffix
+    if extension not in {".srt", ".vtt"}:
+        raise HTTPException(status_code=400, detail="Caption file must use .srt or .vtt format")
+    raw = file.file.read(5 * 1024 * 1024 + 1)
+    if not raw:
+        raise HTTPException(status_code=400, detail="Caption file is empty")
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Caption file exceeds 5 MB")
+    try:
+        raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Caption file must be UTF-8 text")
+    if extension == ".vtt" and not raw.decode("utf-8-sig").lstrip().startswith("WEBVTT"):
+        raise HTTPException(status_code=400, detail="VTT files must start with WEBVTT")
+    canonical_language = language.strip()
+    if not canonical_language:
+        raise HTTPException(status_code=400, detail="language is required")
+    folder = STATIC_ROOT / "captions"
+    folder.mkdir(parents=True, exist_ok=True)
+    filename_out = f"{uuid.uuid4().hex}{extension}"
+    (folder / filename_out).write_bytes(raw)
+    url = _public_url(f"captions/{filename_out}")
+    track = db.query(models.ReelCaptionTrack).filter(
+        models.ReelCaptionTrack.reel_id == video.id,
+        models.ReelCaptionTrack.language == canonical_language,
+    ).first()
+    if track is None:
+        track = models.ReelCaptionTrack(reel_id=video.id, language=canonical_language, format=extension[1:], file_url=url)
+        db.add(track)
+    else:
+        old_url = track.file_url
+        track.format = extension[1:]
+        track.file_url = url
+        try:
+            old_path = STATIC_ROOT / old_url.split("/static/", 1)[-1] if "/static/" in old_url else None
+            if old_path:
+                old_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    db.commit()
+    db.refresh(track)
+    return track
+
+
+@router.get("/{video_id}/captions", response_model=schemas.ReelCaptionTracksResponse)
+def list_reel_captions(
+    video_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user),
+):
+    _get_owned_video_or_404(db, video_id, current_user)
+    items = db.query(models.ReelCaptionTrack).filter(models.ReelCaptionTrack.reel_id == video_id).order_by(models.ReelCaptionTrack.language.asc()).all()
+    return schemas.ReelCaptionTracksResponse(items=items)
+
+
+@router.delete("/{video_id}/captions/{caption_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_reel_captions(
+    video_id: int, caption_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user),
+):
+    _get_owned_video_or_404(db, video_id, current_user)
+    track = db.query(models.ReelCaptionTrack).filter(models.ReelCaptionTrack.id == caption_id, models.ReelCaptionTrack.reel_id == video_id).first()
+    if track is None:
+        raise HTTPException(status_code=404, detail="Caption track not found")
+    url = track.file_url
+    db.delete(track)
+    db.commit()
+    try:
+        if "/static/" in url:
+            (STATIC_ROOT / url.split("/static/", 1)[-1]).unlink(missing_ok=True)
+    except OSError:
+        pass
+    return None
+
+
+@router.post("/drafts/upload", response_model=schemas.ReelDraftOut, status_code=status.HTTP_201_CREATED)
+def create_reel_draft(
+    file: UploadFile,
+    title: str | None = Form(default=None, max_length=150),
+    description: str | None = Form(default=None, max_length=2200),
+    language: str | None = Form(default=None, max_length=50),
+    ai_generated: bool = Form(default=False),
+    audience: str | None = Form(default=None),
+    visibility: str = Form(default="private"),
+    comments_enabled: bool = Form(default=True),
+    hide_like_count: bool = Form(default=False),
+    hide_comments: bool = Form(default=False),
+    editor_state: str | None = Form(default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    parsed_editor_state = editor_state_service.parse_form_value(editor_state)
+    if audience not in {None, "18_plus", "below_18"}:
+        raise HTTPException(status_code=400, detail="audience must be 18_plus or below_18")
+    if visibility not in {"public", "private", "members"}:
+        raise HTTPException(status_code=400, detail="visibility must be public, private or members")
+    video_url, kind = save_upload_file(file, "reels", allow_video=True)
+    if kind != "video":
+        raise HTTPException(status_code=400, detail="File must be a video")
+    draft = models.ReelDraft(
+        user_id=current_user.id, video_url=video_url, thumbnail_url=generate_video_thumbnail(video_url),
+        title=title, caption=description, language=language, ai_generated=ai_generated, audience=audience,
+        visibility=visibility, comments_enabled=comments_enabled, hide_like_count=hide_like_count,
+        hide_comments=hide_comments, editor_state=parsed_editor_state,
+    )
+    db.add(draft)
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+@router.get("/drafts", response_model=list[schemas.ReelDraftOut])
+def list_reel_drafts(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    return db.query(models.ReelDraft).filter(models.ReelDraft.user_id == current_user.id).order_by(models.ReelDraft.updated_at.desc(), models.ReelDraft.id.desc()).all()
+
+
+@router.put("/drafts/{draft_id}", response_model=schemas.ReelDraftOut)
+def update_reel_draft(
+    draft_id: int, payload: schemas.ReelDraftUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user),
+):
+    draft = _get_owned_draft_or_404(db, draft_id, current_user)
+    values = payload.model_dump(exclude_unset=True)
+    for key, value in values.items():
+        target = "caption" if key == "description" else key
+        if target == "audience" and value is not None:
+            value = value.value
+        if target == "visibility" and value is not None:
+            value = value.value
+        if target == "editor_state":
+            value = editor_state_service.check_object(value)
+        setattr(draft, target, value)
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+@router.delete("/drafts/{draft_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_reel_draft(draft_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    draft = _get_owned_draft_or_404(db, draft_id, current_user)
+    db.delete(draft)
+    db.commit()
+    return None
+
+
+@router.post("/drafts/{draft_id}/publish", response_model=schemas.ReelDraftPublishResponse, status_code=status.HTTP_201_CREATED)
+def publish_reel_draft(draft_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    draft = _get_owned_draft_or_404(db, draft_id, current_user)
+    if not draft.video_url:
+        raise HTTPException(status_code=400, detail="A video is required before publishing")
+    reel = models.Reel(
+        user_id=current_user.id, video_url=draft.video_url, thumbnail_url=draft.thumbnail_url, title=draft.title, caption=draft.caption,
+        language=draft.language, ai_generated=draft.ai_generated, audience=draft.audience, visibility=draft.visibility,
+        comments_enabled=draft.comments_enabled, hide_like_count=draft.hide_like_count, hide_comments=draft.hide_comments, editor_state=draft.editor_state,
+    )
+    db.add(reel)
+    db.flush()
+    draft_id_value = draft.id
+    db.delete(draft)
+    db.commit()
+    db.refresh(reel)
+    return schemas.ReelDraftPublishResponse(message="Draft published", draft_id=draft_id_value, reel=_to_reel_detail(db, reel, current_user.id))
+
+
+def _owned_automation_video(db: Session, video_id: int, current_user: models.User) -> models.Reel:
+    return _get_owned_video_or_404(db, video_id, current_user)
+
+
+@router.put("/{video_id}/comment-dm-automation", response_model=schemas.CommentDMAutomationOut)
+def upsert_comment_dm_automation(
+    video_id: int, payload: schemas.CommentDMAutomationUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user),
+):
+    _owned_automation_video(db, video_id, current_user)
+    automation = db.query(models.ReelCommentDMAutomation).filter(models.ReelCommentDMAutomation.reel_id == video_id).first()
+    if automation is None:
+        automation = models.ReelCommentDMAutomation(reel_id=video_id)
+        db.add(automation)
+    for key, value in payload.model_dump().items():
+        setattr(automation, key, value)
+    db.commit()
+    db.refresh(automation)
+    return automation
+
+
+@router.get("/{video_id}/comment-dm-automation", response_model=schemas.CommentDMAutomationOut | None)
+def get_comment_dm_automation(
+    video_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user),
+):
+    _owned_automation_video(db, video_id, current_user)
+    return db.query(models.ReelCommentDMAutomation).filter(models.ReelCommentDMAutomation.reel_id == video_id).first()

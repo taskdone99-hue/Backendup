@@ -2973,3 +2973,115 @@ class FollowStatusOut(BaseModel):
     is_following: bool
     is_followed_by: bool
     request_pending: bool
+
+
+# ---- Krizil video upload page: captions, drafts, and comment-to-DM configuration ----
+class ReelCaptionTrackOut(BaseModel):
+    id: int
+    reel_id: int
+    language: str
+    format: str
+    file_url: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class ReelCaptionTracksResponse(BaseModel):
+    items: list[ReelCaptionTrackOut]
+
+
+class ReelDraftCreateMetadata(BaseModel):
+    title: str | None = Field(default=None, max_length=150)
+    description: str | None = Field(default=None, max_length=2200)
+    language: str | None = Field(default=None, max_length=50)
+    ai_generated: bool = False
+    audience: ReelAudience | None = None
+    visibility: ReelVisibility = ReelVisibility.private
+    comments_enabled: bool = True
+    hide_like_count: bool = False
+    hide_comments: bool = False
+    editor_state: dict[str, Any] | None = None
+
+
+class ReelDraftOut(BaseModel):
+    id: int
+    user_id: int
+    video_url: str
+    thumbnail_url: str | None = None
+    title: str | None = None
+    caption: str | None = None
+    language: str | None = None
+    ai_generated: bool = False
+    audience: str | None = None
+    visibility: str
+    comments_enabled: bool
+    hide_like_count: bool
+    hide_comments: bool
+    editor_state: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class ReelDraftUpdate(BaseModel):
+    title: str | None = Field(default=None, max_length=150)
+    description: str | None = Field(default=None, max_length=2200)
+    language: str | None = Field(default=None, max_length=50)
+    ai_generated: bool | None = None
+    audience: ReelAudience | None = None
+    visibility: ReelVisibility | None = None
+    comments_enabled: bool | None = None
+    hide_like_count: bool | None = None
+    hide_comments: bool | None = None
+    editor_state: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def reject_null_for_required_settings(self):
+        for name in ("ai_generated", "visibility", "comments_enabled", "hide_like_count", "hide_comments"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
+
+
+class ReelDraftPublishResponse(BaseModel):
+    message: str
+    draft_id: int
+    reel: ReelDetailOut
+
+
+class CommentDMAutomationUpdate(BaseModel):
+    enabled: bool = False
+    greeting: str | None = Field(default=None, max_length=500)
+    message: str | None = Field(default=None, max_length=2200)
+    link_url: str | None = Field(default=None, max_length=1000)
+    button_label: str | None = Field(default=None, max_length=80)
+    button_url: str | None = Field(default=None, max_length=1000)
+    follow_gate_enabled: bool = False
+    follow_message: str | None = Field(default=None, max_length=2200)
+    follow_link_url: str | None = Field(default=None, max_length=1000)
+    follow_button_label: str | None = Field(default=None, max_length=80)
+    follow_button_url: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_automation(self):
+        if self.enabled and not (self.greeting or self.message):
+            raise ValueError("Provide a greeting or message when automation is enabled")
+        if self.follow_gate_enabled and not self.enabled:
+            raise ValueError("follow_gate_enabled requires enabled=true")
+        for field_name in ("link_url", "button_url", "follow_link_url", "follow_button_url"):
+            value = getattr(self, field_name)
+            if value and not value.lower().startswith(("https://", "http://")):
+                raise ValueError(f"{field_name} must be an http:// or https:// URL")
+        return self
+
+
+class CommentDMAutomationOut(CommentDMAutomationUpdate):
+    id: int
+    reel_id: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
