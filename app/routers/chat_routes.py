@@ -379,14 +379,27 @@ def get_or_create_direct_conversation(
     ))
 
     # Brand-new 1:1 thread — send the other person's auto-intro DM, as if
-    # it came from them, before either side has typed anything.
-    intro_text = _build_intro_message(other_user)
-    db.add(models.Message(
+    # it came from them, before either side has typed anything. If the other
+    # account has an enabled Business/Premium default menu, attach its saved
+    # greeting and options here so the customer sees the buttons immediately
+    # when opening the conversation (rather than an empty-options intro).
+    menu = chat_option_service.active_default_menu(db, other_user)
+    intro_text = (
+        chat_option_service.effective_greeting(menu)
+        if menu is not None else _build_intro_message(other_user)
+    )
+    intro = models.Message(
         conversation_id=conversation.id,
         sender_id=other_user.id,
         content=intro_text,
         is_auto_message=True,
-    ))
+    )
+    if menu is not None:
+        for position, option in enumerate(menu.options):
+            intro.options.append(models.ChatMessageOption(
+                title=option["title"], action=option["action"], display_order=position
+            ))
+    db.add(intro)
 
     db.commit()
     db.refresh(conversation)
@@ -775,6 +788,37 @@ async def _maybe_send_default_menu(
         menu = chat_option_service.active_default_menu(db, business)
         if menu is None:
             return None
+
+        # If the conversation was just created with the menu-bearing intro,
+        # return that already-persisted message rather than sending a duplicate
+        # greeting after the customer's first message. On later inactive
+        # conversations, the normal 24-hour re-send behavior still applies.
+        prior_human_message = (
+            db.query(models.Message)
+            .filter(
+                models.Message.conversation_id == conversation_id,
+                models.Message.id < customer_message.id,
+                models.Message.is_deleted.is_(False),
+                models.Message.is_auto_message.is_(False),
+            )
+            .order_by(models.Message.id.desc())
+            .first()
+        )
+        if prior_human_message is None:
+            intro = (
+                db.query(models.Message)
+                .filter(
+                    models.Message.conversation_id == conversation_id,
+                    models.Message.sender_id == business.id,
+                    models.Message.is_auto_message.is_(True),
+                    models.Message.is_deleted.is_(False),
+                )
+                .order_by(models.Message.id.desc())
+                .first()
+            )
+            if intro is not None and intro.options:
+                return _to_message_out(db, intro, customer.id)
+
         if not chat_option_service.conversation_is_inactive(db, conversation_id, customer_message.id):
             return None
 

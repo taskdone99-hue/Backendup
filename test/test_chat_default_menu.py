@@ -214,6 +214,24 @@ def test_default_menu_route_is_not_shadowed_by_the_id_routes(client, biz, normal
 
 # ------------------------------------------------------------------ automatic attach
 
+def test_new_conversation_intro_includes_saved_default_menu(client, biz, customer, convo):
+    _save_menu(client, biz, greeting="Welcome! Choose an option")
+    cid = convo(customer, biz)
+    client.login(customer)
+    thread = _messages(client, cid)
+    intro = next(m for m in thread if m["is_auto_message"] and m["sender_id"] == biz.id)
+    assert intro["content"] == "Welcome! Choose an option"
+    assert [(o["title"], o["action"]) for o in intro["options"]] == [
+        (o["title"], o["action"]) for o in MENU
+    ]
+
+    # The first customer message returns the existing intro as auto_reply,
+    # instead of creating a duplicate greeting.
+    sent = _send(client, cid, "Hi").json()
+    assert sent["auto_reply"]["id"] == intro["id"]
+    assert len(_messages(client, cid)) == 2
+
+
 def test_first_message_gets_the_businesss_menu_automatically(client, biz, customer, convo, db):
     cid = convo(customer, biz)  # also creates the business's usual welcome DM
     _save_menu(client, biz, greeting="Welcome! How can we help?")
