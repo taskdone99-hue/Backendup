@@ -193,6 +193,8 @@ class User(Base):
     # Nullable/free-form on purpose: the client owns the list of valid font
     # names, same way it owns theme names, so the API doesn't hardcode one.
     chat_font = Column(String(50), nullable=True)
+    # Preferred UI/content translation language (BCP-47-style short code).
+    preferred_language = Column(String(10), nullable=False, default="en", server_default="en")
     # GLOBAL engagement switches (GET/PUT /api/users/me/engagement-settings):
     # they apply to every post and reel this user owns, on top of any
     # per-reel setting (Reel.hide_like_count / Reel.hide_comments) — either one

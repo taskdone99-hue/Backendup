@@ -41,6 +41,7 @@ from app.routers import (
     report_routes,
     tag_routes,
     public_share_routes,
+    translation_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -121,6 +122,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 app.include_router(auth_routes.router)
 app.include_router(user_routes.router)
+app.include_router(translation_routes.router)
 app.include_router(story_routes.router)
 app.include_router(content_routes.router)
 app.include_router(content_routes.reels_router)
