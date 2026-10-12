@@ -459,6 +459,7 @@ class ReelOut(BaseModel):
     video_url: str
     thumbnail_url: str | None
     created_at: datetime
+    editor_state: dict | None = None
 
     class Config:
         from_attributes = True
