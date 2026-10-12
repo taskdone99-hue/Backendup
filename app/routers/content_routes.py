@@ -849,6 +849,25 @@ async def create_reel(
     editor_state: str | None = Form(
         default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION
     ),
+    recording_duration_seconds: float | None = Form(
+        default=None, ge=0, le=600,
+        description="Optional actual recording duration in seconds (0–600). Metadata only; video duration is measured from the uploaded file.",
+    ),
+    timer_duration_seconds: int | None = Form(
+        default=None, ge=0, le=10,
+        description="Optional pre-recording countdown duration in seconds (0–10).",
+    ),
+    filter_id: str | None = Form(
+        default=None, max_length=100,
+        description="Optional frontend filter identifier, e.g. smooth_blur. The client must apply the filter to the uploaded video.",
+    ),
+    playback_speed: int | None = Form(
+        default=None, description="Optional speed applied by the client before upload: 1, 2, or 3.",
+    ),
+    audio_start_seconds: int | None = Form(
+        default=None, ge=0,
+        description="Optional offset in seconds for the selected audio track; does not mix audio into the video.",
+    ),
     tag_user_ids: str | None = Form(
         default=None, description="Comma-separated user ids to tag, e.g. '12,15,20'"
     ),
@@ -913,8 +932,30 @@ async def create_reel(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    # Validated before the file is written, so a bad editor_state leaves no orphan upload.
+    # Validate editing metadata before any media is written. These settings are
+    # metadata only: the frontend must apply filters/speed and mix audio into
+    # the video itself before upload.
     parsed_editor_state = editor_state_service.parse_form_value(editor_state)
+    if playback_speed is not None and playback_speed not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="playback_speed must be one of 1, 2, or 3")
+    if audio_start_seconds is not None and audio_id is None:
+        raise HTTPException(status_code=400, detail="audio_start_seconds requires audio_id")
+    if audio is not None and audio_start_seconds is not None and audio.duration_seconds is not None:
+        if audio_start_seconds > audio.duration_seconds:
+            raise HTTPException(status_code=400, detail="audio_start_seconds cannot exceed audio duration")
+
+    editing_fields = {
+        "recording_duration_seconds": recording_duration_seconds,
+        "timer_duration_seconds": timer_duration_seconds,
+        "filter_id": filter_id,
+        "playback_speed": playback_speed,
+        "audio_start_seconds": audio_start_seconds,
+    }
+    editing_fields = {key: value for key, value in editing_fields.items() if value is not None}
+    if editing_fields:
+        parsed_editor_state = {**(parsed_editor_state or {}), **editing_fields}
+        # Reuse the editor-state size/JSON validation for the merged object.
+        parsed_editor_state = editor_state_service.check_object(parsed_editor_state)
 
     url, kind = save_upload_file(file, "reels", allow_video=True)
     if kind != "video":
