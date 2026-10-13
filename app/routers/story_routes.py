@@ -337,6 +337,29 @@ def create_story(
     close_friends_only: bool = Form(
         default=False, description="If true, only visible to users on your Close Friends list"
     ),
+    # Camera-screen editing options
+    editor_state: str | None = Form(
+        default=None,
+        description="JSON object containing filters, crop, rotation, text, stickers, and other editor settings",
+    ),
+    recording_duration_seconds: float | None = Form(
+        default=None, ge=0, le=600,
+    ),
+    timer_duration_seconds: int | None = Form(
+        default=None, ge=0, le=10,
+    ),
+    filter_id: str | None = Form(
+        default=None, max_length=100,
+    ),
+    playback_speed: int | None = Form(
+        default=None, description="Allowed values: 1, 2, or 3",
+    ),
+    audio_id: int | None = Form(
+        default=None, gt=0,
+    ),
+    audio_start_seconds: int | None = Form(
+        default=None, ge=0,
+    ),
 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),

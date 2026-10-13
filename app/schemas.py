@@ -640,6 +640,7 @@ class StoryOut(BaseModel):
     poll: "StoryPollOut | None" = None
     question: "StoryQuestionOut | None" = None
     close_friends_only: bool = False
+    editor_state: dict[str, Any] | None = None
 
     class Config:
         from_attributes = True

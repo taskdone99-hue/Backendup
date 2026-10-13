@@ -1137,7 +1137,8 @@ class Story(Base):
     visibility = Column(
         Enum(StoryVisibility), default=StoryVisibility.public, nullable=False
     )
-
+        # Camera/editor metadata; NULL for stories created before this feature.
+    editor_state = Column(JSON(none_as_null=True), nullable=True)
     user = relationship("User", back_populates="stories")
     views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
     reactions = relationship("StoryReaction", back_populates="story", cascade="all, delete-orphan")
