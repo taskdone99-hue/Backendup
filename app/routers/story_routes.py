@@ -472,6 +472,45 @@ def create_story(
             detail=str(e),
         )
 
+    # Validate editor settings before writing story media.
+    parsed_editor_state = _parse_editor_state(editor_state)
+    if playback_speed is not None and playback_speed not in (1, 2, 3):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="playback_speed must be 1, 2, or 3",
+        )
+    if audio_start_seconds is not None and audio_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="audio_start_seconds requires audio_id",
+        )
+
+    camera_settings = {
+        "recording_duration_seconds": recording_duration_seconds,
+        "timer_duration_seconds": timer_duration_seconds,
+        "filter_id": filter_id,
+        "playback_speed": playback_speed,
+        "audio_id": audio_id,
+        "audio_start_seconds": audio_start_seconds,
+    }
+    camera_settings = {k: v for k, v in camera_settings.items() if v is not None}
+    if camera_settings:
+        parsed_editor_state = {**(parsed_editor_state or {}), **camera_settings}
+        try:
+            encoded_state = json.dumps(
+                parsed_editor_state, ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="editor_state must contain valid JSON values",
+            )
+        if len(encoded_state) > MAX_EDITOR_STATE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="editor_state is too large",
+            )
+
     # ---------------------------------------------------------------
     # Save uploaded story media
     # ---------------------------------------------------------------
@@ -488,6 +527,7 @@ def create_story(
 
     story = models.Story(
         user_id=current_user.id,
+        editor_state=parsed_editor_state,
         media_url=url,
         media_type=(
             models.MediaType.video
@@ -1084,6 +1124,7 @@ def publish_story_draft(
         media_url=draft.media_url,
         media_type=draft.media_type,
         caption=draft.caption,
+        editor_state=draft.editor_state,
         expires_at=datetime.now(timezone.utc) + timedelta(hours=STORY_LIFETIME_HOURS),
         # Story only stores location_id (no flat name/lat/lng columns,
         # unlike StoryDraft/Reel/Post) — the draft's flat fields were just

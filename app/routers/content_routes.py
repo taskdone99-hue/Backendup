@@ -315,6 +315,11 @@ async def create_post(
     editor_state: str | None = Form(
         default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION
     ),
+    recording_duration_seconds: float | None = Form(default=None, ge=0, le=600),
+    timer_duration_seconds: int | None = Form(default=None, ge=0, le=10),
+    filter_id: str | None = Form(default=None, max_length=100),
+    playback_speed: int | None = Form(default=None, description="Allowed values: 1, 2, or 3"),
+    audio_start_seconds: int | None = Form(default=None, ge=0),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -385,8 +390,33 @@ async def create_post(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    # Validated before any file is written, so a bad editor_state leaves no orphan upload.
+    # Validate editor settings before writing any media.
     parsed_editor_state = editor_state_service.parse_form_value(editor_state)
+    if playback_speed is not None and playback_speed not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="playback_speed must be 1, 2, or 3")
+
+    camera_settings = {
+        "recording_duration_seconds": recording_duration_seconds,
+        "timer_duration_seconds": timer_duration_seconds,
+        "filter_id": filter_id,
+        "playback_speed": playback_speed,
+        "audio_start_seconds": audio_start_seconds,
+    }
+    camera_settings = {k: v for k, v in camera_settings.items() if v is not None}
+    if audio_start_seconds is not None and not (
+        music_title or music_url
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="audio_start_seconds requires music_title or music_url",
+        )
+
+    if camera_settings:
+        parsed_editor_state = {
+            **(parsed_editor_state or {}),
+            **camera_settings,
+        }
+        editor_state_service.check_object(parsed_editor_state)
 
     saved = [save_upload_file(f, "posts", allow_video=True) for f in upload_files]
     first_url, first_kind = saved[0]
