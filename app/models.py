@@ -292,6 +292,22 @@ class Follow(Base):
     following = relationship("User", foreign_keys=[following_id])
 
 
+class UserSocialLink(Base):
+    """A user's public social/profile links, managed by /api/users/{id}/social-links."""
+    __tablename__ = "user_social_links"
+    __table_args__ = (
+        UniqueConstraint("user_id", "platform", name="uq_user_social_link_platform"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    platform = Column(String(40), nullable=False)
+    url = Column(String(1000), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    user = relationship("User")
+
+
 class FollowRequest(Base):
     """
     A pending follow request to a private account. Only pending requests
