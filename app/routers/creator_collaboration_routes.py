@@ -28,6 +28,8 @@ def _to_out(request: models.CreatorCollaborationRequest) -> schemas.CreatorColla
         message=request.message,
         proposed_revenue_share_percentage=request.proposed_revenue_share_percentage,
         proposed_amount_cents=request.proposed_amount_cents,
+        watch_time_share_percentage=request.watch_time_share_percentage,
+        watch_time_expires_at=request.watch_time_expires_at,
         status=request.status,
         created_at=request.created_at,
         responded_at=request.responded_at,
@@ -48,6 +50,8 @@ async def create_collaboration_request(
         message=payload.message,
         proposed_revenue_share_percentage=payload.proposed_revenue_share_percentage,
         proposed_amount_cents=payload.proposed_amount_cents,
+        watch_time_share_percentage=payload.watch_time_share_percentage,
+        watch_time_expires_at=payload.watch_time_expires_at,
     )
     return _to_out(request)
 

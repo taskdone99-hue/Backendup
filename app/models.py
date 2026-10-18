@@ -1904,6 +1904,9 @@ class CreatorCollaborationRequest(Base):
     # one-time payout credited as a CreatorEarning on acceptance.
     proposed_revenue_share_percentage = Column(Integer, nullable=True)
     proposed_amount_cents = Column(Integer, nullable=True)
+    # Optional per-collaborator watch-time allocation and its expiry.
+    watch_time_share_percentage = Column(Integer, nullable=True)
+    watch_time_expires_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(Enum(CollaborationStatus), nullable=False, default=CollaborationStatus.pending, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     responded_at = Column(DateTime(timezone=True), nullable=True)

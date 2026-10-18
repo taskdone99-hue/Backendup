@@ -2420,6 +2420,8 @@ class CreatorCollaborationCreate(BaseModel):
     message: str | None = Field(default=None, max_length=500)
     proposed_revenue_share_percentage: int | None = Field(default=None, ge=0, le=100)
     proposed_amount_cents: int | None = Field(default=None, ge=0)
+    watch_time_share_percentage: int | None = Field(default=None, ge=0, le=100)
+    watch_time_expires_at: datetime | None = None
 
     @field_validator("message")
     @classmethod
@@ -2435,6 +2437,8 @@ class CreatorCollaborationOut(BaseModel):
     message: str | None
     proposed_revenue_share_percentage: int | None
     proposed_amount_cents: int | None
+    watch_time_share_percentage: int | None
+    watch_time_expires_at: datetime | None
     status: CollaborationStatus
     created_at: datetime
     responded_at: datetime | None

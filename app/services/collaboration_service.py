@@ -141,6 +141,8 @@ async def create_request(
     message: str | None,
     proposed_revenue_share_percentage: int | None,
     proposed_amount_cents: int | None,
+    watch_time_share_percentage: int | None = None,
+    watch_time_expires_at=None,
 ) -> models.CreatorCollaborationRequest:
     requester_id = requester.id
 
@@ -181,6 +183,8 @@ async def create_request(
         message=message,
         proposed_revenue_share_percentage=proposed_revenue_share_percentage,
         proposed_amount_cents=proposed_amount_cents,
+        watch_time_share_percentage=watch_time_share_percentage,
+        watch_time_expires_at=watch_time_expires_at,
         status=models.CollaborationStatus.pending,
     )
     db.add(request)
