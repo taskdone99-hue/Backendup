@@ -379,6 +379,36 @@ def update_video_audience(
 
 
 @router.put(
+    "/{video_id}/age-restriction",
+    response_model=schemas.VideoAgeRestrictionResponse,
+    summary="Set the video's age restriction",
+)
+def update_video_age_restriction(
+    video_id: int,
+    payload: schemas.VideoAgeRestrictionUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Update the age category independently from the viewer audience."""
+    video = _get_owned_video_or_404(db, video_id, current_user)
+
+    video.age_restriction = (
+        payload.age_restriction.value
+        if payload.age_restriction is not None
+        else None
+    )
+
+    db.commit()
+    db.refresh(video)
+
+    return schemas.VideoAgeRestrictionResponse(
+        message="Age restriction updated",
+        video_id=video.id,
+        age_restriction=video.age_restriction,
+        video=_detail(db, video, current_user),
+    )
+
+@router.put(
     "/{video_id}/visibility",
     response_model=schemas.VideoVisibilityResponse,
     summary="Set who can see the video (public, private, members)",
