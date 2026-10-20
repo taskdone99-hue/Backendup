@@ -18,7 +18,8 @@ full updated video):
   PUT    /api/videos/{id}/language             -> spoken language
   PUT    /api/videos/{id}/ai-content           -> "AI-generated content" label
   PUT    /api/videos/{id}/engagement-settings  -> comments on/off, hide likes, hide comments
-  PUT    /api/videos/{id}/audience             -> 18_plus | below_18
+  PUT    /api/videos/{id}/audience             -> everyone | followers | close_friends
+  PUT    /api/videos/{id}/age-restriction       -> 18_plus | below_18 (separate age category)
   PUT    /api/videos/{id}/visibility           -> public | private | members
   PUT    /api/videos/{id}/schedule             -> publish at a future UTC time
   DELETE /api/videos/{id}/schedule             -> cancel the schedule (goes live now)
@@ -335,7 +336,7 @@ def update_video_engagement_settings(
     """
     video = _get_owned_video_or_404(db, video_id, current_user)
     updates = payload.model_dump(exclude_unset=True)
-    for field in ("comments_enabled", "hide_like_count", "hide_comments"):
+    for field in ("comments_enabled", "hide_like_count", "hide_comments", "remixing_enabled", "downloads_enabled"):
         if field in updates:
             setattr(video, field, updates[field])
     db.commit()
@@ -345,6 +346,8 @@ def update_video_engagement_settings(
         comments_enabled=video.comments_enabled,
         hide_like_count=video.hide_like_count,
         hide_comments=video.hide_comments,
+        remixing_enabled=video.remixing_enabled,
+        downloads_enabled=video.downloads_enabled,
         video=_detail(db, video, current_user),
     )
 
@@ -352,7 +355,7 @@ def update_video_engagement_settings(
 @router.put(
     "/{video_id}/audience",
     response_model=schemas.VideoAudienceResponse,
-    summary="Set the video's audience (18_plus or below_18)",
+    summary="Set who can view the video (everyone, followers, close_friends)",
 )
 def update_video_audience(
     video_id: int,
@@ -361,9 +364,8 @@ def update_video_audience(
     current_user: models.User = Depends(get_current_user),
 ):
     """
-    Stores the audience label: exactly `18_plus` or `below_18` (anything else
-    is a 400). It is stored and returned only — it does not yet restrict who
-    can watch. Videos that predate it read as `audience: null`. Owner only.
+    Stores the viewer audience. Age category is separate in /age-restriction.
+    Owner only. Visibility enforcement is handled by the content-access layer.
     """
     video = _get_owned_video_or_404(db, video_id, current_user)
     video.audience = payload.audience.value
@@ -602,18 +604,23 @@ def create_reel_draft(
     description: str | None = Form(default=None, max_length=2200),
     language: str | None = Form(default=None, max_length=50),
     ai_generated: bool = Form(default=False),
-    audience: str | None = Form(default=None),
+    audience: str = Form(default="everyone"),
+    age_restriction: str | None = Form(default=None),
     visibility: str = Form(default="private"),
     comments_enabled: bool = Form(default=True),
     hide_like_count: bool = Form(default=False),
     hide_comments: bool = Form(default=False),
+    remixing_enabled: bool = Form(default=True),
+    downloads_enabled: bool = Form(default=True),
     editor_state: str | None = Form(default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     parsed_editor_state = editor_state_service.parse_form_value(editor_state)
-    if audience not in {None, "18_plus", "below_18"}:
-        raise HTTPException(status_code=400, detail="audience must be 18_plus or below_18")
+    if audience not in {"everyone", "followers", "close_friends"}:
+        raise HTTPException(status_code=400, detail="audience must be everyone, followers or close_friends")
+    if age_restriction not in {None, "18_plus", "below_18"}:
+        raise HTTPException(status_code=400, detail="age_restriction must be 18_plus or below_18")
     if visibility not in {"public", "private", "members"}:
         raise HTTPException(status_code=400, detail="visibility must be public, private or members")
     video_url, kind = save_upload_file(file, "reels", allow_video=True)
@@ -622,8 +629,10 @@ def create_reel_draft(
     draft = models.ReelDraft(
         user_id=current_user.id, video_url=video_url, thumbnail_url=generate_video_thumbnail(video_url),
         title=title, caption=description, language=language, ai_generated=ai_generated, audience=audience,
-        visibility=visibility, comments_enabled=comments_enabled, hide_like_count=hide_like_count,
-        hide_comments=hide_comments, editor_state=parsed_editor_state,
+        age_restriction=age_restriction, visibility=visibility, comments_enabled=comments_enabled,
+        hide_like_count=hide_like_count, hide_comments=hide_comments,
+        remixing_enabled=remixing_enabled, downloads_enabled=downloads_enabled,
+        editor_state=parsed_editor_state,
     )
     db.add(draft)
     db.commit()
@@ -644,7 +653,7 @@ def update_reel_draft(
     values = payload.model_dump(exclude_unset=True)
     for key, value in values.items():
         target = "caption" if key == "description" else key
-        if target == "audience" and value is not None:
+        if target in {"audience", "age_restriction", "visibility"} and value is not None:
             value = value.value
         if target == "visibility" and value is not None:
             value = value.value
@@ -671,8 +680,11 @@ def publish_reel_draft(draft_id: int, db: Session = Depends(get_db), current_use
         raise HTTPException(status_code=400, detail="A video is required before publishing")
     reel = models.Reel(
         user_id=current_user.id, video_url=draft.video_url, thumbnail_url=draft.thumbnail_url, title=draft.title, caption=draft.caption,
-        language=draft.language, ai_generated=draft.ai_generated, audience=draft.audience, visibility=draft.visibility,
-        comments_enabled=draft.comments_enabled, hide_like_count=draft.hide_like_count, hide_comments=draft.hide_comments, editor_state=draft.editor_state,
+        language=draft.language, ai_generated=draft.ai_generated, audience=draft.audience,
+        age_restriction=draft.age_restriction, visibility=draft.visibility,
+        comments_enabled=draft.comments_enabled, hide_like_count=draft.hide_like_count,
+        hide_comments=draft.hide_comments, remixing_enabled=draft.remixing_enabled,
+        downloads_enabled=draft.downloads_enabled, editor_state=draft.editor_state,
     )
     db.add(reel)
     db.flush()

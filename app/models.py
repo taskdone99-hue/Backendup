@@ -605,8 +605,15 @@ class ReelVisibility(str, enum.Enum):
 
 
 class ReelAudience(str, enum.Enum):
-    """Audience label chosen on the upload page (PUT /api/videos/:id/audience).
-    Exactly the two options the upload page offers — nothing else is valid."""
+    """Who can view a reel; independent from age categorisation."""
+
+    everyone = "everyone"
+    followers = "followers"
+    close_friends = "close_friends"
+
+
+class ReelAgeRestriction(str, enum.Enum):
+    """Age category supplied by the client. This label alone does not verify age."""
 
     adult = "18_plus"
     below_18 = "below_18"
@@ -659,7 +666,10 @@ class Reel(Base):
     comments_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
     hide_like_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
     hide_comments = Column(Boolean, default=False, nullable=False, server_default=expression.false())
-    audience = Column(String(20), nullable=True)
+    audience = Column(String(20), nullable=False, default=ReelAudience.everyone.value, server_default=ReelAudience.everyone.value)
+    age_restriction = Column(String(20), nullable=True)
+    remixing_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
+    downloads_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
     visibility = Column(
         String(20), default=ReelVisibility.public.value, nullable=False,
         server_default=ReelVisibility.public.value, index=True,
@@ -728,11 +738,14 @@ class ReelDraft(Base):
     caption = Column(Text, nullable=True)
     language = Column(String(50), nullable=True)
     ai_generated = Column(Boolean, nullable=False, default=False, server_default=expression.false())
-    audience = Column(String(20), nullable=True)
+    audience = Column(String(20), nullable=False, default=ReelAudience.everyone.value, server_default=ReelAudience.everyone.value)
+    age_restriction = Column(String(20), nullable=True)
     visibility = Column(String(20), nullable=False, default=ReelVisibility.public.value, server_default=ReelVisibility.public.value)
     comments_enabled = Column(Boolean, nullable=False, default=True, server_default=expression.true())
     hide_like_count = Column(Boolean, nullable=False, default=False, server_default=expression.false())
     hide_comments = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    remixing_enabled = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    downloads_enabled = Column(Boolean, nullable=False, default=True, server_default=expression.true())
     editor_state = Column(JSON(none_as_null=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

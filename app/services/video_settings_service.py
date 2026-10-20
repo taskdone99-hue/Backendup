@@ -160,19 +160,35 @@ def viewer_is_member(db: Session, reel: models.Reel, viewer_id: int | None) -> b
 
 
 def viewer_can_view(db: Session, reel: models.Reel, viewer_id: int | None) -> bool:
-    """Visibility + schedule check for one reel. (Block / private-account
-    rules are separate — content_routes._require_author_visible.)"""
+    """Audience, visibility and schedule check for one reel."""
     if viewer_id is not None:
         if reel.user_id == viewer_id or _is_collaborator(db, reel, viewer_id):
             return True
     if is_schedule_pending(reel):
         return False
     visibility = reel.visibility or models.ReelVisibility.public.value
-    if visibility == models.ReelVisibility.public.value:
-        return True
     if visibility == models.ReelVisibility.members.value:
-        return viewer_is_member(db, reel, viewer_id)
-    return False  # private (or any unknown value: fail closed)
+        if not viewer_is_member(db, reel, viewer_id):
+            return False
+    elif visibility != models.ReelVisibility.public.value:
+        return False  # private (or unknown value: fail closed)
+
+    audience = getattr(reel, "audience", None) or models.ReelAudience.everyone.value
+    if audience == models.ReelAudience.everyone.value:
+        return True
+    if viewer_id is None:
+        return False
+    if audience == models.ReelAudience.followers.value:
+        return db.query(models.Follow.id).filter(
+            models.Follow.follower_id == viewer_id,
+            models.Follow.following_id == reel.user_id,
+        ).first() is not None
+    if audience == models.ReelAudience.close_friends.value:
+        return db.query(models.CloseFriend.id).filter(
+            models.CloseFriend.owner_id == reel.user_id,
+            models.CloseFriend.friend_id == viewer_id,
+        ).first() is not None
+    return False
 
 
 def require_reel_viewable(db: Session, reel: models.Reel, viewer_id: int | None) -> None:
@@ -196,7 +212,16 @@ def visible_reels_clause(db: Session, viewer_id: int | None):
         models.Reel.visibility == models.ReelVisibility.public.value,
         models.Reel.visibility.is_(None),
     )
-    open_to_everyone = and_(public, live)
+    audience = or_(models.Reel.audience == models.ReelAudience.everyone.value, models.Reel.audience.is_(None))
+    if viewer_id is not None:
+        followed_creator_ids = db.query(models.Follow.following_id).filter(models.Follow.follower_id == viewer_id)
+        close_friend_creator_ids = db.query(models.CloseFriend.owner_id).filter(models.CloseFriend.friend_id == viewer_id)
+        audience = or_(
+            audience,
+            and_(models.Reel.audience == models.ReelAudience.followers.value, models.Reel.user_id.in_(followed_creator_ids)),
+            and_(models.Reel.audience == models.ReelAudience.close_friends.value, models.Reel.user_id.in_(close_friend_creator_ids)),
+        )
+    open_to_everyone = and_(public, live, audience)
     if viewer_id is None:
         return open_to_everyone
     collab_reel_ids = db.query(models.ReelCollaborator.reel_id).filter(

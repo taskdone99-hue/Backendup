@@ -31,7 +31,7 @@ SETTING_ENDPOINTS = {
     "language": {"language": "English"},
     "ai-content": {"ai_generated": True},
     "engagement-settings": {"comments_enabled": False},
-    "audience": {"audience": "18_plus"},
+    "audience": {"audience": "everyone"},
     "visibility": {"visibility": "private"},
     "schedule": {"schedule_enabled": True, "scheduled_at": "2999-01-01T00:00:00"},
 }
@@ -397,7 +397,7 @@ def test_hide_comments_still_lets_people_comment(client, make_user, make_reel):
 
 # =========================================================== audience
 
-@pytest.mark.parametrize("value", ["18_plus", "below_18"])
+@pytest.mark.parametrize("value", ["everyone", "followers", "close_friends"])
 def test_audience_saves_allowed_values(client, make_user, make_reel, value):
     owner = make_user("owner")
     reel = make_reel(owner)
@@ -409,28 +409,75 @@ def test_audience_saves_allowed_values(client, make_user, make_reel, value):
     assert client.get(f"/api/reels/{reel.id}").json()["audience"] == value
 
 
-@pytest.mark.parametrize("bad", ["18+", "adult", "everyone", "", "ALL", 18, None])
+@pytest.mark.parametrize("bad", ["18+", "adult", "18_plus", "below_18", "", "ALL", 18, None])
 def test_audience_rejects_anything_else(client, make_user, make_reel, db, bad):
     owner = make_user("owner")
     reel = make_reel(owner)
     client.login(owner)
-    _set(client, reel.id, "audience", {"audience": "below_18"})
+    _set(client, reel.id, "audience", {"audience": "followers"})
     r = _set(client, reel.id, "audience", {"audience": bad})
     assert r.status_code == 400
     db.refresh(reel)
-    assert reel.audience == "below_18"
+    assert reel.audience == "followers"
 
 
-def test_audience_unset_for_existing_records(client, make_user, make_reel):
+def test_audience_defaults_to_everyone_for_existing_records(client, make_user, make_reel):
     reel = make_reel(make_user("owner"))
-    assert client.get(f"/api/reels/{reel.id}").json()["audience"] is None
+    assert client.get(f"/api/reels/{reel.id}").json()["audience"] == "everyone"
+
+
+def test_followers_audience_hides_reel_from_non_followers(client, make_user, make_reel, db):
+    owner, viewer = make_user("owner"), make_user("viewer")
+    reel = make_reel(owner)
+    reel.audience = "followers"
+    db.commit()
+    client.login(viewer)
+    assert client.get(f"/api/reels/{reel.id}").status_code == 404
+    db.add(models.Follow(follower_id=viewer.id, following_id=owner.id))
+    db.commit()
+    assert client.get(f"/api/reels/{reel.id}").status_code == 200
+
+
+def test_close_friends_audience_hides_reel_from_non_friends(client, make_user, make_reel, db):
+    owner, viewer = make_user("owner"), make_user("viewer")
+    reel = make_reel(owner)
+    reel.audience = "close_friends"
+    db.commit()
+    client.login(viewer)
+    assert client.get(f"/api/reels/{reel.id}").status_code == 404
+    db.add(models.CloseFriend(owner_id=owner.id, friend_id=viewer.id))
+    db.commit()
+    assert client.get(f"/api/reels/{reel.id}").status_code == 200
 
 
 def test_audience_other_user_forbidden(client, make_user, make_reel):
     owner, other = make_user("owner"), make_user("other")
     reel = make_reel(owner)
     client.login(other)
-    assert _set(client, reel.id, "audience", {"audience": "18_plus"}).status_code == 403
+    assert _set(client, reel.id, "audience", {"audience": "everyone"}).status_code == 403
+
+
+def test_age_restriction_is_separate_from_audience(client, make_user, make_reel):
+    owner = make_user("owner")
+    reel = make_reel(owner)
+    client.login(owner)
+    r = _set(client, reel.id, "age-restriction", {"age_restriction": "below_18"})
+    assert r.status_code == 200
+    assert r.json()["age_restriction"] == "below_18"
+    assert r.json()["video"]["age_restriction"] == "below_18"
+    assert r.json()["video"]["audience"] == "everyone"
+
+
+@pytest.mark.parametrize("field", ["remixing_enabled", "downloads_enabled"])
+def test_new_engagement_switches_persist_and_return(client, make_user, make_reel, field):
+    owner = make_user("owner")
+    reel = make_reel(owner)
+    client.login(owner)
+    response = _set(client, reel.id, "engagement-settings", {field: False})
+    assert response.status_code == 200
+    assert response.json()[field] is False
+    assert response.json()["video"][field] is False
+    assert getattr(reel, field) is False
 
 
 # =========================================================== visibility: setting
@@ -857,7 +904,7 @@ def test_schedule_already_fired_cannot_be_rearmed(client, make_user, make_reel, 
 
 NEW_FIELDS = {
     "language", "ai_generated", "comments_enabled", "hide_like_count", "hide_comments",
-    "audience", "visibility", "schedule_enabled", "scheduled_at",
+    "audience", "age_restriction", "remixing_enabled", "downloads_enabled", "visibility", "schedule_enabled", "scheduled_at",
 }
 
 
@@ -870,7 +917,10 @@ def test_existing_records_expose_documented_defaults(client, make_user, make_ree
     assert body["comments_enabled"] is True
     assert body["hide_like_count"] is False
     assert body["hide_comments"] is False
-    assert body["audience"] is None
+    assert body["audience"] == "everyone"
+    assert body["age_restriction"] is None
+    assert body["remixing_enabled"] is True
+    assert body["downloads_enabled"] is True
     assert body["visibility"] == "public"
     assert body["schedule_enabled"] is False
     assert body["scheduled_at"] is None
@@ -893,8 +943,9 @@ def test_all_settings_can_be_combined_without_clobbering_each_other(client, make
     for endpoint, body in {
         "language": {"language": "Telugu"},
         "ai-content": {"ai_generated": True},
-        "engagement-settings": {"comments_enabled": False, "hide_like_count": True, "hide_comments": True},
-        "audience": {"audience": "below_18"},
+        "engagement-settings": {"comments_enabled": False, "hide_like_count": True, "hide_comments": True, "remixing_enabled": False, "downloads_enabled": False},
+        "audience": {"audience": "close_friends"},
+        "age-restriction": {"age_restriction": "below_18"},
         "visibility": {"visibility": "members"},
         "schedule": {"schedule_enabled": True, "scheduled_at": _naive(when)},
     }.items():
@@ -904,7 +955,10 @@ def test_all_settings_can_be_combined_without_clobbering_each_other(client, make
     assert video["language"] == "Telugu"
     assert video["ai_generated"] is True
     assert (video["comments_enabled"], video["hide_like_count"], video["hide_comments"]) == (False, True, True)
-    assert video["audience"] == "below_18"
+    assert video["remixing_enabled"] is False
+    assert video["downloads_enabled"] is False
+    assert video["audience"] == "close_friends"
+    assert video["age_restriction"] == "below_18"
     assert video["visibility"] == "members"
     assert video["schedule_enabled"] is True
     assert datetime.fromisoformat(video["scheduled_at"]) == when

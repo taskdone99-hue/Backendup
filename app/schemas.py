@@ -15,6 +15,7 @@ from app.models import (
     LikeTargetType,
     MediaType,
     ReelAudience,
+    ReelAgeRestriction,
     ReelVisibility,
     MembershipInterval,
     MembershipStatus,
@@ -1108,7 +1109,10 @@ class ReelDetailOut(ReelOut):
     comments_enabled: bool = True
     hide_like_count: bool = False
     hide_comments: bool = False
-    audience: ReelAudience | None = None
+    audience: ReelAudience = ReelAudience.everyone
+    age_restriction: ReelAgeRestriction | None = None
+    remixing_enabled: bool = True
+    downloads_enabled: bool = True
     visibility: ReelVisibility = ReelVisibility.public
     schedule_enabled: bool = False
     scheduled_at: datetime | None = Field(
@@ -1271,19 +1275,19 @@ class VideoAIContentUpdate(BaseModel):
 
 
 class VideoEngagementSettingsUpdate(BaseModel):
-    """PUT /api/videos/:id/engagement-settings — send all three, or only the
-    ones you want to change (omitted ones keep their current value)."""
+    """PUT /api/videos/:id/engagement-settings — send one or more switches."""
     comments_enabled: bool | None = Field(default=None, description="false = nobody can add new comments")
     hide_like_count: bool | None = Field(default=None, description="true = like count/likers hidden from everyone but the owner")
     hide_comments: bool | None = Field(default=None, description="true = comment thread hidden from everyone but the owner")
+    remixing_enabled: bool | None = Field(default=None, description="false = prevent other users from remixing this reel")
+    downloads_enabled: bool | None = Field(default=None, description="false = prevent downloads of this reel")
 
     @model_validator(mode="after")
     def validate_fields(self):
-        sent = self.model_fields_set & {"comments_enabled", "hide_like_count", "hide_comments"}
+        allowed = {"comments_enabled", "hide_like_count", "hide_comments", "remixing_enabled", "downloads_enabled"}
+        sent = self.model_fields_set & allowed
         if not sent:
-            raise ValueError(
-                "Send at least one of comments_enabled, hide_like_count, hide_comments"
-            )
+            raise ValueError("Send at least one engagement setting")
         for name in sent:
             if getattr(self, name) is None:
                 raise ValueError(f"{name} must be true or false, not null")
@@ -1291,8 +1295,13 @@ class VideoEngagementSettingsUpdate(BaseModel):
 
 
 class VideoAudienceUpdate(BaseModel):
-    """PUT /api/videos/:id/audience"""
-    audience: ReelAudience = Field(..., description="'18_plus' or 'below_18'")
+    """PUT /api/videos/:id/audience — visibility audience, not age category."""
+    audience: ReelAudience = Field(..., description="everyone, followers, or close_friends")
+
+
+class VideoAgeRestrictionUpdate(BaseModel):
+    """PUT /api/videos/:id/age-restriction."""
+    age_restriction: ReelAgeRestriction | None = Field(..., description="18_plus or below_18; null clears the label")
 
 
 class VideoVisibilityUpdate(BaseModel):
@@ -1337,10 +1346,16 @@ class VideoEngagementSettingsResponse(VideoSettingResponse):
     comments_enabled: bool
     hide_like_count: bool
     hide_comments: bool
+    remixing_enabled: bool
+    downloads_enabled: bool
 
 
 class VideoAudienceResponse(VideoSettingResponse):
     audience: ReelAudience
+
+
+class VideoAgeRestrictionResponse(VideoSettingResponse):
+    age_restriction: ReelAgeRestriction | None = None
 
 
 class VideoVisibilityResponse(VideoSettingResponse):
@@ -3003,11 +3018,14 @@ class ReelDraftCreateMetadata(BaseModel):
     description: str | None = Field(default=None, max_length=2200)
     language: str | None = Field(default=None, max_length=50)
     ai_generated: bool = False
-    audience: ReelAudience | None = None
+    audience: ReelAudience = ReelAudience.everyone
+    age_restriction: ReelAgeRestriction | None = None
     visibility: ReelVisibility = ReelVisibility.private
     comments_enabled: bool = True
     hide_like_count: bool = False
     hide_comments: bool = False
+    remixing_enabled: bool = True
+    downloads_enabled: bool = True
     editor_state: dict[str, Any] | None = None
 
 
@@ -3020,11 +3038,14 @@ class ReelDraftOut(BaseModel):
     caption: str | None = None
     language: str | None = None
     ai_generated: bool = False
-    audience: str | None = None
+    audience: ReelAudience = ReelAudience.everyone
+    age_restriction: ReelAgeRestriction | None = None
     visibility: str
     comments_enabled: bool
     hide_like_count: bool
     hide_comments: bool
+    remixing_enabled: bool = True
+    downloads_enabled: bool = True
     editor_state: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -3038,15 +3059,18 @@ class ReelDraftUpdate(BaseModel):
     language: str | None = Field(default=None, max_length=50)
     ai_generated: bool | None = None
     audience: ReelAudience | None = None
+    age_restriction: ReelAgeRestriction | None = None
     visibility: ReelVisibility | None = None
     comments_enabled: bool | None = None
     hide_like_count: bool | None = None
     hide_comments: bool | None = None
+    remixing_enabled: bool | None = None
+    downloads_enabled: bool | None = None
     editor_state: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def reject_null_for_required_settings(self):
-        for name in ("ai_generated", "visibility", "comments_enabled", "hide_like_count", "hide_comments"):
+        for name in ("ai_generated", "audience", "visibility", "comments_enabled", "hide_like_count", "hide_comments", "remixing_enabled", "downloads_enabled"):
             if name in self.model_fields_set and getattr(self, name) is None:
                 raise ValueError(f"{name} cannot be null")
         return self
