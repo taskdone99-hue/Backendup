@@ -3,13 +3,19 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app import models, schemas
 from app.auth import get_current_user
-from app.services.media_service import delete_media_file, save_upload_file
+from app.services.media_service import (
+    STATIC_ROOT,
+    _local_path_from_url,
+    delete_media_file,
+    save_upload_file,
+)
 from app.services.push_service import send_push
 from app.services.location_service import resolve_location_from_form
 from app.services import story_extras_service
@@ -1169,6 +1175,67 @@ def get_story(
     return _to_story_out(
         story,
         current_user.id,
+    )
+
+
+# -------------------------------------------------------------------
+# Download Story Media
+# -------------------------------------------------------------------
+
+@router.get("/{story_id}/download", include_in_schema=True)
+def download_story(
+    story_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Download active story media after applying the normal story access checks."""
+    story = _get_active_story_or_404(db, story_id, current_user.id)
+
+    # Match the privacy behavior used by other story interactions.
+    if is_blocked(db, current_user.id, story.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Story not found",
+        )
+
+    media_path = _local_path_from_url(story.media_url)
+    if media_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Story media file is not available for direct download",
+        )
+
+    # Only allow files stored in the stories upload directory; never serve an
+    # arbitrary filesystem path from a URL stored in the database.
+    stories_root = (STATIC_ROOT / "stories").resolve()
+    resolved_path = media_path.resolve()
+    try:
+        resolved_path.relative_to(stories_root)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Story media file not found",
+        )
+
+    if not resolved_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Story media file not found",
+        )
+
+    import mimetypes
+
+    media_type, _ = mimetypes.guess_type(resolved_path.name)
+    if story.media_type == models.MediaType.video:
+        media_type = media_type or "video/mp4"
+    else:
+        media_type = media_type or "image/jpeg"
+
+    return FileResponse(
+        path=resolved_path,
+        media_type=media_type,
+        filename=resolved_path.name,
+        content_disposition_type="attachment",
     )
 
 
