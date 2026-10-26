@@ -1138,6 +1138,17 @@ class Location(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class ProfileView(Base):
+    """A profile visit event. The profile owner can inspect their own viewers."""
+    __tablename__ = "profile_views"
+    id = Column(Integer, primary_key=True, index=True)
+    profile_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    viewer_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    profile_user = relationship("User", foreign_keys=[profile_user_id])
+    viewer_user = relationship("User", foreign_keys=[viewer_user_id])
+
+
 class Story(Base):
     """
     Stories are ephemeral (default 24h). `expires_at` is set at creation time
@@ -1168,6 +1179,8 @@ class Story(Base):
     )
         # Camera/editor metadata; NULL for stories created before this feature.
     editor_state = Column(JSON(none_as_null=True), nullable=True)
+    # Original story id when this story was created with "Add to your story".
+    source_story_id = Column(Integer, nullable=True, index=True)
     user = relationship("User", back_populates="stories")
     views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
     reactions = relationship("StoryReaction", back_populates="story", cascade="all, delete-orphan")
@@ -1561,6 +1574,9 @@ class Message(Base):
     # ForeignKey, same reasoning. Only one of shared_reel_id / shared_post_id
     # is ever set on a given message — enforced in schemas.MessageCreate.
     shared_post_id = Column(Integer, nullable=True, index=True)
+    # Story mention / story-share card in chat; intentionally not a FK so the
+    # conversation history survives story expiry/deletion.
+    shared_story_id = Column(Integer, nullable=True, index=True)
     # True for the one-time auto-intro DM sent on a brand-new 1:1
     # conversation (see chat_routes.create_conversation) — lets a client
     # style/skip it differently from a message the sender actually typed.

@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -154,6 +156,19 @@ def get_user_profile(
     current_user: models.User | None = Depends(get_current_user_optional),
 ):
     user = _get_user_or_404(db, user_id)
+    if current_user is not None and current_user.id != user_id:
+        # Deduplicate repeated profile refreshes within a 24-hour window.
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent = db.query(models.ProfileView).filter(
+            models.ProfileView.profile_user_id == user_id,
+            models.ProfileView.viewer_user_id == current_user.id,
+            models.ProfileView.created_at >= since,
+        ).first()
+        if recent is None:
+            db.add(models.ProfileView(
+                profile_user_id=user_id, viewer_user_id=current_user.id
+            ))
+            db.commit()
     profile = schemas.UserProfileOut.model_validate(user)
     (
         profile.posts_count,
@@ -174,6 +189,31 @@ def get_user_profile(
             is not None
         )
     return profile
+
+
+@router.get("/api/users/me/profile-views", response_model=schemas.ProfileViewsResponse)
+def get_my_profile_views(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return authenticated viewers of the current user's profile."""
+    query = db.query(models.ProfileView).filter(
+        models.ProfileView.profile_user_id == current_user.id
+    )
+    total = query.count()
+    rows = query.order_by(models.ProfileView.created_at.desc()).offset(offset).limit(limit).all()
+    return schemas.ProfileViewsResponse(
+        total=total, limit=limit, offset=offset,
+        items=[
+            schemas.ProfileViewItemOut(
+                viewer=schemas.UserSummaryOut.model_validate(row.viewer_user),
+                viewed_at=row.created_at,
+            )
+            for row in rows
+        ],
+    )
 
 
 @router.put("/api/users/{user_id}", response_model=schemas.UserProfileOut)

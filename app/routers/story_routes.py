@@ -92,6 +92,8 @@ def _to_story_out(
 
     out.user = schemas.UserSummaryOut.model_validate(story.user)
     out.close_friends_only = story.visibility == models.StoryVisibility.close_friends
+    out.source_story_id = story.source_story_id
+    out.is_reshare = story.source_story_id is not None
 
     out.views_count = len(story.views)
     out.reactions_count = len(story.reactions)
@@ -581,6 +583,19 @@ def create_story(
                 message=f"{current_user.username} mentioned you in their story",
                 story_id=story.id,
             )
+            # Also place a story card in the mentioned user's DM inbox.
+            # Respect blocks: a story mention must not bypass chat privacy.
+            if not is_blocked(db, current_user.id, mentioned_id):
+                conversation = _get_or_create_direct_conversation(
+                    db, current_user.id, mentioned_id
+                )
+                db.add(models.Message(
+                    conversation_id=conversation.id,
+                    sender_id=current_user.id,
+                    content=f"mentioned you in their story",
+                    shared_story_id=story.id,
+                ))
+                db.commit()
 
     # Load relationships before serialization
     story = (
@@ -1148,6 +1163,53 @@ def publish_story_draft(
     db.commit()
     db.refresh(story)
 
+    story = _active_story_query(db).filter(models.Story.id == story.id).first()
+    return _to_story_out(story, current_user.id)
+
+
+# -------------------------------------------------------------------
+# Add to your story (only users explicitly mentioned can reshare)
+# -------------------------------------------------------------------
+
+@router.post("/{story_id}/reshare", response_model=schemas.StoryOut,
+             status_code=status.HTTP_201_CREATED)
+def reshare_story(
+    story_id: int,
+    caption: str | None = Form(default=None, max_length=280),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Create a new story referencing the original, available for 24 hours.
+    This is the 'Add to your story' action for users mentioned in the source.
+    """
+    source = _get_active_story_or_404(db, story_id, current_user.id)
+    if source.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot reshare your own story")
+    mentioned = db.query(models.StoryMention).filter(
+        models.StoryMention.story_id == source.id,
+        models.StoryMention.user_id == current_user.id,
+    ).first()
+    tagged = db.query(models.StoryTag).filter(
+        models.StoryTag.story_id == source.id,
+        models.StoryTag.user_id == current_user.id,
+    ).first()
+    if mentioned is None and tagged is None:
+        raise HTTPException(status_code=403, detail="You can only reshare a story that mentions or tags you")
+    if is_blocked(db, current_user.id, source.user_id):
+        raise HTTPException(status_code=404, detail="Story not found")
+
+    story = models.Story(
+        user_id=current_user.id,
+        media_url=source.media_url,
+        media_type=source.media_type,
+        caption=caption,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=STORY_LIFETIME_HOURS),
+        visibility=models.StoryVisibility.public,
+        source_story_id=source.id,
+    )
+    db.add(story)
+    db.commit()
+    db.refresh(story)
     story = _active_story_query(db).filter(models.Story.id == story.id).first()
     return _to_story_out(story, current_user.id)
 

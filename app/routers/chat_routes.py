@@ -201,6 +201,14 @@ def _to_message_out(
         out.shared_reel = _build_shared_reel_out(db, message.shared_reel_id, viewer_id)
     elif message.shared_post_id is not None:
         out.shared_post = _build_shared_post_out(db, message.shared_post_id, viewer_id)
+    if message.shared_story_id is not None:
+        story = db.query(models.Story).filter(models.Story.id == message.shared_story_id).first()
+        if story is not None:
+            out.shared_story = schemas.StoryPreviewOut(
+                id=story.id, user_id=story.user_id, media_url=story.media_url,
+                media_type=story.media_type, caption=story.caption,
+                expires_at=story.expires_at, source_story_id=story.source_story_id,
+            )
 
     if message.reply_to_message_id is not None:
         original = (
@@ -1241,6 +1249,14 @@ async def remove_message_reaction(
 # ==========================================================================
 # Chat settings
 # ==========================================================================
+
+@router.get("/settings/font", response_model=schemas.ChatFontResponse)
+def get_chat_font(
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return the current user's chat display-font preference."""
+    return schemas.ChatFontResponse(message="Chat font retrieved", font=current_user.chat_font or "default")
+
 
 @router.put("/settings/font", response_model=schemas.ChatFontResponse)
 def update_chat_font(

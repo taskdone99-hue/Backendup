@@ -642,6 +642,8 @@ class StoryOut(BaseModel):
     question: "StoryQuestionOut | None" = None
     close_friends_only: bool = False
     editor_state: dict[str, Any] | None = None
+    source_story_id: int | None = None
+    is_reshare: bool = False
 
     class Config:
         from_attributes = True
@@ -2096,6 +2098,8 @@ class MessageOut(BaseModel):
     reply_to_message_id: int | None = None
     reply_to: "MessageRepliedToOut | None" = None
     reply_to_story_id: int | None = None
+    shared_story_id: int | None = None
+    shared_story: StoryPreviewOut | None = None
     # Non-null `shared_reel`/`shared_post` means this message is a shared
     # reel/post (mutually exclusive); `content` is then just the optional
     # note.
@@ -2617,6 +2621,28 @@ class PaginatedMutedUsersResponse(BaseModel):
 
 
 # ---- Advanced stories: mentions / polls / questions ----
+
+class StoryPreviewOut(BaseModel):
+    id: int
+    user_id: int
+    media_url: str
+    media_type: MediaType
+    caption: str | None = None
+    expires_at: datetime | None = None
+    source_story_id: int | None = None
+
+
+class ProfileViewItemOut(BaseModel):
+    viewer: UserSummaryOut
+    viewed_at: datetime
+
+
+class ProfileViewsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[ProfileViewItemOut]
+
 
 class StoryMentionOut(BaseModel):
     id: int
