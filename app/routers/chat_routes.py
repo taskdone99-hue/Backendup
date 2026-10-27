@@ -575,6 +575,86 @@ def decline_conversation(
     )
 
 
+@router.get(
+    "/conversations/{conversation_id}/notification-settings",
+    response_model=schemas.ConversationNotificationSettingsOut,
+)
+def get_conversation_notification_settings(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    row = (
+        db.query(models.ConversationMute)
+        .filter(
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
+        )
+        .first()
+    )
+    return schemas.ConversationNotificationSettingsOut(
+        conversation_id=conversation_id,
+        mute_messages=bool(row.mute_messages) if row else False,
+        mute_calls=bool(row.mute_calls) if row else False,
+        hide_message_previews=bool(row.hide_message_previews) if row else False,
+    )
+
+
+@router.put(
+    "/conversations/{conversation_id}/notification-settings",
+    response_model=schemas.ConversationNotificationSettingsOut,
+)
+def update_conversation_notification_settings(
+    conversation_id: int,
+    payload: schemas.ConversationNotificationSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    row = (
+        db.query(models.ConversationMute)
+        .filter(
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
+        )
+        .first()
+    )
+
+    updates = payload.model_dump(exclude_unset=True)
+    if row is None:
+        row = models.ConversationMute(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            mute_messages=False,
+            mute_calls=False,
+            hide_message_previews=False,
+        )
+        db.add(row)
+        db.flush()
+
+    for field, value in updates.items():
+        if value is not None:
+            setattr(row, field, value)
+
+    result = schemas.ConversationNotificationSettingsOut(
+        conversation_id=conversation_id,
+        mute_messages=bool(row.mute_messages),
+        mute_calls=bool(row.mute_calls),
+        hide_message_previews=bool(row.hide_message_previews),
+    )
+
+    if not (
+        result.mute_messages
+        or result.mute_calls
+        or result.hide_message_previews
+    ):
+        db.delete(row)
+
+    db.commit()
+    return result
+
+
 @router.post("/conversations/{conversation_id}/mute", response_model=schemas.MessageResponse)
 def mute_conversation(
     conversation_id: int,
@@ -591,8 +671,17 @@ def mute_conversation(
         .first()
     )
     if existing is None:
-        db.add(models.ConversationMute(user_id=current_user.id, conversation_id=conversation_id))
-        db.commit()
+        existing = models.ConversationMute(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            mute_messages=True,
+            mute_calls=False,
+            hide_message_previews=False,
+        )
+        db.add(existing)
+    else:
+        existing.mute_messages = True
+    db.commit()
     return schemas.MessageResponse(message="Conversation muted")
 
 
@@ -611,7 +700,9 @@ def unmute_conversation(
         .first()
     )
     if row is not None:
-        db.delete(row)
+        row.mute_messages = False
+        if not (row.mute_calls or row.hide_message_previews):
+            db.delete(row)
         db.commit()
     return schemas.MessageResponse(message="Conversation unmuted")
 
@@ -913,7 +1004,19 @@ async def _create_and_dispatch_message(
             message=f"{current_user.username} sent you a message",
             target_type="conversation",
             target_id=conversation_id,
-            push_body=preview,
+            push_body=(
+                "You received a new message"
+                if (
+                    (settings_row := db.query(models.ConversationMute)
+                     .filter(
+                         models.ConversationMute.user_id == uid,
+                         models.ConversationMute.conversation_id == conversation_id,
+                     )
+                     .first())
+                    and settings_row.hide_message_previews
+                )
+                else preview
+            ),
         )
 
     return message_out

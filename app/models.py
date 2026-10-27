@@ -435,6 +435,11 @@ class ConversationMute(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    # Independent per-user notification preferences for this conversation.
+    # Existing rows are migrated with mute_messages=True for backwards compatibility.
+    mute_messages = Column(Boolean, nullable=False, default=False, server_default="0")
+    mute_calls = Column(Boolean, nullable=False, default=False, server_default="0")
+    hide_message_previews = Column(Boolean, nullable=False, default=False, server_default="0")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", foreign_keys=[user_id])

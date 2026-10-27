@@ -2143,6 +2143,21 @@ class PaginatedMessagesResponse(BaseModel):
     items: list[MessageOut]
 
 
+class ConversationNotificationSettingsUpdate(BaseModel):
+    """Partial update: omitted settings retain their current values."""
+
+    mute_messages: bool | None = None
+    mute_calls: bool | None = None
+    hide_message_previews: bool | None = None
+
+
+class ConversationNotificationSettingsOut(BaseModel):
+    conversation_id: int
+    mute_messages: bool
+    mute_calls: bool
+    hide_message_previews: bool
+
+
 class ConversationOut(BaseModel):
     id: int
     is_group: bool

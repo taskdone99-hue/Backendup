@@ -119,11 +119,13 @@ def get_mute(db: Session, muter_id: int, muted_id: int) -> models.UserMute | Non
 # ---- conversation mute ----
 
 def is_conversation_muted(db: Session, user_id: int, conversation_id: int) -> bool:
+    """Return whether this user has message notifications muted for a thread."""
     return (
         db.query(models.ConversationMute)
         .filter(
             models.ConversationMute.user_id == user_id,
             models.ConversationMute.conversation_id == conversation_id,
+            models.ConversationMute.mute_messages.is_(True),
         )
         .first()
         is not None
