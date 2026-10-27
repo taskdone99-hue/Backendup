@@ -1,17 +1,22 @@
 import os
 import re
 from datetime import date, datetime
+from typing import Any
 
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.services import admob_service
+from app.services import admob_service, chat_option_service
+from app.services.video_settings_service import normalize_language
 
 from app.models import (
     DevicePlatform,
     Gender,
     LikeTargetType,
     MediaType,
+    ReelAudience,
+    ReelAgeRestriction,
+    ReelVisibility,
     MembershipInterval,
     MembershipStatus,
     NotificationType,
@@ -455,6 +460,7 @@ class ReelOut(BaseModel):
     video_url: str
     thumbnail_url: str | None
     created_at: datetime
+    editor_state: dict | None = None
 
     class Config:
         from_attributes = True
@@ -635,6 +641,9 @@ class StoryOut(BaseModel):
     poll: "StoryPollOut | None" = None
     question: "StoryQuestionOut | None" = None
     close_friends_only: bool = False
+    editor_state: dict[str, Any] | None = None
+    source_story_id: int | None = None
+    is_reshare: bool = False
 
     class Config:
         from_attributes = True
@@ -655,6 +664,30 @@ class StoryDraftOut(BaseModel):
     caption: str | None
     location: LocationOut | None = None
     close_friends_only: bool
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Opaque JSON object saved by the story editor so the draft can be "
+            "reopened exactly as it was left (background, media shape, text "
+            "layers, positions, effects, stickers, filters, ...). Stored and "
+            "returned verbatim - the server never interprets or reshapes it. "
+            "`null` for drafts that have no editor state (including every "
+            "draft created before this field existed)."
+        ),
+        examples=[
+            {
+                "version": 1,
+                "background": {"type": "gradient", "colors": ["#833ab4", "#fd1d1d"]},
+                "media": {"shape": "rounded", "x": 0.5, "y": 0.45, "scale": 0.9, "rotation": 0},
+                "texts": [
+                    {"text": "Hello", "x": 0.5, "y": 0.2, "font": "classic", "color": "#ffffff"}
+                ],
+                "stickers": [{"type": "emoji", "value": "🔥", "x": 0.8, "y": 0.7, "scale": 1.2}],
+                "filter": {"name": "warm", "intensity": 0.6},
+                "effects": [],
+            }
+        ],
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -781,6 +814,11 @@ class PostUpdate(BaseModel):
     # gets removed. Omit the field entirely to leave tags/members untouched.
     tag_user_ids: list[int] | None = None
     member_user_ids: list[int] | None = None
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="Replace the stored editor state with this JSON object (any structure, max 2 MB); "
+        "`null` clears it; omit to leave it unchanged.",
+    )
 
     @field_validator("caption", "alt_text")
     @classmethod
@@ -818,8 +856,23 @@ class NearbyLocationsResponse(BaseModel):
 
 class PostDetailOut(PostOut):
     user: UserSummaryOut | None = None
-    likes_count: int = 0
+    likes_count: int | None = Field(
+        default=0,
+        description="`null` when the owner hides like counts (their global setting) and the viewer is not the owner.",
+    )
     comments_count: int = 0
+    like_count_hidden: bool = Field(
+        default=False,
+        description="The owner hides like counts on this post: others get `likes_count: null` and no likers list.",
+    )
+    comments_hidden: bool = Field(
+        default=False,
+        description="The owner hides comments on this post: only the owner can read the thread (others get 403).",
+    )
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="The client editor's full state, stored and returned verbatim. `null` if none was saved.",
+    )
     share_count: int = 0
     hashtags: list[str] = []
     # All media attached to the post, in upload order. `media_url`/
@@ -1033,7 +1086,10 @@ class ReelDetailOut(ReelOut):
     title: str | None = None
     remixed_from_id: int | None = None
     user: UserSummaryOut | None = None
-    likes_count: int = 0
+    likes_count: int | None = Field(
+        default=0,
+        description="`null` when the owner turned on `hide_like_count` and the viewer is not the owner.",
+    )
     comments_count: int = 0
     is_liked: bool = False
     like_id: int | None = None
@@ -1046,6 +1102,39 @@ class ReelDetailOut(ReelOut):
     tags_count: int = 0
     tags: list[UserSummaryOut] = []
     audio: AudioOut | None = None
+    # Upload-page settings (see /api/videos/{id}/language|ai-content|
+    # engagement-settings|audience|visibility|schedule). Rows that predate
+    # them read as: language/audience null, comments on, nothing hidden,
+    # public, no schedule.
+    language: str | None = None
+    ai_generated: bool = False
+    comments_enabled: bool = True
+    hide_like_count: bool = False
+    hide_comments: bool = False
+    audience: ReelAudience = ReelAudience.everyone
+    age_restriction: ReelAgeRestriction | None = None
+    remixing_enabled: bool = True
+    downloads_enabled: bool = True
+    visibility: ReelVisibility = ReelVisibility.public
+    schedule_enabled: bool = False
+    scheduled_at: datetime | None = Field(
+        default=None, description="UTC. Null unless a schedule is set."
+    )
+    # EFFECTIVE hide state = the owner's global setting OR this reel's own
+    # `hide_like_count` / `hide_comments` above (which keep meaning "this
+    # reel's own switch" and are unchanged).
+    like_count_hidden: bool = Field(
+        default=False,
+        description="Like count is hidden from everyone but the owner (global setting or this reel's own).",
+    )
+    comments_hidden: bool = Field(
+        default=False,
+        description="Comment thread is hidden from everyone but the owner (global setting or this reel's own).",
+    )
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="The client editor's full state, stored and returned verbatim. `null` if none was saved.",
+    )
 
 
 class PaginatedReelDetailResponse(BaseModel):
@@ -1056,6 +1145,32 @@ class PaginatedReelDetailResponse(BaseModel):
 
 
 # ---- Tag controls, tagged feed, pending tags ----
+
+class UserEngagementSettingsOut(BaseModel):
+    """GLOBAL engagement switches — apply to every post and reel the user owns."""
+    hide_like_count: bool = Field(
+        False, description="Hide like counts (and who liked) on all my posts and reels from other users"
+    )
+    hide_comments: bool = Field(
+        False, description="Hide the comment thread on all my posts and reels from other users"
+    )
+
+
+class UserEngagementSettingsUpdate(BaseModel):
+    """PUT /api/users/me/engagement-settings — send either or both."""
+    hide_like_count: bool | None = None
+    hide_comments: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        sent = self.model_fields_set & {"hide_like_count", "hide_comments"}
+        if not sent:
+            raise ValueError("Send hide_like_count and/or hide_comments")
+        for name in sent:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} must be true or false, not null")
+        return self
+
 
 class TagSettingsOut(BaseModel):
     approve_tags_manually: bool = False
@@ -1115,6 +1230,11 @@ class VideoMetadataUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=150)
     description: str | None = Field(default=None, max_length=2200, description="Stored as the reel's caption")
     location: LocationIn | None = None
+    editor_state: dict[str, Any] | None = Field(
+        default=None,
+        description="Replace the stored editor state with this JSON object (any structure, max 2 MB); "
+        "`null` clears it; omit to leave it unchanged.",
+    )
 
     @field_validator("title")
     @classmethod
@@ -1130,6 +1250,123 @@ class VideoMetadataUpdate(BaseModel):
 class ThumbnailUploadResponse(BaseModel):
     message: str
     thumbnail_url: str
+
+
+# ---- Upload-page settings: PUT /api/videos/{id}/language | ai-content |
+#      engagement-settings | audience | visibility | schedule ----
+
+class VideoLanguageUpdate(BaseModel):
+    """PUT /api/videos/:id/language"""
+    language: str = Field(
+        ...,
+        max_length=50,
+        description="Language name ('English', 'Hindi', 'Telugu'...) or ISO 639-1 code ('en'). "
+        "Stored and returned as the canonical name.",
+        examples=["English"],
+    )
+
+    @field_validator("language")
+    @classmethod
+    def check_language(cls, v: str) -> str:
+        return normalize_language(v)  # ValueError -> 400 {"message": ...}
+
+
+class VideoAIContentUpdate(BaseModel):
+    """PUT /api/videos/:id/ai-content"""
+    ai_generated: bool = Field(..., description="The upload page's 'AI-Generated Content' switch")
+
+
+class VideoEngagementSettingsUpdate(BaseModel):
+    """PUT /api/videos/:id/engagement-settings — send one or more switches."""
+    comments_enabled: bool | None = Field(default=None, description="false = nobody can add new comments")
+    hide_like_count: bool | None = Field(default=None, description="true = like count/likers hidden from everyone but the owner")
+    hide_comments: bool | None = Field(default=None, description="true = comment thread hidden from everyone but the owner")
+    remixing_enabled: bool | None = Field(default=None, description="false = prevent other users from remixing this reel")
+    downloads_enabled: bool | None = Field(default=None, description="false = prevent downloads of this reel")
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        allowed = {"comments_enabled", "hide_like_count", "hide_comments", "remixing_enabled", "downloads_enabled"}
+        sent = self.model_fields_set & allowed
+        if not sent:
+            raise ValueError("Send at least one engagement setting")
+        for name in sent:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} must be true or false, not null")
+        return self
+
+
+class VideoAudienceUpdate(BaseModel):
+    """PUT /api/videos/:id/audience — visibility audience, not age category."""
+    audience: ReelAudience = Field(..., description="everyone, followers, or close_friends")
+
+
+class VideoAgeRestrictionUpdate(BaseModel):
+    """PUT /api/videos/:id/age-restriction."""
+    age_restriction: ReelAgeRestriction | None = Field(..., description="18_plus or below_18; null clears the label")
+
+
+class VideoVisibilityUpdate(BaseModel):
+    """PUT /api/videos/:id/visibility"""
+    visibility: ReelVisibility = Field(..., description="'public', 'private' or 'members'")
+
+
+class VideoScheduleUpdate(BaseModel):
+    """PUT /api/videos/:id/schedule — `scheduled_at` is read as UTC when it
+    carries no timezone offset, converted to UTC when it does."""
+    schedule_enabled: bool
+    scheduled_at: datetime | None = Field(
+        default=None,
+        description="Required when schedule_enabled is true; must be in the future. "
+        "Ignored (and cleared) when schedule_enabled is false.",
+        examples=["2026-10-10T18:30:00"],
+    )
+
+    @model_validator(mode="after")
+    def require_time_when_enabled(self):
+        if self.schedule_enabled and self.scheduled_at is None:
+            raise ValueError("scheduled_at is required when schedule_enabled is true")
+        return self
+
+
+class VideoSettingResponse(BaseModel):
+    """Common envelope: what was saved plus the full, updated video."""
+    message: str
+    video_id: int
+    video: ReelDetailOut
+
+
+class VideoLanguageResponse(VideoSettingResponse):
+    language: str
+
+
+class VideoAIContentResponse(VideoSettingResponse):
+    ai_generated: bool
+
+
+class VideoEngagementSettingsResponse(VideoSettingResponse):
+    comments_enabled: bool
+    hide_like_count: bool
+    hide_comments: bool
+    remixing_enabled: bool
+    downloads_enabled: bool
+
+
+class VideoAudienceResponse(VideoSettingResponse):
+    audience: ReelAudience
+
+
+class VideoAgeRestrictionResponse(VideoSettingResponse):
+    age_restriction: ReelAgeRestriction | None = None
+
+
+class VideoVisibilityResponse(VideoSettingResponse):
+    visibility: ReelVisibility
+
+
+class VideoScheduleResponse(VideoSettingResponse):
+    schedule_enabled: bool
+    scheduled_at: datetime | None = None
 
 
 class CollaboratorAddRequest(BaseModel):
@@ -1236,7 +1473,10 @@ class LikeOut(BaseModel):
 class LikeActionResponse(BaseModel):
     message: str
     like: LikeOut | None = None
-    likes_count: int
+    likes_count: int | None = Field(
+        default=None,
+        description="`null` when liking a reel whose owner hid its like count (and you're not the owner).",
+    )
 
 
 class PaginatedLikesResponse(BaseModel):
@@ -1537,6 +1777,214 @@ class ConversationCreate(BaseModel):
         return deduped
 
 
+# ---- Interactive chat options (Business / Premium quick-reply buttons) ----
+
+_OPTION_ACTION_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def _clean_option_title(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Option title can't be empty")
+    if len(v) > chat_option_service.TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"Option title can be at most {chat_option_service.TITLE_MAX_LENGTH} characters"
+        )
+    if not v.isprintable():
+        raise ValueError("Option title can't contain line breaks or control characters")
+    return v
+
+
+def _clean_option_action(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Option action can't be empty")
+    if len(v) > chat_option_service.ACTION_MAX_LENGTH:
+        raise ValueError(
+            f"Option action can be at most {chat_option_service.ACTION_MAX_LENGTH} characters"
+        )
+    if not _OPTION_ACTION_RE.match(v):
+        raise ValueError(
+            "Option action may only contain letters, digits, '_', '-', '.' and ':' (e.g. 'track_order')"
+        )
+    return v
+
+
+def _clean_greeting(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Greeting can't be empty (send null to use the default greeting)")
+    if len(v) > chat_option_service.GREETING_MAX_LENGTH:
+        raise ValueError(f"Greeting can be at most {chat_option_service.GREETING_MAX_LENGTH} characters")
+    return v
+
+
+class ChatOptionIn(BaseModel):
+    """One button to create."""
+    title: str = Field(..., description="Button label, 1-24 characters", examples=["Today's Deals"])
+    action: str = Field(
+        ...,
+        description="Machine-readable id the client acts on, 1-50 chars of letters, digits, _ - . :",
+        examples=["deals"],
+    )
+
+    @field_validator("title")
+    @classmethod
+    def check_title(cls, v: str) -> str:
+        return _clean_option_title(v)
+
+    @field_validator("action")
+    @classmethod
+    def check_action(cls, v: str) -> str:
+        return _clean_option_action(v)
+
+
+def _reject_duplicate_options(options: list["ChatOptionIn"]) -> None:
+    titles = [o.title.casefold() for o in options]
+    actions = [o.action.casefold() for o in options]
+    if len(set(titles)) != len(titles):
+        raise ValueError("Option titles must be unique within a message")
+    if len(set(actions)) != len(actions):
+        raise ValueError("Option actions must be unique within a message")
+
+
+class ChatOptionsCreate(BaseModel):
+    """POST /api/chat/options"""
+    message_id: int = Field(..., gt=0)
+    options: list[ChatOptionIn] = Field(
+        ..., min_length=1, max_length=chat_option_service.MAX_OPTIONS_PER_MESSAGE
+    )
+
+    @model_validator(mode="after")
+    def no_duplicates(self):
+        _reject_duplicate_options(self.options)
+        return self
+
+
+class ChatOptionUpdate(BaseModel):
+    """PUT /api/chat/options/{option_id} — send only what changes."""
+    title: str | None = None
+    action: str | None = None
+    is_enabled: bool | None = Field(
+        default=None, description="false hides the button from recipients and stops it being selectable"
+    )
+
+    @field_validator("title")
+    @classmethod
+    def check_title(cls, v: str | None) -> str | None:
+        return None if v is None else _clean_option_title(v)
+
+    @field_validator("action")
+    @classmethod
+    def check_action(cls, v: str | None) -> str | None:
+        return None if v is None else _clean_option_action(v)
+
+    @model_validator(mode="after")
+    def at_least_one(self):
+        sent = self.model_fields_set & {"title", "action", "is_enabled"}
+        if not sent:
+            raise ValueError("Send at least one of title, action, is_enabled")
+        for name in sent:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} can't be null")
+        return self
+
+
+class ChatOptionOut(BaseModel):
+    id: int
+    title: str
+    action: str
+    is_enabled: bool = True
+
+    class Config:
+        from_attributes = True
+
+
+class ChatDefaultMenuUpdate(BaseModel):
+    """PUT /api/chat/options/default-menu — send only what changes."""
+    is_enabled: bool | None = Field(
+        default=None, description="Turn the automatic menu on/off. Needs at least one option to turn on."
+    )
+    greeting: str | None = Field(
+        default=None,
+        description="Text of the automatic message (max 1000 chars). `null` resets to the default greeting.",
+        examples=["Hi! Welcome to our shop. How can we help you?"],
+    )
+    options: list[ChatOptionIn] | None = Field(
+        default=None,
+        max_length=chat_option_service.MAX_OPTIONS_PER_MESSAGE,
+        description="The full menu, replacing the saved one (0-5 buttons, in display order).",
+    )
+
+    @field_validator("greeting")
+    @classmethod
+    def check_greeting(cls, v: str | None) -> str | None:
+        return None if v is None else _clean_greeting(v)
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        sent = self.model_fields_set & {"is_enabled", "greeting", "options"}
+        if not sent:
+            raise ValueError("Send at least one of is_enabled, greeting, options")
+        for name in ("is_enabled", "options"):
+            if name in sent and getattr(self, name) is None:
+                raise ValueError(f"{name} can't be null")
+        if self.options:
+            _reject_duplicate_options(self.options)
+        return self
+
+
+class ChatDefaultMenuOptionOut(BaseModel):
+    title: str
+    action: str
+
+
+class ChatDefaultMenuOut(BaseModel):
+    is_enabled: bool = False
+    greeting: str = Field(
+        chat_option_service.DEFAULT_GREETING,
+        description="The text that will be sent (the default greeting if you haven't set one).",
+    )
+    options: list[ChatDefaultMenuOptionOut] = []
+    inactivity_hours: int = Field(
+        chat_option_service.DEFAULT_MENU_INACTIVITY_HOURS,
+        description="The menu is (re)sent when a customer writes after this many hours of silence.",
+    )
+
+
+class ChatMessageOptionsOut(BaseModel):
+    """A message's text together with its buttons — what the client renders."""
+    message_id: int
+    text: str | None = None
+    options: list[ChatOptionOut] = []
+
+
+class PaginatedChatOptionsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[ChatMessageOptionsOut]
+
+
+class ChatOptionSelectRequest(BaseModel):
+    option_id: int = Field(..., gt=0)
+
+
+class ChatOptionSelectionOut(BaseModel):
+    message_id: int
+    option_id: int
+    title: str
+    action: str
+    selected: bool = True
+
+
+class ChatOptionAnalyticsOut(BaseModel):
+    option_id: int
+    title: str
+    action: str
+    selection_count: int = Field(..., description="Distinct users who selected this option")
+
+
 class MessageCreate(BaseModel):
     """Text message, or a shared reel/post. With `shared_reel_id` or
     `shared_post_id`, `content` is an optional note sent alongside the
@@ -1552,6 +2000,12 @@ class MessageCreate(BaseModel):
     shared_post_id: int | None = Field(
         default=None, gt=0, description="Share this post into the conversation"
     )
+    options: list[ChatOptionIn] | None = Field(
+        default=None,
+        max_length=chat_option_service.MAX_OPTIONS_PER_MESSAGE,
+        description="Optional clickable buttons (max 5) sent with a text message. "
+        "Business / Premium accounts only (403 otherwise); needs `content`.",
+    )
 
     @field_validator("content")
     @classmethod
@@ -1564,6 +2018,12 @@ class MessageCreate(BaseModel):
     def require_content_or_share(self):
         if self.content is None and self.shared_reel_id is None and self.shared_post_id is None:
             raise ValueError("Message can't be empty")
+        if self.options:
+            if self.content is None:
+                raise ValueError("A message with options needs text in `content`")
+            if self.shared_reel_id is not None or self.shared_post_id is not None:
+                raise ValueError("Options can't be attached to a shared reel or post")
+            _reject_duplicate_options(self.options)
         if self.shared_reel_id is not None and self.shared_post_id is not None:
             raise ValueError("A message can only share one reel or post, not both")
         return self
@@ -1638,6 +2098,8 @@ class MessageOut(BaseModel):
     reply_to_message_id: int | None = None
     reply_to: "MessageRepliedToOut | None" = None
     reply_to_story_id: int | None = None
+    shared_story_id: int | None = None
+    shared_story: StoryPreviewOut | None = None
     # Non-null `shared_reel`/`shared_post` means this message is a shared
     # reel/post (mutually exclusive); `content` is then just the optional
     # note.
@@ -1649,6 +2111,13 @@ class MessageOut(BaseModel):
     edited_at: datetime | None = None
     is_deleted: bool = False
     reactions: list[MessageReactionOut] = []
+    # Clickable buttons (Business / Premium senders). Always present; [] for an
+    # ordinary message. Recipients only get enabled options.
+    options: list[ChatOptionOut] = []
+    # Set only on the response to *your* send when it triggered the recipient's
+    # automatic default menu: the business's greeting message (with `options`),
+    # already created in the conversation. Otherwise null.
+    auto_reply: "MessageOut | None" = None
     # "sent" | "delivered" | "read" — see models.MessageStatus. Always
     # "sent" from the sender's own point of view isn't tracked separately;
     # this reflects the furthest state any recipient has reached.
@@ -1674,19 +2143,6 @@ class PaginatedMessagesResponse(BaseModel):
     items: list[MessageOut]
 
 
-class ConversationNotificationSettingsUpdate(BaseModel):
-    """Partial update; omitted fields keep their current values."""
-    mute_messages: bool | None = None
-    mute_calls: bool | None = None
-    hide_message_previews: bool | None = None
-
-    @model_validator(mode="after")
-    def require_at_least_one_setting(self):
-        if all(getattr(self, name) is None for name in ("mute_messages", "mute_calls", "hide_message_previews")):
-            raise ValueError("Provide at least one setting to update")
-        return self
-
-
 class ConversationOut(BaseModel):
     id: int
     is_group: bool
@@ -1699,10 +2155,7 @@ class ConversationOut(BaseModel):
     # sitting in their Message Requests until they accept/decline (see
     # chat_routes.get_message_requests / accept_conversation).
     status: str = "accepted"
-    is_muted: bool = False  # Backward-compatible alias for mute_messages
-    mute_messages: bool = False
-    mute_calls: bool = False
-    hide_message_previews: bool = False
+    is_muted: bool = False
     # Only meaningful from POST /api/chat/conversations: whether this call
     # just created the 1:1 thread (vs. returning an existing one), and — if
     # so — the auto-intro DM that was sent on B's behalf. Both are None on
@@ -1986,6 +2439,8 @@ class CreatorCollaborationCreate(BaseModel):
     message: str | None = Field(default=None, max_length=500)
     proposed_revenue_share_percentage: int | None = Field(default=None, ge=0, le=100)
     proposed_amount_cents: int | None = Field(default=None, ge=0)
+    watch_time_share_percentage: int | None = Field(default=None, ge=0, le=100)
+    watch_time_expires_at: datetime | None = None
 
     @field_validator("message")
     @classmethod
@@ -2001,6 +2456,8 @@ class CreatorCollaborationOut(BaseModel):
     message: str | None
     proposed_revenue_share_percentage: int | None
     proposed_amount_cents: int | None
+    watch_time_share_percentage: int | None
+    watch_time_expires_at: datetime | None
     status: CollaborationStatus
     created_at: datetime
     responded_at: datetime | None
@@ -2165,6 +2622,28 @@ class PaginatedMutedUsersResponse(BaseModel):
 
 # ---- Advanced stories: mentions / polls / questions ----
 
+class StoryPreviewOut(BaseModel):
+    id: int
+    user_id: int
+    media_url: str
+    media_type: MediaType
+    caption: str | None = None
+    expires_at: datetime | None = None
+    source_story_id: int | None = None
+
+
+class ProfileViewItemOut(BaseModel):
+    viewer: UserSummaryOut
+    viewed_at: datetime
+
+
+class ProfileViewsResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[ProfileViewItemOut]
+
+
 class StoryMentionOut(BaseModel):
     id: int
     user: UserSummaryOut
@@ -2278,6 +2757,8 @@ class MediaMessageResponse(BaseModel):
     media_type: MediaType | None
     reply_to_message_id: int | None
     created_at: datetime
+    # The recipient's automatic default menu, if this send triggered it (see MessageOut.auto_reply).
+    auto_reply: MessageOut | None = None
 
     class Config:
         from_attributes = True
@@ -2539,3 +3020,124 @@ class FollowStatusOut(BaseModel):
     is_following: bool
     is_followed_by: bool
     request_pending: bool
+
+
+# ---- Krizil video upload page: captions, drafts, and comment-to-DM configuration ----
+class ReelCaptionTrackOut(BaseModel):
+    id: int
+    reel_id: int
+    language: str
+    format: str
+    file_url: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class ReelCaptionTracksResponse(BaseModel):
+    items: list[ReelCaptionTrackOut]
+
+
+class ReelDraftCreateMetadata(BaseModel):
+    title: str | None = Field(default=None, max_length=150)
+    description: str | None = Field(default=None, max_length=2200)
+    language: str | None = Field(default=None, max_length=50)
+    ai_generated: bool = False
+    audience: ReelAudience = ReelAudience.everyone
+    age_restriction: ReelAgeRestriction | None = None
+    visibility: ReelVisibility = ReelVisibility.private
+    comments_enabled: bool = True
+    hide_like_count: bool = False
+    hide_comments: bool = False
+    remixing_enabled: bool = True
+    downloads_enabled: bool = True
+    editor_state: dict[str, Any] | None = None
+
+
+class ReelDraftOut(BaseModel):
+    id: int
+    user_id: int
+    video_url: str
+    thumbnail_url: str | None = None
+    title: str | None = None
+    caption: str | None = None
+    language: str | None = None
+    ai_generated: bool = False
+    audience: ReelAudience = ReelAudience.everyone
+    age_restriction: ReelAgeRestriction | None = None
+    visibility: str
+    comments_enabled: bool
+    hide_like_count: bool
+    hide_comments: bool
+    remixing_enabled: bool = True
+    downloads_enabled: bool = True
+    editor_state: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class ReelDraftUpdate(BaseModel):
+    title: str | None = Field(default=None, max_length=150)
+    description: str | None = Field(default=None, max_length=2200)
+    language: str | None = Field(default=None, max_length=50)
+    ai_generated: bool | None = None
+    audience: ReelAudience | None = None
+    age_restriction: ReelAgeRestriction | None = None
+    visibility: ReelVisibility | None = None
+    comments_enabled: bool | None = None
+    hide_like_count: bool | None = None
+    hide_comments: bool | None = None
+    remixing_enabled: bool | None = None
+    downloads_enabled: bool | None = None
+    editor_state: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def reject_null_for_required_settings(self):
+        for name in ("ai_generated", "audience", "visibility", "comments_enabled", "hide_like_count", "hide_comments", "remixing_enabled", "downloads_enabled"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
+
+
+class ReelDraftPublishResponse(BaseModel):
+    message: str
+    draft_id: int
+    reel: ReelDetailOut
+
+
+class CommentDMAutomationUpdate(BaseModel):
+    enabled: bool = False
+    greeting: str | None = Field(default=None, max_length=500)
+    message: str | None = Field(default=None, max_length=2200)
+    link_url: str | None = Field(default=None, max_length=1000)
+    button_label: str | None = Field(default=None, max_length=80)
+    button_url: str | None = Field(default=None, max_length=1000)
+    follow_gate_enabled: bool = False
+    follow_message: str | None = Field(default=None, max_length=2200)
+    follow_link_url: str | None = Field(default=None, max_length=1000)
+    follow_button_label: str | None = Field(default=None, max_length=80)
+    follow_button_url: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_automation(self):
+        if self.enabled and not (self.greeting or self.message):
+            raise ValueError("Provide a greeting or message when automation is enabled")
+        if self.follow_gate_enabled and not self.enabled:
+            raise ValueError("follow_gate_enabled requires enabled=true")
+        for field_name in ("link_url", "button_url", "follow_link_url", "follow_button_url"):
+            value = getattr(self, field_name)
+            if value and not value.lower().startswith(("https://", "http://")):
+                raise ValueError(f"{field_name} must be an http:// or https:// URL")
+        return self
+
+
+class CommentDMAutomationOut(CommentDMAutomationUpdate):
+    id: int
+    reel_id: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
