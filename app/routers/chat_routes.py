@@ -13,11 +13,11 @@ from app import models, schemas
 from app.auth import get_current_user, get_user_from_raw_token
 from app.ws_manager import manager
 from app.services.notification_service import notify_user
-from app.services.privacy_service import is_blocked, is_conversation_muted
+from app.services.privacy_service import (
+    is_blocked, is_conversation_muted, get_conversation_notification_settings,
+)
 from app.services.media_service import save_upload_file
 from app.routers.content_routes import _require_author_visible
-from app.services.video_settings_service import require_reel_viewable, viewer_can_view
-from app.services import chat_option_service
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -109,9 +109,7 @@ def _reel_visible_to(db: Session, reel: models.Reel, viewer_id: int | None) -> b
         _require_author_visible(db, reel.user, viewer_id)
     except HTTPException:
         return False
-    # Private / members-only / not-yet-published reels follow the owner's
-    # upload-page settings (video_settings_service).
-    return viewer_can_view(db, reel, viewer_id)
+    return True
 
 
 def _build_shared_reel_out(
@@ -143,7 +141,6 @@ def _get_shareable_reel_or_404(db: Session, reel_id: int, sender_id: int) -> mod
     # You can only share what you could open yourself (404 if blocked, 403
     # if private and not followed) — same responses as GET /api/reels/{id}.
     _require_author_visible(db, reel.user, sender_id)
-    require_reel_viewable(db, reel, sender_id)
     return reel
 
 
@@ -201,14 +198,6 @@ def _to_message_out(
         out.shared_reel = _build_shared_reel_out(db, message.shared_reel_id, viewer_id)
     elif message.shared_post_id is not None:
         out.shared_post = _build_shared_post_out(db, message.shared_post_id, viewer_id)
-    if message.shared_story_id is not None:
-        story = db.query(models.Story).filter(models.Story.id == message.shared_story_id).first()
-        if story is not None:
-            out.shared_story = schemas.StoryPreviewOut(
-                id=story.id, user_id=story.user_id, media_url=story.media_url,
-                media_type=story.media_type, caption=story.caption,
-                expires_at=story.expires_at, source_story_id=story.source_story_id,
-            )
 
     if message.reply_to_message_id is not None:
         original = (
@@ -229,10 +218,6 @@ def _to_message_out(
 
     out.reactions = [
         schemas.MessageReactionOut(user_id=r.user_id, emoji=r.emoji) for r in message.reactions
-    ]
-    out.options = [
-        schemas.ChatOptionOut.model_validate(o)
-        for o in chat_option_service.visible_options(message, viewer_id)
     ]
 
     # status: "sent" (default) until every recipient's row clears each bar.
@@ -270,6 +255,7 @@ def _to_conversation_out(
     unread_count = 0
     my_status = "accepted"
     is_muted = False
+    mute_messages = mute_calls = hide_message_previews = False
     if viewer_id is not None:
         my_participant = next((p for p in conversation.participants if p.user_id == viewer_id), None)
         if my_participant is not None:
@@ -278,7 +264,11 @@ def _to_conversation_out(
                 q = q.filter(models.Message.id > my_participant.last_read_message_id)
             unread_count = q.filter(models.Message.sender_id != viewer_id).count()
             my_status = my_participant.status.value
-        is_muted = is_conversation_muted(db, viewer_id, conversation.id)
+        settings = get_conversation_notification_settings(db, viewer_id, conversation.id)
+        is_muted = bool(settings and settings.mute_messages)
+        mute_messages = is_muted
+        mute_calls = bool(settings and settings.mute_calls)
+        hide_message_previews = bool(settings and settings.hide_message_previews)
 
     return schemas.ConversationOut(
         id=conversation.id,
@@ -290,6 +280,9 @@ def _to_conversation_out(
         unread_count=unread_count,
         status=my_status,
         is_muted=is_muted,
+        mute_messages=mute_messages,
+        mute_calls=mute_calls,
+        hide_message_previews=hide_message_previews,
     )
 
 
@@ -387,27 +380,14 @@ def get_or_create_direct_conversation(
     ))
 
     # Brand-new 1:1 thread — send the other person's auto-intro DM, as if
-    # it came from them, before either side has typed anything. If the other
-    # account has an enabled Business/Premium default menu, attach its saved
-    # greeting and options here so the customer sees the buttons immediately
-    # when opening the conversation (rather than an empty-options intro).
-    menu = chat_option_service.active_default_menu(db, other_user)
-    intro_text = (
-        chat_option_service.effective_greeting(menu)
-        if menu is not None else _build_intro_message(other_user)
-    )
-    intro = models.Message(
+    # it came from them, before either side has typed anything.
+    intro_text = _build_intro_message(other_user)
+    db.add(models.Message(
         conversation_id=conversation.id,
         sender_id=other_user.id,
         content=intro_text,
         is_auto_message=True,
-    )
-    if menu is not None:
-        for position, option in enumerate(menu.options):
-            intro.options.append(models.ChatMessageOption(
-                title=option["title"], action=option["action"], display_order=position
-            ))
-    db.add(intro)
+    ))
 
     db.commit()
     db.refresh(conversation)
@@ -591,8 +571,10 @@ def mute_conversation(
         .first()
     )
     if existing is None:
-        db.add(models.ConversationMute(user_id=current_user.id, conversation_id=conversation_id))
-        db.commit()
+        db.add(models.ConversationMute(user_id=current_user.id, conversation_id=conversation_id, mute_messages=True))
+    else:
+        existing.mute_messages = True
+    db.commit()
     return schemas.MessageResponse(message="Conversation muted")
 
 
@@ -611,9 +593,39 @@ def unmute_conversation(
         .first()
     )
     if row is not None:
-        db.delete(row)
+        row.mute_messages = False
+        # Remove the row only when all preferences are at defaults.
+        if not row.mute_calls and not row.hide_message_previews:
+            db.delete(row)
         db.commit()
     return schemas.MessageResponse(message="Conversation unmuted")
+
+
+@router.patch(
+    "/conversations/{conversation_id}/notification-settings",
+    response_model=schemas.ConversationOut,
+)
+def update_conversation_notification_settings(
+    conversation_id: int,
+    payload: schemas.ConversationNotificationSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Update independent message, call, and preview preferences for this user."""
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    settings = get_conversation_notification_settings(db, current_user.id, conversation_id)
+    if settings is None:
+        settings = models.ConversationMute(user_id=current_user.id, conversation_id=conversation_id)
+        db.add(settings)
+    for field in ("mute_messages", "mute_calls", "hide_message_previews"):
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(settings, field, value)
+    if not settings.mute_messages and not settings.mute_calls and not settings.hide_message_previews:
+        db.delete(settings)
+    db.commit()
+    conversation = _get_conversation_or_404(db, conversation_id)
+    return _to_conversation_out(db, conversation, current_user.id)
 
 
 @router.delete("/conversations/{conversation_id}", response_model=schemas.MessageResponse)
@@ -764,104 +776,12 @@ async def _push_message_event(
         await manager.send_to_users([uid], {**base, "message": out.model_dump(mode="json")})
 
 
-async def _maybe_send_default_menu(
-    db: Session,
-    conversation_id: int,
-    customer: models.User,
-    customer_message: models.Message,
-) -> schemas.MessageOut | None:
-    """Automatic default menu. Called right after `customer` sent
-    `customer_message`; if the other person in this 1:1 conversation is a
-    Business / Premium account with an enabled default menu and the
-    conversation has been inactive, sends that account's greeting — from
-    them, flagged `is_auto_message` — with the menu attached as ordinary
-    message options (so selection and analytics work as usual).
-
-    Returns the greeting as the *customer* sees it (for the `auto_reply`
-    field of their send response), or None. It never fails the customer's
-    send: the customer's message is already saved, so any error here is
-    logged and swallowed.
-    """
-    try:
-        conversation = db.get(models.Conversation, conversation_id)
-        if conversation is None or conversation.is_group:
-            return None
-        participant_ids = _conversation_participant_ids(db, conversation_id)
-        if len(participant_ids) != 2 or customer.id not in participant_ids:
-            return None
-        business = db.get(models.User, next(uid for uid in participant_ids if uid != customer.id))
-        if business is None:
-            return None
-
-        menu = chat_option_service.active_default_menu(db, business)
-        if menu is None:
-            return None
-
-        # If the conversation was just created with the menu-bearing intro,
-        # return that already-persisted message rather than sending a duplicate
-        # greeting after the customer's first message. On later inactive
-        # conversations, the normal 24-hour re-send behavior still applies.
-        prior_human_message = (
-            db.query(models.Message)
-            .filter(
-                models.Message.conversation_id == conversation_id,
-                models.Message.id < customer_message.id,
-                models.Message.is_deleted.is_(False),
-                models.Message.is_auto_message.is_(False),
-            )
-            .order_by(models.Message.id.desc())
-            .first()
-        )
-        if prior_human_message is None:
-            intro = (
-                db.query(models.Message)
-                .filter(
-                    models.Message.conversation_id == conversation_id,
-                    models.Message.sender_id == business.id,
-                    models.Message.is_auto_message.is_(True),
-                    models.Message.is_deleted.is_(False),
-                )
-                .order_by(models.Message.id.desc())
-                .first()
-            )
-            if intro is not None and intro.options:
-                return _to_message_out(db, intro, customer.id)
-
-        if not chat_option_service.conversation_is_inactive(db, conversation_id, customer_message.id):
-            return None
-
-        greeting = models.Message(
-            conversation_id=conversation_id,
-            sender_id=business.id,
-            content=chat_option_service.effective_greeting(menu),
-            is_auto_message=True,
-        )
-        business_view = await _create_and_dispatch_message(
-            db,
-            conversation_id,
-            greeting,
-            business,
-            greeting.content[:80],
-            options=[schemas.ChatOptionIn(title=o["title"], action=o["action"]) for o in menu.options],
-            mark_sender_read=False,  # the customer's message is still unread for the business
-        )
-        # The business's own open chat screen should show it too.
-        await _push_message_event(db, [business.id], greeting, "message", business_view)
-        return _to_message_out(db, greeting, customer.id)
-    except Exception:  # noqa: BLE001 - must never break the customer's send
-        logger.exception("default menu auto-send failed for conversation %s", conversation_id)
-        db.rollback()
-        return None
-
-
 async def _create_and_dispatch_message(
     db: Session,
     conversation_id: int,
     message: models.Message,
     current_user: models.User,
     preview: str,
-    options: list[schemas.ChatOptionIn] | None = None,
-    mark_sender_read: bool = True,
 ) -> schemas.MessageOut:
     """Shared by send_message (text) and send_media_message (image/video/
     voice): persist the message, mark it read for the sender, create
@@ -870,17 +790,12 @@ async def _create_and_dispatch_message(
     short text used in that notification (e.g. the caption, or "Sent a
     photo" for a caption-less media message)."""
     db.add(message)
-    for position, option in enumerate(options or []):
-        message.options.append(models.ChatMessageOption(
-            title=option.title, action=option.action, display_order=position
-        ))
     db.commit()
     db.refresh(message)
 
     my_participant = _get_participant_or_403(db, conversation_id, current_user.id)
-    if mark_sender_read:
-        my_participant.last_read_message_id = message.id
-        db.commit()
+    my_participant.last_read_message_id = message.id
+    db.commit()
 
     participant_ids = _conversation_participant_ids(db, conversation_id)
     recipient_ids = [uid for uid in participant_ids if uid != current_user.id]
@@ -913,7 +828,10 @@ async def _create_and_dispatch_message(
             message=f"{current_user.username} sent you a message",
             target_type="conversation",
             target_id=conversation_id,
-            push_body=preview,
+            push_body=("You received a new message" if (
+                (settings := get_conversation_notification_settings(db, uid, conversation_id))
+                and settings.hide_message_previews
+            ) else preview),
         )
 
     return message_out
@@ -935,10 +853,6 @@ async def send_message(
     _reject_if_blocked_in_conversation(db, conversation_id, current_user.id)
 
     reply_to_id = _validate_reply_target(db, conversation_id, payload.reply_to_message_id)
-
-    if payload.options:
-        # Backend-enforced: only Business / active-Premium accounts may attach buttons.
-        chat_option_service.require_eligible_sender(db, current_user)
 
     if payload.shared_reel_id is not None:
         # Share a reel as a card (optionally with a note in `content`).
@@ -962,11 +876,7 @@ async def send_message(
     )
     text = payload.content or default_preview
     preview = text if len(text) <= 80 else text[:77] + "..."
-    message_out = await _create_and_dispatch_message(
-        db, conversation_id, message, current_user, preview, options=payload.options
-    )
-    message_out.auto_reply = await _maybe_send_default_menu(db, conversation_id, current_user, message)
-    return message_out
+    return await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
 
 
 @router.post(
@@ -1014,9 +924,7 @@ async def send_media_message(
     )
     preview = caption or {"image": "Sent a photo", "video": "Sent a video", "audio": "Sent a voice message"}[kind]
     message_out = await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
-    auto_reply = await _maybe_send_default_menu(db, conversation_id, current_user, message)
     return schemas.MediaMessageResponse(
-        auto_reply=auto_reply,
         id=message_out.id,
         conversation_id=message_out.conversation_id,
         sender_id=message_out.sender_id,
@@ -1249,14 +1157,6 @@ async def remove_message_reaction(
 # ==========================================================================
 # Chat settings
 # ==========================================================================
-
-@router.get("/settings/font", response_model=schemas.ChatFontResponse)
-def get_chat_font(
-    current_user: models.User = Depends(get_current_user),
-):
-    """Return the current user's chat display-font preference."""
-    return schemas.ChatFontResponse(message="Chat font retrieved", font=current_user.chat_font or "default")
-
 
 @router.put("/settings/font", response_model=schemas.ChatFontResponse)
 def update_chat_font(

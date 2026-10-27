@@ -10,7 +10,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -193,14 +192,6 @@ class User(Base):
     # Nullable/free-form on purpose: the client owns the list of valid font
     # names, same way it owns theme names, so the API doesn't hardcode one.
     chat_font = Column(String(50), nullable=True)
-    # Preferred UI/content translation language (BCP-47-style short code).
-    preferred_language = Column(String(10), nullable=False, default="en", server_default="en")
-    # GLOBAL engagement switches (GET/PUT /api/users/me/engagement-settings):
-    # they apply to every post and reel this user owns, on top of any
-    # per-reel setting (Reel.hide_like_count / Reel.hide_comments) — either one
-    # being on is enough to hide.
-    hide_like_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
-    hide_comments = Column(Boolean, default=False, nullable=False, server_default=expression.false())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     refresh_tokens = relationship(
@@ -290,22 +281,6 @@ class Follow(Base):
 
     follower = relationship("User", foreign_keys=[follower_id])
     following = relationship("User", foreign_keys=[following_id])
-
-
-class UserSocialLink(Base):
-    """A user's public social/profile links, managed by /api/users/{id}/social-links."""
-    __tablename__ = "user_social_links"
-    __table_args__ = (
-        UniqueConstraint("user_id", "platform", name="uq_user_social_link_platform"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    platform = Column(String(40), nullable=False)
-    url = Column(String(1000), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    user = relationship("User")
 
 
 class FollowRequest(Base):
@@ -435,6 +410,11 @@ class ConversationMute(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    # Per-user, per-conversation notification preferences. Existing mute rows
+    # retain mute_messages=True via the migration default for compatibility.
+    mute_messages = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    mute_calls = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    hide_message_previews = Column(Boolean, nullable=False, default=False, server_default=expression.false())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", foreign_keys=[user_id])
@@ -473,10 +453,6 @@ class Post(Base):
     # "AI info" disclosure label — whether the post's media was created or
     # edited with AI (Instagram's "AI-generated content" toggle).
     ai_generated = Column(Boolean, default=False, nullable=False)
-    # The client editor's complete state (trim/crop/zoom/rotation/filters/
-    # effects/text/stickers/media position & shape...). Opaque to the server:
-    # stored and returned verbatim. JSON on MySQL, JSON-as-text on SQLite.
-    editor_state = Column(JSON(none_as_null=True), nullable=True)
 
     user = relationship("User", back_populates="posts")
     saves = relationship("SavedPost", back_populates="post", cascade="all, delete-orphan")
@@ -589,36 +565,6 @@ class PostMember(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
-class ReelVisibility(str, enum.Enum):
-    """Who may view a reel/video (PUT /api/videos/:id/visibility).
-
-    `members` is stored and validated, but the app has no creator-scoped
-    membership relation yet (UserMembership is a platform subscription, not
-    "subscribed to creator X"), so until one exists only the owner and
-    credited collaborators can open a members-only reel — it fails closed.
-    See app/services/video_settings_service.viewer_is_member.
-    """
-
-    public = "public"
-    private = "private"
-    members = "members"
-
-
-class ReelAudience(str, enum.Enum):
-    """Who can view a reel; independent from age categorisation."""
-
-    everyone = "everyone"
-    followers = "followers"
-    close_friends = "close_friends"
-
-
-class ReelAgeRestriction(str, enum.Enum):
-    """Age category supplied by the client. This label alone does not verify age."""
-
-    adult = "18_plus"
-    below_18 = "below_18"
-
-
 class Reel(Base):
     __tablename__ = "reels"
 
@@ -657,29 +603,6 @@ class Reel(Base):
     location_longitude = Column(Float, nullable=True)
     location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
 
-    # ---- Upload-page settings (Phase 1 of the video upload flow) ----
-    # Every column is additive and defaults so rows created before this
-    # existed keep behaving exactly as they did: public, comments on, no
-    # schedule. language/audience stay NULL = "never set".
-    language = Column(String(50), nullable=True)
-    ai_generated = Column(Boolean, default=False, nullable=False, server_default=expression.false())
-    comments_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
-    hide_like_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
-    hide_comments = Column(Boolean, default=False, nullable=False, server_default=expression.false())
-    audience = Column(String(20), nullable=False, default=ReelAudience.everyone.value, server_default=ReelAudience.everyone.value)
-    age_restriction = Column(String(20), nullable=True)
-    remixing_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
-    downloads_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
-    visibility = Column(
-        String(20), default=ReelVisibility.public.value, nullable=False,
-        server_default=ReelVisibility.public.value, index=True,
-    )
-    schedule_enabled = Column(Boolean, default=False, nullable=False, server_default=expression.false())
-    # Stored as a naive UTC datetime (see video_settings_service.to_storage_utc).
-    scheduled_at = Column(DateTime, nullable=True, index=True)
-    # Same opaque editor blob as Post.editor_state.
-    editor_state = Column(JSON(none_as_null=True), nullable=True)
-
     user = relationship("User", back_populates="reels")
     location = relationship("Location", foreign_keys=[location_id])
     audio = relationship("Audio", foreign_keys=[audio_id])
@@ -689,66 +612,6 @@ class Reel(Base):
     revenue_splits = relationship(
         "ReelRevenueShare", back_populates="reel", cascade="all, delete-orphan"
     )
-
-
-class ReelCaptionTrack(Base):
-    """Uploaded subtitle/caption file for a reel (SRT or WebVTT)."""
-    __tablename__ = "reel_caption_tracks"
-    __table_args__ = (UniqueConstraint("reel_id", "language", name="uq_reel_caption_language"),)
-
-    id = Column(Integer, primary_key=True, index=True)
-    reel_id = Column(Integer, ForeignKey("reels.id", ondelete="CASCADE"), nullable=False, index=True)
-    language = Column(String(50), nullable=False)
-    format = Column(String(8), nullable=False)
-    file_url = Column(String(500), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-
-class ReelCommentDMAutomation(Base):
-    """Per-reel comment-to-DM configuration. Dispatch is intentionally separate."""
-    __tablename__ = "reel_comment_dm_automations"
-
-    id = Column(Integer, primary_key=True, index=True)
-    reel_id = Column(Integer, ForeignKey("reels.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
-    enabled = Column(Boolean, nullable=False, default=False, server_default=expression.false())
-    greeting = Column(String(500), nullable=True)
-    message = Column(Text, nullable=True)
-    link_url = Column(String(1000), nullable=True)
-    button_label = Column(String(80), nullable=True)
-    button_url = Column(String(1000), nullable=True)
-    follow_gate_enabled = Column(Boolean, nullable=False, default=False, server_default=expression.false())
-    follow_message = Column(Text, nullable=True)
-    follow_link_url = Column(String(1000), nullable=True)
-    follow_button_label = Column(String(80), nullable=True)
-    follow_button_url = Column(String(1000), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-
-class ReelDraft(Base):
-    """Unpublished reel draft; it is separate from reels so normal feeds never expose it."""
-    __tablename__ = "reel_drafts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    video_url = Column(String(500), nullable=False)
-    thumbnail_url = Column(String(500), nullable=True)
-    title = Column(String(150), nullable=True)
-    caption = Column(Text, nullable=True)
-    language = Column(String(50), nullable=True)
-    ai_generated = Column(Boolean, nullable=False, default=False, server_default=expression.false())
-    audience = Column(String(20), nullable=False, default=ReelAudience.everyone.value, server_default=ReelAudience.everyone.value)
-    age_restriction = Column(String(20), nullable=True)
-    visibility = Column(String(20), nullable=False, default=ReelVisibility.public.value, server_default=ReelVisibility.public.value)
-    comments_enabled = Column(Boolean, nullable=False, default=True, server_default=expression.true())
-    hide_like_count = Column(Boolean, nullable=False, default=False, server_default=expression.false())
-    hide_comments = Column(Boolean, nullable=False, default=False, server_default=expression.false())
-    remixing_enabled = Column(Boolean, nullable=False, default=True, server_default=expression.true())
-    downloads_enabled = Column(Boolean, nullable=False, default=True, server_default=expression.true())
-    editor_state = Column(JSON(none_as_null=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class ReelCollaborator(Base):
@@ -1138,17 +1001,6 @@ class Location(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class ProfileView(Base):
-    """A profile visit event. The profile owner can inspect their own viewers."""
-    __tablename__ = "profile_views"
-    id = Column(Integer, primary_key=True, index=True)
-    profile_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    viewer_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    profile_user = relationship("User", foreign_keys=[profile_user_id])
-    viewer_user = relationship("User", foreign_keys=[viewer_user_id])
-
-
 class Story(Base):
     """
     Stories are ephemeral (default 24h). `expires_at` is set at creation time
@@ -1177,10 +1029,7 @@ class Story(Base):
     visibility = Column(
         Enum(StoryVisibility), default=StoryVisibility.public, nullable=False
     )
-        # Camera/editor metadata; NULL for stories created before this feature.
-    editor_state = Column(JSON(none_as_null=True), nullable=True)
-    # Original story id when this story was created with "Add to your story".
-    source_story_id = Column(Integer, nullable=True, index=True)
+
     user = relationship("User", back_populates="stories")
     views = relationship("StoryView", back_populates="story", cascade="all, delete-orphan")
     reactions = relationship("StoryReaction", back_populates="story", cascade="all, delete-orphan")
@@ -1205,14 +1054,6 @@ class StoryDraft(Base):
     question) that live on Story — a draft is "finish this later", not a
     parallel copy of every attachable extra. Flag if drafts should carry
     those too.
-
-    `editor_state` is the one exception to "core fields only": it is an
-    opaque JSON blob owned by the client's story editor (background, media
-    shape, text layers, positions, effects, stickers, filters, ...) so the
-    editor can be reopened exactly as it was left. The backend stores and
-    returns it verbatim and never interprets it. NULL for drafts created
-    before the column existed. It is NOT carried over to the Story row on
-    publish — the published story is the flattened media.
     """
 
     __tablename__ = "story_drafts"
@@ -1227,10 +1068,6 @@ class StoryDraft(Base):
     location_longitude = Column(Float, nullable=True)
     location_id = Column(Integer, ForeignKey("locations.id"), nullable=True, index=True)
     close_friends_only = Column(Boolean, default=False, nullable=False)
-    # JSON on MySQL (native JSON type), JSON-as-text on SQLite (tests).
-    # none_as_null=True: Python None is stored as SQL NULL, not the JSON
-    # literal `null`, so "no editor state" is one thing in the database.
-    editor_state = Column(JSON(none_as_null=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -1574,9 +1411,6 @@ class Message(Base):
     # ForeignKey, same reasoning. Only one of shared_reel_id / shared_post_id
     # is ever set on a given message — enforced in schemas.MessageCreate.
     shared_post_id = Column(Integer, nullable=True, index=True)
-    # Story mention / story-share card in chat; intentionally not a FK so the
-    # conversation history survives story expiry/deletion.
-    shared_story_id = Column(Integer, nullable=True, index=True)
     # True for the one-time auto-intro DM sent on a brand-new 1:1
     # conversation (see chat_routes.create_conversation) — lets a client
     # style/skip it differently from a message the sender actually typed.
@@ -1600,82 +1434,6 @@ class Message(Base):
     statuses = relationship(
         "MessageStatus", back_populates="message", cascade="all, delete-orphan"
     )
-    options = relationship(
-        "ChatMessageOption",
-        back_populates="message",
-        cascade="all, delete-orphan",
-        order_by="ChatMessageOption.display_order, ChatMessageOption.id",
-    )
-
-
-class ChatMessageOption(Base):
-    """One clickable quick-reply button attached to a chat message (WhatsApp
-    Business style). Only Business / active-Premium senders can create them —
-    see services/chat_option_service.py. A message has at most
-    MAX_OPTIONS_PER_MESSAGE; display_order is the left-to-right / top-to-bottom
-    order the client renders them in."""
-
-    __tablename__ = "chat_message_options"
-    __table_args__ = (
-        UniqueConstraint("message_id", "action", name="uq_chat_option_message_action"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
-    title = Column(String(24), nullable=False)
-    action = Column(String(50), nullable=False)
-    display_order = Column(Integer, default=0, nullable=False)
-    is_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-    message = relationship("Message", back_populates="options")
-    selections = relationship(
-        "ChatMessageOptionSelection", back_populates="option", cascade="all, delete-orphan"
-    )
-
-
-class ChatDefaultMenu(Base):
-    """A Business / Premium account's saved quick-reply menu. When a customer
-    messages them and the conversation has been inactive (see
-    chat_option_service.DEFAULT_MENU_INACTIVITY_HOURS), the backend sends
-    `greeting` from the business automatically with `options` attached as
-    ordinary message options. One row per account. `options` is a JSON list of
-    {"title", "action"} in display order (max MAX_OPTIONS_PER_MESSAGE)."""
-
-    __tablename__ = "chat_default_menus"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
-    )
-    is_enabled = Column(Boolean, default=False, nullable=False, server_default=expression.false())
-    greeting = Column(String(1000), nullable=True)  # NULL = DEFAULT_GREETING
-    options = Column(JSON, nullable=False, default=list)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-    user = relationship("User", foreign_keys=[user_id])
-
-
-class ChatMessageOptionSelection(Base):
-    """A user tapping an option — one row per (option, user): tapping the same
-    option again is a no-op, so selection counts are unique users."""
-
-    __tablename__ = "chat_message_option_selections"
-    __table_args__ = (
-        UniqueConstraint("option_id", "user_id", name="uq_chat_option_selection"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    option_id = Column(
-        Integer, ForeignKey("chat_message_options.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    selected_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    option = relationship("ChatMessageOption", back_populates="selections")
-    user = relationship("User", foreign_keys=[user_id])
 
 
 class MessageReaction(Base):
@@ -1933,9 +1691,6 @@ class CreatorCollaborationRequest(Base):
     # one-time payout credited as a CreatorEarning on acceptance.
     proposed_revenue_share_percentage = Column(Integer, nullable=True)
     proposed_amount_cents = Column(Integer, nullable=True)
-    # Optional per-collaborator watch-time allocation and its expiry.
-    watch_time_share_percentage = Column(Integer, nullable=True)
-    watch_time_expires_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(Enum(CollaborationStatus), nullable=False, default=CollaborationStatus.pending, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     responded_at = Column(DateTime(timezone=True), nullable=True)
