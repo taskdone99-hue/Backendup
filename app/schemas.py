@@ -2099,7 +2099,7 @@ class MessageOut(BaseModel):
     reply_to: "MessageRepliedToOut | None" = None
     reply_to_story_id: int | None = None
     shared_story_id: int | None = None
-    shared_story: StoryPreviewOut | None = None
+    shared_story: "StoryPreviewOut | None" = None
     # Non-null `shared_reel`/`shared_post` means this message is a shared
     # reel/post (mutually exclusive); `content` is then just the optional
     # note.
