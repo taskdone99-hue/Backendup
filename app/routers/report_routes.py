@@ -37,6 +37,88 @@ def _get_own_report_or_404(db: Session, report_id: int, current_user: models.Use
 # User-facing
 # ==========================================================================
 
+@router.get("/reasons")
+def get_report_reasons():
+    """Return supported report reasons and their subcategories."""
+    reason_details = {
+        models.ReportReason.spam: {
+            "label": "Spam",
+            "subcategories": [
+                {"id": "repetitive_content", "label": "Repetitive content"},
+                {"id": "scam_or_fraud", "label": "Scam or fraud"},
+                {"id": "fake_engagement", "label": "Fake engagement"},
+            ],
+        },
+        models.ReportReason.nudity_or_sexual_content: {
+            "label": "Nudity or sexual content",
+            "subcategories": [
+                {"id": "nudity", "label": "Nudity"},
+                {"id": "sexual_activity", "label": "Sexual activity"},
+                {"id": "sexual_exploitation", "label": "Sexual exploitation"},
+            ],
+        },
+        models.ReportReason.hate_speech_or_symbols: {
+            "label": "Hate speech or symbols",
+            "subcategories": [
+                {"id": "hateful_language", "label": "Hateful language"},
+                {"id": "hateful_symbols", "label": "Hateful symbols"},
+            ],
+        },
+        models.ReportReason.harassment_or_bullying: {
+            "label": "Harassment or bullying",
+            "subcategories": [
+                {"id": "bullying", "label": "Bullying"},
+                {"id": "threats", "label": "Threats"},
+                {"id": "unwanted_contact", "label": "Unwanted contact"},
+            ],
+        },
+        models.ReportReason.violence_or_dangerous_content: {
+            "label": "Violence or dangerous content",
+            "subcategories": [
+                {"id": "violent_content", "label": "Violent content"},
+                {"id": "threats_of_violence", "label": "Threats of violence"},
+            ],
+        },
+        models.ReportReason.false_information: {
+            "label": "False information",
+            "subcategories": [
+                {"id": "misinformation", "label": "Misinformation"},
+                {"id": "misleading_content", "label": "Misleading content"},
+            ],
+        },
+        models.ReportReason.intellectual_property: {
+            "label": "Intellectual property",
+            "subcategories": [
+                {"id": "copyright", "label": "Copyright infringement"},
+                {"id": "trademark", "label": "Trademark infringement"},
+            ],
+        },
+        models.ReportReason.self_injury: {
+            "label": "Self-injury",
+            "subcategories": [
+                {"id": "self_harm", "label": "Self-harm content"},
+                {"id": "suicide_content", "label": "Suicide-related content"},
+            ],
+        },
+        models.ReportReason.other: {
+            "label": "Other",
+            "subcategories": [
+                {"id": "other", "label": "Other reason"},
+            ],
+        },
+    }
+
+    return {
+        "reasons": [
+            {
+                "id": reason.value,
+                **details,
+            }
+            for reason, details in reason_details.items()
+        ]
+    }
+
+
 @router.post("", response_model=schemas.ReportOut, status_code=status.HTTP_201_CREATED)
 def create_report(
     payload: schemas.ReportCreate,
