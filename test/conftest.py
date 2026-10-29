@@ -16,6 +16,7 @@ import os
 import sys
 
 import pytest
+os.environ.setdefault("MSG91_AUTHKEY", "test-msg91-authkey")
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
