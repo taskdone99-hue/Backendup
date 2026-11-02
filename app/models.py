@@ -2348,3 +2348,28 @@ class UserThemePreference(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
     theme = Column(String(20), nullable=False, default="system", server_default="system")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+class ReelInsightEvent(Base):
+    __tablename__ = "reel_insight_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "reel_id", "viewer_id", "client_event_id",
+            name="uq_reel_insight_client_event",
+        ),
+        Index("ix_reel_insight_reel_created", "reel_id", "created_at"),
+        Index(
+            "ix_reel_insight_reel_audience_created",
+            "reel_id", "audience_type", "created_at",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    reel_id = Column(Integer, ForeignKey("reels.id", ondelete="CASCADE"), nullable=False, index=True)
+    viewer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(24), nullable=False, index=True)
+    audience_type = Column(String(20), nullable=False, index=True)
+    source = Column(String(24), nullable=True, index=True)
+    watched_seconds = Column(Float, nullable=True)
+    progress_percent = Column(Float, nullable=True)
+    client_event_id = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
