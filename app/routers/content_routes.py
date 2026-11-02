@@ -253,6 +253,27 @@ def _visible_authors_clause(db: Session, viewer_id: int | None):
     return base
 
 
+def _exclude_not_interested(query, db: Session, viewer_id: int | None, content_type: str, content_id_column):
+    """Hide content the authenticated viewer marked as not interested.
+
+    Anonymous feed requests are unchanged. Applying this to the SQL query
+    (before count/order/pagination) keeps totals and page boundaries correct.
+    """
+    if viewer_id is None:
+        return query
+
+    excluded = (
+        db.query(models.NotInterested.id)
+        .filter(
+            models.NotInterested.user_id == viewer_id,
+            models.NotInterested.content_type == content_type,
+            models.NotInterested.content_id == content_id_column,
+        )
+        .exists()
+    )
+    return query.filter(~excluded)
+
+
 def _require_author_visible(db: Session, author: models.User, viewer_id: int | None) -> None:
     """Same rule as _visible_authors_clause, but for a single already-fetched
     item (a specific post/reel by id) rather than a list query. A block
@@ -497,6 +518,9 @@ def get_home_feed(
     muted_ids = muted_user_ids(db, current_user.id, for_stories=False)
     if muted_ids:
         query = query.filter(models.Post.user_id.notin_(muted_ids))
+    query = _exclude_not_interested(
+        query, db, current_user.id, "post", models.Post.id
+    )
     total = query.count()
     posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_post_detail(db, p, current_user.id) for p in posts]
@@ -565,7 +589,13 @@ def get_explore_feed(
             .filter(_visible_authors_clause(db, viewer_id))
         )
 
-    query = _base_query()
+    # Apply this to the shared base query so both the personalized Explore
+    # query and its fallback exclude the viewer's hidden posts.
+    base_query = _base_query()
+    query = _exclude_not_interested(
+        base_query, db, viewer_id, "post", models.Post.id
+    )
+
     if current_user is not None:
         excluded_ids = _following_ids(db, current_user.id) + [current_user.id]
         personalized_query = query.filter(models.Post.user_id.notin_(excluded_ids))
@@ -1073,6 +1103,9 @@ def get_reels_home_feed(
         models.Reel.user_id.in_(author_ids),
         visible_reels_clause(db, current_user.id),
     )
+    query = _exclude_not_interested(
+        query, db, current_user.id, "reel", models.Reel.id
+    )
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_reel_detail(db, r, current_user.id) for r in reels]
@@ -1095,6 +1128,9 @@ def get_reels_feed(
     query = db.query(models.Reel).join(models.User, models.Reel.user_id == models.User.id)
     query = query.filter(_visible_authors_clause(db, viewer_id))
     query = query.filter(visible_reels_clause(db, viewer_id))
+    query = _exclude_not_interested(
+        query, db, viewer_id, "reel", models.Reel.id
+    )
     total = query.count()
     reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
     items = [_to_reel_detail(db, r, viewer_id) for r in reels]
@@ -1154,6 +1190,9 @@ def get_trending_reels(
         .filter(_visible_authors_clause(db, viewer_id))
         .filter(visible_reels_clause(db, viewer_id))
         .order_by(score.desc(), models.Reel.created_at.desc())
+    )
+    query = _exclude_not_interested(
+        query, db, viewer_id, "reel", models.Reel.id
     )
 
     total = query.count()
