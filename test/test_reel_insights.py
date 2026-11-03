@@ -68,3 +68,49 @@ def test_retention_unavailable_until_progress_events(client, db, make_user, make
     response = client.get(f"/api/reels/{reel.id}/insights/retention")
     assert response.status_code == 200
     assert response.json() == {"reel_id": reel.id, "available": False, "data": []}
+
+
+def test_reel_audience_aggregates_age_gender_and_hides_viewer_identities(
+    client, db, make_user, make_reel
+):
+    from datetime import date
+
+    owner = make_user("audience_owner")
+    viewer = make_user("audience_viewer")
+    viewer.date_of_birth = date(2000, 1, 1)
+    viewer.gender = models.Gender.female
+    db.commit()
+    reel = make_reel(owner)
+    db.add(models.ReelInsightEvent(
+        reel_id=reel.id, viewer_id=viewer.id, event_type="view",
+        audience_type="non_followers", source="feed",
+    ))
+    db.commit()
+
+    client.login(owner)
+    summary = client.get(f"/api/reels/{reel.id}/audience")
+    assert summary.status_code == 200
+    assert summary.json()["unique_viewers"] == 1
+    assert summary.json()["categories"]["age"]["available"] is True
+    assert summary.json()["categories"]["gender"]["available"] is True
+    assert summary.json()["categories"]["country"]["available"] is False
+
+    age = client.get(f"/api/reels/{reel.id}/audience/age")
+    assert age.status_code == 200
+    assert age.json()["available"] is True
+    assert sum(item["viewers"] for item in age.json()["data"]) == 1
+
+    gender = client.get(f"/api/reels/{reel.id}/audience/gender")
+    assert gender.status_code == 200
+    assert gender.json()["available"] is True
+    assert next(item for item in gender.json()["data"] if item["gender"] == "female")["percentage"] == 100.0
+
+    countries = client.get(f"/api/reels/{reel.id}/audience/countries")
+    assert countries.status_code == 200
+    assert countries.json()["available"] is False
+    assert countries.json()["reason"] == "viewer_country_not_collected"
+
+    viewers = client.get(f"/api/reels/{reel.id}/audience/viewers")
+    assert viewers.status_code == 200
+    assert viewers.json()["available"] is False
+    assert "viewer" not in viewers.json() or "data" not in viewers.json()

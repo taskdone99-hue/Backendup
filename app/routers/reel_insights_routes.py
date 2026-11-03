@@ -226,3 +226,131 @@ def reel_insights_sources(reel_id: int, db: Session = Depends(get_db), user: mod
             "data": [{"source": label, "views": counts.get(label, 0),
                       "percentage": round(counts.get(label, 0) * 100 / total, 2) if total else None}
                      for label in labels] if total else []}
+
+
+def _unique_viewers(db: Session, reel_id: int):
+    """Return distinct users who generated a recorded view for this Reel."""
+    viewer_ids = db.query(models.ReelInsightEvent.viewer_id).filter(
+        models.ReelInsightEvent.reel_id == reel_id,
+        models.ReelInsightEvent.event_type == "view",
+    ).distinct().subquery()
+    return db.query(models.User).join(
+        viewer_ids, models.User.id == viewer_ids.c.viewer_id
+    )
+
+
+def _percentage(count: int, total: int):
+    return round(count * 100 / total, 2) if total else None
+
+
+def _age_on(dob, today):
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+@router.get("/api/reels/{reel_id}/audience")
+def reel_audience_summary(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    viewers = _unique_viewers(db, reel_id).all()
+    with_dob = sum(1 for viewer in viewers if viewer.date_of_birth is not None)
+    with_gender = sum(
+        1 for viewer in viewers
+        if viewer.gender is not None and getattr(viewer.gender, "value", viewer.gender) != "prefer_not_to_say"
+    )
+    return {
+        "reel_id": reel_id,
+        "unique_viewers": len(viewers),
+        "categories": {
+            "age": {"available": with_dob > 0, "status": "available" if with_dob else "unavailable"},
+            "country": {"available": False, "status": "unavailable", "reason": "viewer_country_not_collected"},
+            "gender": {"available": with_gender > 0, "status": "available" if with_gender else "unavailable"},
+        },
+        "viewers": {"available": False, "status": "unavailable", "reason": "individual_viewer_identities_not_exposed"},
+    }
+
+
+@router.get("/api/reels/{reel_id}/audience/viewers")
+def reel_audience_viewers_status(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    return {
+        "reel_id": reel_id,
+        "available": False,
+        "status": "unavailable",
+        "reason": "individual_viewer_identities_not_exposed",
+    }
+
+
+@router.get("/api/reels/{reel_id}/audience/age")
+def reel_audience_age(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    today = datetime.now(timezone.utc).date()
+    viewers = [v for v in _unique_viewers(db, reel_id).all() if v.date_of_birth is not None]
+    groups = [("13-17", 13, 17), ("18-24", 18, 24), ("25-34", 25, 34),
+              ("35-44", 35, 44), ("45-54", 45, 54), ("55-64", 55, 64), ("65+", 65, None)]
+    counts = {label: 0 for label, _, _ in groups}
+    for viewer in viewers:
+        age = _age_on(viewer.date_of_birth, today)
+        for label, lower, upper in groups:
+            if age >= lower and (upper is None or age <= upper):
+                counts[label] += 1
+                break
+    total = len(viewers)
+    return {
+        "reel_id": reel_id, "available": total > 0,
+        "status": "available" if total else "unavailable",
+        "denominator_viewers": total,
+        "data": [
+            {"age_group": label, "viewers": counts[label], "percentage": _percentage(counts[label], total)}
+            for label, _, _ in groups
+        ] if total else [],
+    }
+
+
+@router.get("/api/reels/{reel_id}/audience/countries")
+def reel_audience_countries(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    return {
+        "reel_id": reel_id, "available": False, "status": "unavailable",
+        "reason": "viewer_country_not_collected", "denominator_viewers": 0, "data": [],
+    }
+
+
+@router.get("/api/reels/{reel_id}/audience/gender")
+def reel_audience_gender(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    viewers = _unique_viewers(db, reel_id).all()
+    labels = ("male", "female", "non_binary")
+    counts = {label: 0 for label in labels}
+    for viewer in viewers:
+        value = getattr(viewer.gender, "value", viewer.gender)
+        if value in counts:
+            counts[value] += 1
+    total = sum(counts.values())
+    return {
+        "reel_id": reel_id, "available": total > 0,
+        "status": "available" if total else "unavailable",
+        "denominator_viewers": total,
+        "data": [
+            {"gender": label, "viewers": counts[label], "percentage": _percentage(counts[label], total)}
+            for label in labels
+        ] if total else [],
+    }
