@@ -114,3 +114,109 @@ def test_reel_audience_aggregates_age_gender_and_hides_viewer_identities(
     assert viewers.status_code == 200
     assert viewers.json()["available"] is False
     assert "viewer" not in viewers.json() or "data" not in viewers.json()
+
+
+def test_reel_insights_period_filters_views_and_event_watch_time(
+    client, db, make_user, make_reel
+):
+    from datetime import timedelta
+
+    owner = make_user("insights_period_owner")
+    viewer = make_user("insights_period_viewer")
+    reel = make_reel(owner)
+    now = datetime.now(timezone.utc)
+
+    db.add_all([
+        models.ReelInsightEvent(
+            reel_id=reel.id, viewer_id=viewer.id, event_type="view",
+            audience_type="non_followers", watched_seconds=30,
+            created_at=now,
+        ),
+        models.ReelInsightEvent(
+            reel_id=reel.id, viewer_id=viewer.id, event_type="view",
+            audience_type="non_followers", watched_seconds=10,
+            created_at=now - timedelta(hours=13),
+        ),
+    ])
+    db.commit()
+
+    client.login(owner)
+    response = client.get(f"/api/reels/{reel.id}/insights?period=12h")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["period"] == "12h"
+    assert payload["views"] == 1
+    assert payload["reach"] == 1
+    assert payload["total_watch_time_seconds"] == 30
+    assert payload["average_watch_time_seconds"] == 30
+    assert payload["watch_time_events"] == 1
+
+    lifetime = client.get(f"/api/reels/{reel.id}/insights?period=lifetime")
+    assert lifetime.status_code == 200
+    assert lifetime.json()["views"] == 2
+    assert lifetime.json()["total_watch_time_seconds"] == 40
+
+
+def test_reel_insights_timeline_returns_views_and_watch_time_for_period(
+    client, db, make_user, make_reel
+):
+    from datetime import timedelta
+
+    owner = make_user("insights_timeline_owner")
+    viewer = make_user("insights_timeline_viewer")
+    reel = make_reel(owner)
+    now = datetime.now(timezone.utc)
+
+    db.add_all([
+        models.ReelInsightEvent(
+            reel_id=reel.id, viewer_id=viewer.id, event_type="view",
+            audience_type="non_followers", watched_seconds=30,
+            created_at=now,
+        ),
+        models.ReelInsightEvent(
+            reel_id=reel.id, viewer_id=viewer.id, event_type="view",
+            audience_type="non_followers", watched_seconds=10,
+            created_at=now - timedelta(days=5),
+        ),
+    ])
+    db.commit()
+
+    client.login(owner)
+    response = client.get(f"/api/reels/{reel.id}/insights/timeline?period=7d")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["period"] == "7d"
+    assert payload["total_views"] == 2
+    assert payload["total_watch_time_seconds"] == 40
+    assert sum(point["views"] for point in payload["data"]) == 2
+    assert sum(point["watch_time_seconds"] for point in payload["data"]) == 40
+
+    realtime = client.get(f"/api/reels/{reel.id}/insights/timeline?period=12h")
+    assert realtime.status_code == 200
+    assert realtime.json()["total_views"] == 1
+    assert realtime.json()["total_watch_time_seconds"] == 30
+
+
+def test_retention_includes_progress_percent_on_view_events(
+    client, db, make_user, make_reel
+):
+    owner = make_user("insights_view_progress_owner")
+    viewer = make_user("insights_view_progress_viewer")
+    reel = make_reel(owner)
+    db.add(models.ReelInsightEvent(
+        reel_id=reel.id, viewer_id=viewer.id, event_type="view",
+        audience_type="non_followers", progress_percent=75,
+        watched_seconds=30,
+    ))
+    db.commit()
+
+    client.login(owner)
+    response = client.get(f"/api/reels/{reel.id}/insights/retention")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["data"] == [{
+        "progress_percent": 75,
+        "retained_viewers": 1,
+        "retention_percent": 100.0,
+    }]

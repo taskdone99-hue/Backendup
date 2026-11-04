@@ -1,4 +1,5 @@
 """Creator-facing Reel insights and playback analytics event ingestion."""
+import calendar
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -93,34 +94,132 @@ def record_reel_insight_event(
     return {"recorded": True, "event_id": event.id, "audience": event.audience_type}
 
 
+# The period values are shared by the overview (Views + Watch Time) and timeline
+# (real-time Views + Watch Time) endpoints.
+InsightsPeriod = Literal["12h", "24h", "7d", "30d", "6m", "1y", "lifetime"]
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _subtract_months(value: datetime, months: int) -> datetime:
+    month_index = value.year * 12 + (value.month - 1) - months
+    year, month_zero_based = divmod(month_index, 12)
+    month = month_zero_based + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _period_start(period: InsightsPeriod, now: datetime) -> datetime | None:
+    if period == "12h":
+        return now - timedelta(hours=12)
+    if period == "24h":
+        return now - timedelta(hours=24)
+    if period == "7d":
+        return now - timedelta(days=7)
+    if period == "30d":
+        return now - timedelta(days=30)
+    if period == "6m":
+        return _subtract_months(now, 6)
+    if period == "1y":
+        return _subtract_months(now, 12)
+
+    # Lifetime means every insight event recorded for this Reel. Do not use
+    # reel.created_at as a lower bound: imported/backfilled events may predate
+    # that timestamp, and database timestamp precision can otherwise exclude
+    # events recorded at Reel creation time.
+    return None
+
+
+def _period_events(db: Session, reel_id: int, start: datetime | None):
+    query = _events(db, reel_id)
+    if start is not None:
+        query = query.filter(models.ReelInsightEvent.created_at >= start)
+    return query
+
+
+def _timeline_bucket(value: datetime, granularity: str) -> datetime:
+    value = _as_utc(value) or datetime.now(timezone.utc)
+    if granularity == "hour":
+        return value.replace(minute=0, second=0, microsecond=0)
+    if granularity == "day":
+        return value.replace(hour=0, minute=0, second=0, microsecond=0)
+    if granularity == "week":
+        day_start = value.replace(hour=0, minute=0, second=0, microsecond=0)
+        return day_start - timedelta(days=day_start.weekday())
+    return value.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _next_timeline_bucket(value: datetime, granularity: str) -> datetime:
+    if granularity == "hour":
+        return value + timedelta(hours=1)
+    if granularity == "day":
+        return value + timedelta(days=1)
+    if granularity == "week":
+        return value + timedelta(days=7)
+    return _subtract_months(value.replace(day=1), -1)
+
+
+def _timeline_label(value: datetime, granularity: str) -> str:
+    if granularity == "hour":
+        return value.strftime("%Y-%m-%dT%H:00:00Z")
+    if granularity in ("day", "week"):
+        return value.date().isoformat()
+    return value.strftime("%Y-%m")
+
+
+def _timeline_granularity(period: InsightsPeriod) -> str:
+    if period in ("12h", "24h"):
+        return "hour"
+    if period in ("7d", "30d"):
+        return "day"
+    if period == "6m":
+        return "week"
+    return "month"
+
+
 @router.get("/api/reels/{reel_id}/insights")
 def reel_insights_overview(
     reel_id: int,
+    period: InsightsPeriod = Query("lifetime"),
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
     reel = _owned_reel(db, reel_id, user)
-    view_q = _events(db, reel_id).filter(models.ReelInsightEvent.event_type == "view")
+    now = datetime.now(timezone.utc)
+    start = _period_start(period, now)
+    period_q = _period_events(db, reel_id, start)
+    view_q = period_q.filter(models.ReelInsightEvent.event_type == "view")
     views = int(view_q.count())
     reach = int(view_q.with_entities(func.count(func.distinct(models.ReelInsightEvent.viewer_id))).scalar() or 0)
-    sessions = db.query(models.WatchSession).filter(
-        models.WatchSession.reel_id == reel_id,
-        models.WatchSession.user_id != reel.user_id,
-        models.WatchSession.is_valid.is_(True),
-        models.WatchSession.watch_seconds.isnot(None),
-    ).all()
-    total_watch_seconds = sum(int(s.watch_seconds or 0) for s in sessions)
-    session_count = len(sessions)
+
+    # Reel Insights uses its own playback-event source. Do not read or mutate
+    # WatchSession here: that table remains the source of truth for monetization.
+    watch_q = view_q.filter(models.ReelInsightEvent.watched_seconds.isnot(None))
+    total_watch_seconds = float(
+        watch_q.with_entities(func.coalesce(func.sum(models.ReelInsightEvent.watched_seconds), 0)).scalar() or 0
+    )
+    watch_event_count = int(watch_q.with_entities(func.count(models.ReelInsightEvent.id)).scalar() or 0)
+    total_watch_seconds = round(total_watch_seconds, 2)
+
     like_count = _count(db, models.Like, models.Like.target_type == models.LikeTargetType.reel, models.Like.target_id == reel_id)
     comment_count = _count(db, models.Comment, models.Comment.reel_id == reel_id)
     share_count = _count(db, models.Share, models.Share.content_type == models.ShareContentType.reel, models.Share.content_id == reel_id)
     save_count = _count(db, models.SavedItem, models.SavedItem.target_type == models.SavedItemType.reel, models.SavedItem.target_id == reel_id)
     return {
         "reel_id": reel_id,
+        "period": period,
+        "period_start": start.isoformat() if start else None,
         "views": views,
         "reach": reach,
         "total_watch_time_seconds": total_watch_seconds,
-        "average_watch_time_seconds": round(total_watch_seconds / session_count, 2) if session_count else None,
+        "average_watch_time_seconds": round(total_watch_seconds / watch_event_count, 2) if watch_event_count else None,
+        "watch_time_events": watch_event_count,
         "followers_gained": None,
         "revenue": None,
         "engagement": {
@@ -135,7 +234,7 @@ def reel_insights_overview(
             "revenue": "unavailable_without_reel_earnings_ledger",
             "reposts": "unavailable_without_repost_tracking",
             "views": "available_from_insight_events",
-            "watch_time": "available_from_valid_watch_sessions",
+            "watch_time": "available_from_reel_insight_view_events",
         },
         "created_at": reel.created_at.isoformat() if reel.created_at else None,
     }
@@ -144,29 +243,78 @@ def reel_insights_overview(
 @router.get("/api/reels/{reel_id}/insights/timeline")
 def reel_insights_timeline(
     reel_id: int,
+    period: InsightsPeriod = Query("7d"),
     audience: Literal["all", "followers", "non_followers"] = Query("all"),
-    days: int = Query(7, ge=1, le=90),
+    # Keep the legacy days parameter working for existing clients. New clients
+    # should use period so all seven filters are available consistently.
+    days: int | None = Query(None, ge=1, le=90),
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    _owned_reel(db, reel_id, user)
-    start = datetime.now(timezone.utc) - timedelta(days=days - 1)
-    query = _events(db, reel_id, None if audience == "all" else audience).filter(
-        models.ReelInsightEvent.event_type == "view",
-        models.ReelInsightEvent.created_at >= start,
-    ).order_by(models.ReelInsightEvent.created_at.asc())
-    daily: dict[str, int] = {}
+    reel = _owned_reel(db, reel_id, user)
+    now = datetime.now(timezone.utc)
+
+    if days is not None and period == "7d":
+        start = now - timedelta(days=days)
+        granularity = "day"
+        selected_period = f"{days}d"
+    else:
+        start = _period_start(period, now)
+        granularity = _timeline_granularity(period)
+        selected_period = period
+
+    query = _period_events(db, reel_id, start)
+    if audience != "all":
+        query = query.filter(models.ReelInsightEvent.audience_type == audience)
+    query = query.filter(models.ReelInsightEvent.event_type == "view").order_by(
+        models.ReelInsightEvent.created_at.asc()
+    )
+
+    totals: dict[datetime, dict[str, float | int]] = {}
+    total_views = 0
+    total_watch_time_seconds = 0.0
     for event in query.all():
-        created = event.created_at
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        key = created.date().isoformat()
-        daily[key] = daily.get(key, 0) + 1
+        created = _as_utc(event.created_at)
+        if created is None:
+            continue
+        watched_seconds = float(event.watched_seconds or 0)
+        bucket = _timeline_bucket(created, granularity)
+        point = totals.setdefault(bucket, {"views": 0, "watch_time_seconds": 0.0})
+        point["views"] += 1
+        point["watch_time_seconds"] += watched_seconds
+        total_views += 1
+        total_watch_time_seconds += watched_seconds
+
+    first_bucket = _timeline_bucket(start, granularity) if start else None
+    current_bucket = _timeline_bucket(now, granularity)
+    if first_bucket is None:
+        first_bucket = min(totals) if totals else current_bucket
+
     points = []
-    for offset in range(days):
-        day = (start.date() + timedelta(days=offset)).isoformat()
-        points.append({"date": day, "views": daily.get(day, 0)})
-    return {"reel_id": reel_id, "audience": audience, "days": days, "data": points}
+    bucket = first_bucket
+    # A cap protects lifetime charts for very old Reels. The API still returns
+    # lifetime totals in the overview; timeline output is bounded to 600 buckets.
+    max_buckets = 600
+    if granularity == "month" and (current_bucket.year - bucket.year) * 12 + current_bucket.month - bucket.month > max_buckets:
+        bucket = _subtract_months(current_bucket, max_buckets - 1)
+    while bucket <= current_bucket and len(points) < max_buckets:
+        point = totals.get(bucket, {"views": 0, "watch_time_seconds": 0.0})
+        points.append({
+            "bucket": _timeline_label(bucket, granularity),
+            "views": int(point["views"]),
+            "watch_time_seconds": round(float(point["watch_time_seconds"]), 2),
+        })
+        bucket = _next_timeline_bucket(bucket, granularity)
+
+    return {
+        "reel_id": reel_id,
+        "period": selected_period,
+        "audience": audience,
+        "granularity": granularity,
+        "total_views": total_views,
+        "total_watch_time_seconds": round(total_watch_time_seconds, 2),
+        "data": points,
+    }
 
 
 @router.get("/api/reels/{reel_id}/insights/impact-rates")
@@ -190,7 +338,7 @@ def reel_insights_impact_rates(reel_id: int, db: Session = Depends(get_db), user
 def reel_insights_retention(reel_id: int, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     _owned_reel(db, reel_id, user)
     rows = _events(db, reel_id).filter(
-        models.ReelInsightEvent.event_type == "progress",
+        models.ReelInsightEvent.event_type.in_(("progress", "view")),
         models.ReelInsightEvent.progress_percent.isnot(None),
     ).all()
     if not rows:
