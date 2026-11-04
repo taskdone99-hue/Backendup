@@ -18,7 +18,10 @@ router = APIRouter(tags=["Reel Insights"])
 
 class ReelInsightEventIn(BaseModel):
     event_type: Literal["view", "progress", "skip"]
-    source: Literal["profile", "feed", "reels_tab", "explore", "stories"] | None = None
+    source: Literal[
+        "profile", "feed", "reels_tab", "explore", "stories",
+        "suggested_content", "search", "other",
+    ] | None = None
     watched_seconds: float | None = Field(default=None, ge=0, le=86400)
     progress_percent: float | None = Field(default=None, ge=0, le=100)
     # Generate a UUID per client event and retry with the same value on network errors.
@@ -240,6 +243,165 @@ def reel_insights_overview(
     }
 
 
+
+
+def _engagement_counts(db: Session, reel_id: int) -> dict:
+    """Counts current persisted interactions; reposts remain unavailable until tracked."""
+    likes = _count(
+        db, models.Like,
+        models.Like.target_type == models.LikeTargetType.reel,
+        models.Like.target_id == reel_id,
+    )
+    comments = _count(db, models.Comment, models.Comment.reel_id == reel_id)
+    shares = _count(
+        db, models.Share,
+        models.Share.content_type == models.ShareContentType.reel,
+        models.Share.content_id == reel_id,
+    )
+    saves = _count(
+        db, models.SavedItem,
+        models.SavedItem.target_type == models.SavedItemType.reel,
+        models.SavedItem.target_id == reel_id,
+    )
+    # There is no persisted Reel repost model/event in this project yet.
+    total = likes + comments + shares + saves
+    return {
+        "total_interactions": total,
+        "likes": likes,
+        "comments": comments,
+        "reposts": None,
+        "shares": shares,
+        "saves": saves,
+        "availability": {"reposts": "unavailable_without_repost_tracking"},
+    }
+
+
+def _reach_counts(db: Session, reel_id: int) -> dict:
+    view_events = _events(db, reel_id).filter(models.ReelInsightEvent.event_type == "view")
+    unique_reach = int(
+        view_events.with_entities(
+            func.count(func.distinct(models.ReelInsightEvent.viewer_id))
+        ).scalar() or 0
+    )
+    total_views = int(view_events.count())
+    return {
+        "total_reach": unique_reach,
+        "unique_accounts_reached": unique_reach,
+        "total_views": total_views,
+    }
+
+
+def _view_breakdown(db: Session, reel_id: int) -> dict:
+    events = _events(db, reel_id)
+    viewed = int(
+        events.filter(models.ReelInsightEvent.event_type == "view")
+        .with_entities(func.count(func.distinct(models.ReelInsightEvent.viewer_id)))
+        .scalar() or 0
+    )
+    skipped = int(
+        events.filter(models.ReelInsightEvent.event_type == "skip")
+        .with_entities(func.count(func.distinct(models.ReelInsightEvent.viewer_id)))
+        .scalar() or 0
+    )
+    # Only classify accounts when an explicit event was recorded. The two
+    # categories may overlap if clients emit both events; no inference is made.
+    classified = viewed + skipped
+    return {
+        "viewed": viewed,
+        "skipped": skipped,
+        "viewed_percentage": _percentage(viewed, classified),
+        "skipped_percentage": _percentage(skipped, classified),
+        "classified_accounts": classified,
+        "available": classified > 0,
+    }
+
+
+def _source_breakdown(db: Session, reel_id: int) -> dict:
+    rows = _events(db, reel_id).filter(
+        models.ReelInsightEvent.event_type == "view",
+        models.ReelInsightEvent.source.isnot(None),
+    ).order_by(models.ReelInsightEvent.created_at.asc(), models.ReelInsightEvent.id.asc()).all()
+    # Attribute each reached account to its first recorded discovery source so
+    # source percentages are mutually exclusive and cannot exceed 100% in total.
+    first_source_by_viewer: dict[int, str] = {}
+    for event in rows:
+        first_source_by_viewer.setdefault(event.viewer_id, event.source)
+    counts: dict[str, int] = {}
+    for source in first_source_by_viewer.values():
+        counts[source] = counts.get(source, 0) + 1
+    total = sum(counts.values())
+    labels = [
+        "suggested_content", "search", "feed", "profile",
+        "reels_tab", "explore", "stories", "other",
+    ]
+    return {
+        "available": total > 0,
+        "total_attributed_accounts": total,
+        "data": [
+            {
+                "source": label,
+                "unique_accounts": counts.get(label, 0),
+                "percentage": _percentage(counts.get(label, 0), total),
+            }
+            for label in labels
+        ] if total else [],
+    }
+
+
+@router.get("/api/reels/{reel_id}/insights/engagement")
+def reel_insights_engagement(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Combined Engagement screen payload for the Reel owner."""
+    _owned_reel(db, reel_id, user)
+    reach = _reach_counts(db, reel_id)
+    views = _view_breakdown(db, reel_id)
+    sources = _source_breakdown(db, reel_id)
+    interactions = _engagement_counts(db, reel_id)
+    engagement_rate = _percentage(interactions["total_interactions"], reach["unique_accounts_reached"])
+    return {
+        "reel_id": reel_id,
+        "reach": reach,
+        "viewing": views,
+        "reach_sources": sources,
+        "interactions": interactions,
+        "engagement_rate": engagement_rate,
+        "engagement_rate_basis": "total_interactions / unique_accounts_reached * 100",
+    }
+
+
+@router.get("/api/reels/{reel_id}/insights/reach")
+def reel_insights_reach(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    return {"reel_id": reel_id, **_reach_counts(db, reel_id)}
+
+
+@router.get("/api/reels/{reel_id}/insights/views")
+def reel_insights_views(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    return {"reel_id": reel_id, **_view_breakdown(db, reel_id)}
+
+
+@router.get("/api/reels/{reel_id}/insights/interactions")
+def reel_insights_interactions(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    _owned_reel(db, reel_id, user)
+    return {"reel_id": reel_id, **_engagement_counts(db, reel_id)}
+
+
 @router.get("/api/reels/{reel_id}/insights/timeline")
 def reel_insights_timeline(
     reel_id: int,
@@ -361,19 +523,25 @@ def reel_insights_retention(reel_id: int, db: Session = Depends(get_db), user: m
 @router.get("/api/reels/{reel_id}/insights/sources")
 def reel_insights_sources(reel_id: int, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     _owned_reel(db, reel_id, user)
-    rows = _events(db, reel_id).filter(
-        models.ReelInsightEvent.event_type == "view",
-        models.ReelInsightEvent.source.isnot(None),
-    ).all()
-    counts: dict[str, int] = {}
-    for row in rows:
-        counts[row.source] = counts.get(row.source, 0) + 1
-    total = sum(counts.values())
-    labels = ["profile", "feed", "reels_tab", "explore", "stories"]
-    return {"reel_id": reel_id, "available": bool(total), "total_attributed_views": total,
-            "data": [{"source": label, "views": counts.get(label, 0),
-                      "percentage": round(counts.get(label, 0) * 100 / total, 2) if total else None}
-                     for label in labels] if total else []}
+    breakdown = _source_breakdown(db, reel_id)
+    # Keep legacy `views` field for existing clients while adding unique reach.
+    data = []
+    for item in breakdown["data"]:
+        source = item["source"]
+        event_count = _count(
+            db, models.ReelInsightEvent,
+            models.ReelInsightEvent.reel_id == reel_id,
+            models.ReelInsightEvent.event_type == "view",
+            models.ReelInsightEvent.source == source,
+        )
+        data.append({**item, "views": event_count})
+    return {
+        "reel_id": reel_id,
+        "available": breakdown["available"],
+        "total_attributed_views": sum(item["views"] for item in data),
+        "total_attributed_accounts": breakdown["total_attributed_accounts"],
+        "data": data,
+    }
 
 
 def _unique_viewers(db: Session, reel_id: int):
