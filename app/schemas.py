@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 
 import phonenumbers
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -24,7 +24,6 @@ from app.models import (
     NotificationType,
     TagPermission,
     OTPChannel,
-    OTPPurpose,
     PaymentProvider,
     PaymentStatus,
     SavedItemType,
@@ -115,7 +114,7 @@ def _validate_dob(dob: date) -> date:
 
 class RequestOTPRequest(BaseModel):
     identifier: str = Field(description="Email address or E.164 phone number")
-    purpose: OTPPurpose = OTPPurpose.signup
+    purpose: Literal["signup", "login", "reset_password"] = "signup"
 
     @field_validator("identifier")
     @classmethod
@@ -127,7 +126,7 @@ class RequestOTPRequest(BaseModel):
 class VerifyOTPRequest(BaseModel):
     identifier: str
     otp: str = Field(min_length=4, max_length=8)
-    purpose: OTPPurpose = OTPPurpose.signup
+    purpose: Literal["signup", "login", "reset_password"] = "signup"
 
     @field_validator("identifier")
     @classmethod
@@ -3018,6 +3017,62 @@ class NotificationPreferencesUpdate(BaseModel):
 # ==========================================================================
 # Account / security
 # ==========================================================================
+
+class ChangeEmailRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=255)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        normalized, channel = normalize_identifier(value)
+        if channel != OTPChannel.email:
+            raise ValueError("Please provide a valid email address")
+        return normalized
+
+
+class VerifyChangeEmailRequest(ChangeEmailRequest):
+    otp: str = Field(..., min_length=4, max_length=8)
+
+
+class ChangePhoneRequest(BaseModel):
+    phone_number: str = Field(..., min_length=7, max_length=30)
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone_number(cls, value: str) -> str:
+        normalized, channel = normalize_identifier(value)
+        if channel != OTPChannel.phone:
+            raise ValueError("Please provide a valid phone number")
+        return normalized
+
+
+class VerifyChangePhoneRequest(ChangePhoneRequest):
+    otp: str = Field(..., min_length=4, max_length=8)
+
+
+class DeleteAccountOTPRequest(BaseModel):
+    channel: OTPChannel = Field(
+        description="Verified contact method to receive the account deletion OTP"
+    )
+
+
+class DeleteAccountConfirmRequest(BaseModel):
+    identifier: str = Field(..., description="The verified email or phone number receiving the deletion OTP")
+    otp: str = Field(..., min_length=4, max_length=8)
+    confirmation: Literal["DELETE"] = Field(
+        ..., description='Must be exactly "DELETE" to confirm account deletion'
+    )
+    current_password: str | None = Field(
+        default=None,
+        description="Required for accounts that have a password; OTP-only accounts may omit it",
+    )
+
+    @field_validator("identifier")
+    @classmethod
+    def validate_identifier(cls, value: str) -> str:
+        normalized, _ = normalize_identifier(value)
+        return normalized
+
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., min_length=1)

@@ -480,8 +480,13 @@ def reset_password(payload: schemas.ResetPasswordRequest, db: Session = Depends(
 
 @router.post("/request-otp", response_model=schemas.OTPResponse)
 def request_otp(payload: schemas.RequestOTPRequest, db: Session = Depends(get_db)):
+    if payload.purpose not in ("signup", "login", "reset_password"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This OTP purpose is available only through its authenticated account endpoint",
+        )
     identifier, channel = schemas.normalize_identifier(payload.identifier)
-    otp = _issue_otp(db, identifier, channel, payload.purpose)
+    otp = _issue_otp(db, identifier, channel, OTPPurpose(payload.purpose))
 
     return schemas.OTPResponse(
         message="OTP sent successfully",
@@ -502,9 +507,14 @@ def verify_otp(
     Real phone login/signup now goes through the MSG91 OTP Widget and
     POST /api/auth/verify-msg91-token instead — see that endpoint.
     """
+    if payload.purpose not in ("signup", "login"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This OTP purpose cannot be used for sign-in verification",
+        )
     identifier, channel = schemas.normalize_identifier(payload.identifier)
 
-    _consume_otp(db, identifier, payload.purpose, payload.otp)
+    _consume_otp(db, identifier, OTPPurpose(payload.purpose), payload.otp)
 
     return _finalize_verified_identifier(db, identifier, channel)
 
@@ -596,3 +606,194 @@ def change_password(
     db.commit()
 
     return schemas.MessageResponse(message="Password changed successfully")
+
+# ---- Change verified email / phone (authenticated + OTP to the new contact) ----
+
+def _ensure_contact_available(
+    db: Session, identifier: str, channel: OTPChannel, current_user: models.User
+) -> None:
+    existing = _get_user_by_identifier(db, identifier, channel)
+    if existing is not None and existing.id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This email address or phone number is already linked to another account",
+        )
+    current_value = current_user.email if channel == OTPChannel.email else current_user.phone_number
+    if current_value == identifier:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is already your current contact information",
+        )
+
+
+def _revoke_user_refresh_tokens(db: Session, user_id: int) -> None:
+    db.query(models.RefreshToken).filter(
+        models.RefreshToken.user_id == user_id,
+        models.RefreshToken.revoked == False,
+    ).update({"revoked": True}, synchronize_session=False)
+
+
+@router.post("/change-email/request", response_model=schemas.OTPResponse)
+def request_change_email(
+    payload: schemas.ChangeEmailRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _ensure_contact_available(db, payload.email, OTPChannel.email, current_user)
+    otp = _issue_otp(db, payload.email, OTPChannel.email, OTPPurpose.change_email)
+    return schemas.OTPResponse(
+        message="Verification code sent to the new email address",
+        identifier=payload.email,
+        expires_in_seconds=OTP_EXPIRE_MINUTES * 60,
+        debug_otp=otp if DEBUG_RETURN_OTP else None,
+    )
+
+
+@router.post("/change-email/verify", response_model=schemas.MessageResponse)
+def verify_change_email(
+    payload: schemas.VerifyChangeEmailRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _ensure_contact_available(db, payload.email, OTPChannel.email, current_user)
+    _consume_otp(db, payload.email, OTPPurpose.change_email, payload.otp)
+    current_user.email = payload.email
+    current_user.is_email_verified = True
+    try:
+        _revoke_user_refresh_tokens(db, current_user.id)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This email address is already linked to another account",
+        ) from exc
+    return schemas.MessageResponse(message="Email address updated and verified successfully")
+
+
+@router.post("/change-phone/request", response_model=schemas.OTPResponse)
+def request_change_phone(
+    payload: schemas.ChangePhoneRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _ensure_contact_available(db, payload.phone_number, OTPChannel.phone, current_user)
+    otp = _issue_otp(db, payload.phone_number, OTPChannel.phone, OTPPurpose.change_phone)
+    return schemas.OTPResponse(
+        message="Verification code sent to the new phone number",
+        identifier=payload.phone_number,
+        expires_in_seconds=OTP_EXPIRE_MINUTES * 60,
+        debug_otp=otp if DEBUG_RETURN_OTP else None,
+    )
+
+
+@router.post("/change-phone/verify", response_model=schemas.MessageResponse)
+def verify_change_phone(
+    payload: schemas.VerifyChangePhoneRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _ensure_contact_available(db, payload.phone_number, OTPChannel.phone, current_user)
+    _consume_otp(db, payload.phone_number, OTPPurpose.change_phone, payload.otp)
+    current_user.phone_number = payload.phone_number
+    current_user.is_phone_verified = True
+    try:
+        _revoke_user_refresh_tokens(db, current_user.id)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This phone number is already linked to another account",
+        ) from exc
+    return schemas.MessageResponse(message="Phone number updated and verified successfully")
+
+
+# ---- Delete account (OTP confirmation + current password when configured) ----
+
+@router.post("/delete-account/request", response_model=schemas.OTPResponse)
+def request_delete_account(
+    payload: schemas.DeleteAccountOTPRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if payload.channel == OTPChannel.email:
+        identifier = current_user.email
+        verified = current_user.is_email_verified
+    else:
+        identifier = current_user.phone_number
+        verified = current_user.is_phone_verified
+
+    if not identifier or not verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Choose a verified email address or phone number to receive the deletion code",
+        )
+
+    otp = _issue_otp(db, identifier, payload.channel, OTPPurpose.delete_account)
+    return schemas.OTPResponse(
+        message="Account deletion verification code sent",
+        identifier=identifier,
+        expires_in_seconds=OTP_EXPIRE_MINUTES * 60,
+        debug_otp=otp if DEBUG_RETURN_OTP else None,
+    )
+
+
+@router.post("/delete-account/confirm", response_model=schemas.MessageResponse)
+def confirm_delete_account(
+    payload: schemas.DeleteAccountConfirmRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    identifier, channel = schemas.normalize_identifier(payload.identifier)
+    expected_identifier = current_user.email if channel == OTPChannel.email else current_user.phone_number
+    is_verified = current_user.is_email_verified if channel == OTPChannel.email else current_user.is_phone_verified
+    if identifier != expected_identifier or not is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The deletion code must be sent to a verified contact on your account",
+        )
+
+    if current_user.hashed_password:
+        if not payload.current_password or not verify_password(
+            payload.current_password, current_user.hashed_password
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password is required and must be correct to delete this account",
+            )
+
+    _consume_otp(db, identifier, OTPPurpose.delete_account, payload.otp)
+
+    # This project has many historical/content foreign keys without ON DELETE
+    # CASCADE. Keep the user row as an anonymized tombstone to preserve referential
+    # integrity and accounting/chat history, but remove login/contact/profile PII.
+    current_user.is_active = False
+    current_user.username = f"deleted_{current_user.id}_{secrets.token_hex(4)}"
+    current_user.phone_number = None
+    current_user.email = None
+    current_user.hashed_password = None
+    current_user.date_of_birth = None
+    current_user.gender = None
+    current_user.full_name = None
+    current_user.bio = None
+    current_user.avatar_url = None
+    current_user.is_private = True
+    current_user.is_phone_verified = False
+    current_user.is_email_verified = False
+    current_user.business_name = None
+    current_user.business_category = None
+    current_user.business_description = None
+
+    _revoke_user_refresh_tokens(db, current_user.id)
+    db.query(models.DeviceToken).filter(
+        models.DeviceToken.user_id == current_user.id
+    ).delete(synchronize_session=False)
+    db.commit()
+
+    return schemas.MessageResponse(
+        message=(
+            "Account deactivated and personal profile details removed. "
+            "Previously shared content, messages, and legally required transaction records may be retained."
+        )
+    )

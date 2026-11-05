@@ -31,6 +31,9 @@ class OTPPurpose(str, enum.Enum):
     signup = "signup"
     login = "login"
     reset_password = "reset_password"
+    change_phone = "change_phone"
+    change_email = "change_email"
+    delete_account = "delete_account"
 
 
 class Gender(str, enum.Enum):
