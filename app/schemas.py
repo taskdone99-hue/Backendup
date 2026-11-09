@@ -3238,3 +3238,49 @@ class PrivacySettingsOut(BaseModel):
     showFollowerList: bool
     showOnlineStatus: bool
     accountSuggestions: bool
+
+
+CONTENT_CATEGORY_IDS = (
+    "artist", "blogger", "digital_creator", "education", "entertainment",
+    "fashion", "food_lifestyle", "gaming", "health_fitness", "music",
+    "photography", "technology", "travel", "business", "other",
+)
+
+
+class ContentCategorySave(BaseModel):
+    """Create/replace the authenticated user's content category."""
+    model_config = {"extra": "forbid"}
+
+    category: Literal[
+        "artist", "blogger", "digital_creator", "education", "entertainment",
+        "fashion", "food_lifestyle", "gaming", "health_fitness", "music",
+        "photography", "technology", "travel", "business", "other",
+    ]
+    customCategory: str | None = None
+
+    @model_validator(mode="after")
+    def validate_custom_category(self):
+        if self.category == "other":
+            if self.customCategory is None:
+                raise ValueError("customCategory is required when category is other")
+            normalized = self.customCategory.strip()
+            if not normalized:
+                raise ValueError("customCategory cannot be empty")
+            if len(normalized) > 60:
+                raise ValueError("customCategory must be 60 characters or fewer")
+            self.customCategory = normalized
+        elif self.customCategory is not None:
+            raise ValueError("customCategory must be null unless category is other")
+        return self
+
+
+class ContentCategoryOut(BaseModel):
+    category: str
+    customCategory: str | None = None
+    updatedAt: datetime | None = None
+
+
+class ContentCategoryOption(BaseModel):
+    id: str
+    label: str
+    allowsCustom: bool = False

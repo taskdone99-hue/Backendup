@@ -37,6 +37,7 @@ from app.routers import (
     hashtag_routes,
     privacy_routes,
     account_privacy_routes,
+    content_category_routes,
     audio_routes,
     live_routes,
     report_routes,
@@ -155,6 +156,7 @@ app.include_router(creator_collaboration_routes.router)
 app.include_router(brand_collaboration_routes.router)
 app.include_router(privacy_routes.router)
 app.include_router(account_privacy_routes.router)
+app.include_router(content_category_routes.router)
 app.include_router(search_routes.router)
 app.include_router(hashtag_routes.router)
 app.include_router(audio_routes.router)

@@ -325,6 +325,32 @@ class PrivacySettingsAudit(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class UserContentCategory(Base):
+    """The authenticated user's single selected content category."""
+    __tablename__ = "user_content_categories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    category = Column(String(40), nullable=False)
+    custom_category = Column(String(60), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ContentCategoryAudit(Base):
+    """Server-side audit history for content-category changes."""
+    __tablename__ = "content_category_audit"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    old_category = Column(String(40), nullable=True)
+    new_category = Column(String(40), nullable=False)
+    old_custom_category = Column(String(60), nullable=True)
+    new_custom_category = Column(String(60), nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class UserSocialLink(Base):
     """A user's public social/profile links, managed by /api/users/{id}/social-links."""
     __tablename__ = "user_social_links"
