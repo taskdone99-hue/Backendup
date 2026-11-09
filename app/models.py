@@ -324,6 +324,68 @@ class PrivacySettingsAudit(Base):
     user_agent = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+class UserMessageSettings(Base):
+    """Per-user messaging permissions and preferences."""
+    __tablename__ = "user_message_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    allow_messages_from = Column(
+        String(20), nullable=False, default="everyone",
+        server_default="everyone"
+    )
+    read_receipts = Column(
+        Boolean, nullable=False, default=True,
+        server_default=expression.true()
+    )
+    activity_status = Column(
+        Boolean, nullable=False, default=False,
+        server_default=expression.false()
+    )
+    filter_message_requests = Column(
+        Boolean, nullable=False, default=True,
+        server_default=expression.true()
+    )
+    group_add_permission = Column(
+        String(20), nullable=False, default="following",
+        server_default="following"
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now()
+    )
+
+
+class MessageSettingsAudit(Base):
+    """Audit trail for messaging preference changes."""
+    __tablename__ = "message_settings_audit"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    changed_fields = Column(JSON, nullable=False)
+    old_values = Column(JSON, nullable=False)
+    new_values = Column(JSON, nullable=False)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(500), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+
+
 
 class UserContentCategory(Base):
     """The authenticated user's single selected content category."""

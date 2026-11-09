@@ -3239,6 +3239,31 @@ class PrivacySettingsOut(BaseModel):
     showOnlineStatus: bool
     accountSuggestions: bool
 
+class MessageSettingsPatch(BaseModel):
+    """Partial update for the authenticated user's messaging settings."""
+    model_config = {"extra": "forbid"}
+
+    allowMessagesFrom: Literal["everyone", "following", "no_one"] | None = None
+    readReceipts: bool | None = None
+    activityStatus: bool | None = None
+    filterMessageRequests: bool | None = None
+    groupAddPermission: Literal["everyone", "following", "no_one"] | None = None
+
+    @model_validator(mode="after")
+    def require_at_least_one_setting(self):
+        if not self.model_fields_set:
+            raise ValueError("Provide at least one message setting to update")
+        return self
+
+
+class MessageSettingsOut(BaseModel):
+    allowMessagesFrom: Literal["everyone", "following", "no_one"]
+    readReceipts: bool
+    activityStatus: bool
+    filterMessageRequests: bool
+    groupAddPermission: Literal["everyone", "following", "no_one"]
+
+
 
 CONTENT_CATEGORY_IDS = (
     "artist", "blogger", "digital_creator", "education", "entertainment",
