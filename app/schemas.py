@@ -3213,3 +3213,28 @@ class CommentDMAutomationOut(CommentDMAutomationUpdate):
     updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class PrivacySettingsPatch(BaseModel):
+    """Partial update for the authenticated account's privacy settings."""
+    model_config = {"extra": "forbid"}
+
+    visibility: Literal["public", "private"] | None = None
+    showActivityStatus: bool | None = None
+    showFollowerList: bool | None = None
+    showOnlineStatus: bool | None = None
+    accountSuggestions: bool | None = None
+
+    @model_validator(mode="after")
+    def require_at_least_one_setting(self):
+        if not self.model_fields_set:
+            raise ValueError("Provide at least one privacy setting to update")
+        return self
+
+
+class PrivacySettingsOut(BaseModel):
+    visibility: Literal["public", "private"]
+    showActivityStatus: bool
+    showFollowerList: bool
+    showOnlineStatus: bool
+    accountSuggestions: bool

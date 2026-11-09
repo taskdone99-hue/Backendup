@@ -295,6 +295,36 @@ class Follow(Base):
     following = relationship("User", foreign_keys=[following_id])
 
 
+class UserPrivacySettings(Base):
+    """Per-account activity/discovery preferences. Visibility remains canonical
+    on users.is_private so existing profile/feed authorization keeps applying.
+    A missing row uses the documented defaults and is created on first PATCH.
+    """
+    __tablename__ = "user_privacy_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    show_activity_status = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    show_follower_list = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    show_online_status = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    account_suggestions = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class PrivacySettingsAudit(Base):
+    """Server-side audit trail for account privacy preference changes."""
+    __tablename__ = "privacy_settings_audit"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    changed_fields = Column(JSON, nullable=False)
+    old_values = Column(JSON, nullable=False)
+    new_values = Column(JSON, nullable=False)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class UserSocialLink(Base):
     """A user's public social/profile links, managed by /api/users/{id}/social-links."""
     __tablename__ = "user_social_links"
