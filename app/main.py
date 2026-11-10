@@ -49,6 +49,7 @@ from app.routers import (
     profile_actions_routes,
     call_feature_routes,
     reel_insights_routes,
+    kpp_analytics_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -149,3 +150,5 @@ app.include_router(public_share_routes.router)
 @app.get("/")
 def health_check():
     return {"status": "ok"}
+
+app.include_router(kpp_analytics_routes.router)

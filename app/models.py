@@ -2495,3 +2495,18 @@ class ReelInsightEvent(Base):
     progress_percent = Column(Float, nullable=True)
     client_event_id = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class KPPApplication(Base):
+    """A creator's single KPP application and its eligibility snapshot."""
+    __tablename__ = "kpp_applications"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_kpp_application_user"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default="submitted", server_default="submitted", index=True)
+    eligibility_snapshot = Column(JSON, nullable=False)
+    submitted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", foreign_keys=[user_id])
