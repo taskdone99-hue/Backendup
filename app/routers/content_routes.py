@@ -65,15 +65,21 @@ def _to_post_detail(
         detail.media = [
             schemas.MediaItemOut.model_validate(m) for m in post.media_items
         ]
+        # Backwards-friendly top-level thumbnail: first video item's thumbnail.
+        detail.thumbnail_url = next(
+            (item.thumbnail_url for item in detail.media if item.media_type == models.MediaType.video and item.thumbnail_url),
+            None,
+        )
     else:
         # Legacy post created before the post_media table existed — synthesize
         # a single-item list from the flat columns so `media` is never empty.
         detail.media = [
             schemas.MediaItemOut(
                 id=post.id, media_url=post.media_url, media_type=post.media_type, position=0,
-                caption=post.caption,
+                caption=post.caption, thumbnail_url=None,
             )
         ]
+        detail.thumbnail_url = None
     detail.media_count = len(detail.media)
     detail.like_id = engagement.get_like_id(
         db, viewer_id, models.LikeTargetType.post, post.id
@@ -464,12 +470,15 @@ async def create_post(
     db.flush()
 
     for position, (url, kind) in enumerate(saved):
+        media_kind = models.MediaType.video if kind == "video" else models.MediaType.image
+        thumbnail_url = generate_video_thumbnail(url) if media_kind == models.MediaType.video else None
         db.add(models.PostMedia(
             post_id=post.id,
             media_url=url,
-            media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
+            media_type=media_kind,
             position=position,
             caption=media_captions[position] if media_captions and position < len(media_captions) else None,
+            thumbnail_url=thumbnail_url,
         ))
 
     sync_post_hashtags(db, post, caption)
@@ -763,12 +772,15 @@ def update_post_media(
         db.delete(m)
     db.flush()
     for position, (url, kind) in enumerate(saved):
+        media_kind = models.MediaType.video if kind == "video" else models.MediaType.image
+        thumbnail_url = generate_video_thumbnail(url) if media_kind == models.MediaType.video else None
         db.add(models.PostMedia(
             post_id=post.id,
             media_url=url,
-            media_type=models.MediaType.video if kind == "video" else models.MediaType.image,
+            media_type=media_kind,
             position=position,
             caption=media_captions[position] if media_captions and position < len(media_captions) else None,
+            thumbnail_url=thumbnail_url,
         ))
 
     db.commit()

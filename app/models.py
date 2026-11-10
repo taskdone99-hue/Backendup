@@ -634,6 +634,7 @@ class PostMedia(Base):
     media_type = Column(Enum(MediaType), default=MediaType.image, nullable=False)
     position = Column(Integer, default=0, nullable=False)
     caption = Column(Text, nullable=True)
+    thumbnail_url = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     post = relationship("Post", back_populates="media_items")

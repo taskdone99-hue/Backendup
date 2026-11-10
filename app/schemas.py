@@ -319,6 +319,32 @@ class MessageResponse(BaseModel):
 
 # ---- User profile ----
 
+class PersonalDetailsPatch(BaseModel):
+    date_of_birth: date | None = None
+    gender: Gender | None = None
+
+    @field_validator("date_of_birth")
+    @classmethod
+    def dob_not_in_future(cls, value: date | None) -> date | None:
+        if value is not None and value > date.today():
+            raise ValueError("date_of_birth cannot be in the future")
+        return value
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self):
+        if not self.model_fields_set:
+            raise ValueError("Provide date_of_birth and/or gender")
+        return self
+
+
+class PersonalDetailsOut(BaseModel):
+    date_of_birth: date | None
+    gender: Gender | None
+
+    class Config:
+        from_attributes = True
+
+
 class UserProfileOut(BaseModel):
     """Public-facing profile — what GET /api/users/:id and follower/following lists return."""
     id: int
@@ -448,6 +474,7 @@ class PostOut(BaseModel):
     caption: str | None
     media_url: str
     media_type: MediaType
+    thumbnail_url: str | None = None
     created_at: datetime
 
     class Config:
@@ -841,6 +868,7 @@ class MediaItemOut(BaseModel):
     media_type: MediaType
     position: int = 0
     caption: str | None = None
+    thumbnail_url: str | None = None
 
     class Config:
         from_attributes = True
