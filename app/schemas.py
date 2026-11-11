@@ -863,6 +863,25 @@ class PostUpdate(BaseModel):
         return v.strip() if v is not None else v
 
 
+class ReelUpdate(BaseModel):
+    """PUT /api/reels/{reel_id}: update editable Reel Info fields.
+
+    Omitted fields remain unchanged; nullable fields sent as null are cleared.
+    The uploaded video itself is not replaced by this endpoint.
+    """
+    caption: str | None = Field(default=None, max_length=2200)
+    audio_id: int | None = Field(default=None, ge=1)
+    tag_user_ids: list[int] | None = None
+    location: LocationIn | None = None
+    ai_generated: bool | None = None
+    editor_state: dict[str, Any] | None = None
+
+    @field_validator("caption")
+    @classmethod
+    def strip_reel_caption(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else v
+
+
 class MusicOut(BaseModel):
     title: str
     artist: str | None

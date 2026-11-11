@@ -1226,6 +1226,83 @@ def get_reel(
     return _to_reel_detail(db, reel, viewer_id)
 
 
+@reels_router.put("/{reel_id}", response_model=schemas.ReelDetailOut)
+async def update_reel(
+    reel_id: int,
+    payload: schemas.ReelUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Update the editable fields shown on the Reel Edit Info screen.
+
+    Only the owner can edit. Omitted fields are preserved; nullable fields
+    such as audio_id and location can be sent as null to clear them.
+    Video/thumbnail file replacement remains handled by dedicated endpoints.
+    """
+    reel = _get_reel_or_404(db, reel_id)
+    if reel.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only update your own reels",
+        )
+
+    updates = payload.model_dump(exclude_unset=True)
+
+    if "audio_id" in updates:
+        audio_id = updates["audio_id"]
+        if audio_id is not None:
+            audio = db.query(models.Audio).filter(models.Audio.id == audio_id).first()
+            if audio is None:
+                raise HTTPException(status_code=404, detail="Audio not found")
+        reel.audio_id = audio_id
+
+    if "caption" in updates:
+        reel.caption = updates["caption"]
+
+    if "ai_generated" in updates and updates["ai_generated"] is not None:
+        reel.ai_generated = updates["ai_generated"]
+
+    if "editor_state" in updates:
+        reel.editor_state = editor_state_service.check_object(updates["editor_state"])
+
+    if "location" in updates:
+        location = updates["location"]
+        if location is None:
+            reel.location_name = None
+            reel.location_latitude = None
+            reel.location_longitude = None
+            reel.location_id = None
+        else:
+            loc_row = find_or_create_location(
+                db,
+                name=location["name"],
+                latitude=location.get("latitude"),
+                longitude=location.get("longitude"),
+            )
+            reel.location_name = loc_row.name
+            reel.location_latitude = loc_row.latitude
+            reel.location_longitude = loc_row.longitude
+            reel.location_id = loc_row.id
+
+    new_tags = []
+    if updates.get("tag_user_ids") is not None:
+        ids = list(dict.fromkeys(updates["tag_user_ids"]))
+        existing = {
+            tag.user_id: tag
+            for tag in db.query(models.ReelTag).filter(models.ReelTag.reel_id == reel.id).all()
+        }
+        new_tags = tag_service.add_tags(
+            db, "reel", reel, current_user, [(uid, None, None) for uid in ids]
+        )
+        for uid in set(existing) - set(ids):
+            db.delete(existing[uid])
+
+    db.commit()
+    await tag_service.notify_new_tags(db, "reel", reel.id, current_user, new_tags)
+    db.refresh(reel)
+    return _to_reel_detail(db, reel, current_user.id)
+
+
 @reels_router.delete("/{reel_id}", response_model=schemas.MessageResponse)
 def delete_reel(
     reel_id: int,
