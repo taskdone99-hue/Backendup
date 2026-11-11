@@ -325,10 +325,8 @@ class PersonalDetailsPatch(BaseModel):
 
     @field_validator("date_of_birth")
     @classmethod
-    def dob_not_in_future(cls, value: date | None) -> date | None:
-        if value is not None and value > date.today():
-            raise ValueError("date_of_birth cannot be in the future")
-        return value
+    def validate_date_of_birth(cls, value: date | None) -> date | None:
+        return _validate_dob(value) if value is not None else value
 
     @model_validator(mode="after")
     def require_at_least_one_field(self):
@@ -343,6 +341,12 @@ class PersonalDetailsOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class PersonalDetailsUpdateOut(BaseModel):
+    message: str
+    date_of_birth: date | None
+    gender: Gender | None
 
 
 class UserProfileOut(BaseModel):

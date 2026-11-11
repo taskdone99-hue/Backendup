@@ -216,6 +216,42 @@ def get_my_profile_views(
     )
 
 
+@router.get(
+    "/v1/me/personal-details",
+    response_model=schemas.PersonalDetailsOut,
+)
+def get_my_personal_details(
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return DOB and gender for the authenticated user only."""
+    return current_user
+
+
+@router.patch(
+    "/v1/me/personal-details",
+    response_model=schemas.PersonalDetailsUpdateOut,
+)
+def update_my_personal_details(
+    payload: schemas.PersonalDetailsPatch,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Update DOB and/or gender for the authenticated user only."""
+    updates = payload.model_dump(exclude_unset=True)
+
+    for field, value in updates.items():
+        setattr(current_user, field, value)
+
+    db.commit()
+    db.refresh(current_user)
+
+    return {
+        "message": "Personal details updated successfully",
+        "date_of_birth": current_user.date_of_birth,
+        "gender": current_user.gender,
+    }
+
+
 @router.put("/api/users/{user_id}", response_model=schemas.UserProfileOut)
 def update_user_profile(
     user_id: int,
