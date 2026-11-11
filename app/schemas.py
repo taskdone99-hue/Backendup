@@ -384,10 +384,15 @@ class UserProfileUpdate(BaseModel):
     bio: str | None = Field(default=None, max_length=150)
     gender: Gender | None = None
     is_private: bool | None = None
+    date_of_birth: date | None = None
     account_type: AccountType | None = None
     business_name: str | None = Field(default=None, max_length=100)
     business_category: str | None = Field(default=None, max_length=100)
     business_description: str | None = Field(default=None, max_length=500)
+    @field_validator("date_of_birth")
+    @classmethod
+    def validate_date_of_birth(cls, v: date | None) -> date | None:
+        return _validate_dob(v) if v is not None else v
 
     @field_validator("username")
     @classmethod
