@@ -14,6 +14,7 @@ from app.routers import (
     user_routes,
     story_routes,
     content_routes,
+    content_search_routes,
     watch_routes,
     comment_routes,
     video_routes,
@@ -112,6 +113,7 @@ app.include_router(call_feature_routes.router)
 app.include_router(reel_insights_routes.router)
 app.include_router(story_routes.router)
 app.include_router(content_routes.router)
+app.include_router(content_search_routes.router)
 app.include_router(content_routes.reels_router)
 app.include_router(watch_routes.router)
 app.include_router(comment_routes.router)
