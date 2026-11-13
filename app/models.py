@@ -204,6 +204,8 @@ class User(Base):
     # being on is enough to hide.
     hide_like_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
     hide_comments = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    hide_share_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
+    hide_saved_count = Column(Boolean, default=False, nullable=False, server_default=expression.false())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     refresh_tokens = relationship(
@@ -2470,6 +2472,47 @@ class UserThemePreference(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
     theme = Column(String(20), nullable=False, default="system", server_default="system")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+
+class UserCommentSettings(Base):
+    __tablename__ = "user_comment_settings"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
+    allow_comments_from = Column(String(20), nullable=False, default="everyone", server_default="everyone")
+    filter_offensive_comments = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    manual_filter_enabled = Column(Boolean, nullable=False, default=False, server_default=expression.false())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class UserMentionSettings(Base):
+    __tablename__ = "user_mention_settings"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
+    allow_mentions_from = Column(String(20), nullable=False, default="everyone", server_default="everyone")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class UserHiddenWord(Base):
+    __tablename__ = "user_hidden_words"
+    __table_args__ = (UniqueConstraint("user_id", "word", name="uq_user_hidden_word"),)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    word = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class UserScreenTimeSession(Base):
+    __tablename__ = "user_screen_time_sessions"
+    __table_args__ = (UniqueConstraint("user_id", "client_session_id", name="uq_user_screen_session"),)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    client_session_id = Column(String(100), nullable=False)
+    duration_seconds = Column(Integer, nullable=False)
+    session_date = Column(Date, nullable=False, index=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 
 class ReelInsightEvent(Base):
     __tablename__ = "reel_insight_events"

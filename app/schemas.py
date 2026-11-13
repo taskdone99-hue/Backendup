@@ -1211,16 +1211,20 @@ class UserEngagementSettingsOut(BaseModel):
     hide_comments: bool = Field(
         False, description="Hide the comment thread on all my posts and reels from other users"
     )
+    hide_share_count: bool = False
+    hide_saved_count: bool = False
 
 
 class UserEngagementSettingsUpdate(BaseModel):
     """PUT /api/users/me/engagement-settings — send either or both."""
     hide_like_count: bool | None = None
     hide_comments: bool | None = None
+    hide_share_count: bool | None = None
+    hide_saved_count: bool | None = None
 
     @model_validator(mode="after")
     def validate_fields(self):
-        sent = self.model_fields_set & {"hide_like_count", "hide_comments"}
+        sent = self.model_fields_set & {"hide_like_count", "hide_comments", "hide_share_count", "hide_saved_count"}
         if not sent:
             raise ValueError("Send hide_like_count and/or hide_comments")
         for name in sent:

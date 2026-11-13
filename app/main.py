@@ -12,6 +12,7 @@ from app.database import Base, engine
 from app.routers import (
     auth_routes,
     user_routes,
+    settings_routes,
     story_routes,
     content_routes,
     content_search_routes,
@@ -107,6 +108,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 app.include_router(auth_routes.router)
 app.include_router(user_routes.router)
+app.include_router(settings_routes.router)
 app.include_router(translation_routes.router)
 app.include_router(profile_actions_routes.router)
 app.include_router(call_feature_routes.router)

@@ -109,7 +109,8 @@ def get_my_engagement_settings(current_user: models.User = Depends(get_current_u
     if either is on, it's hidden. Both default to `false`.
     """
     return schemas.UserEngagementSettingsOut(
-        hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments
+        hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments,
+        hide_share_count=current_user.hide_share_count, hide_saved_count=current_user.hide_saved_count
     )
 
 
@@ -139,13 +140,14 @@ def update_my_engagement_settings(
     You, the owner, always see everything.
     """
     updates = payload.model_dump(exclude_unset=True)
-    for field in ("hide_like_count", "hide_comments"):
+    for field in ("hide_like_count", "hide_comments", "hide_share_count", "hide_saved_count"):
         if field in updates:
             setattr(current_user, field, updates[field])
     db.commit()
     db.refresh(current_user)
     return schemas.UserEngagementSettingsOut(
-        hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments
+        hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments,
+        hide_share_count=current_user.hide_share_count, hide_saved_count=current_user.hide_saved_count
     )
 
 
