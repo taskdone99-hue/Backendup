@@ -11,6 +11,7 @@ callers only care about getting a URL back, so nothing else needs to change.
 
 import logging
 import os
+import json
 import subprocess
 import time
 import uuid
@@ -46,6 +47,7 @@ def save_upload_file(
     *,
     allow_video: bool = False,
     allow_audio: bool = False,
+    max_video_bytes: int = MAX_VIDEO_BYTES,
 ) -> tuple[str, str]:
     """
     Validates and saves an uploaded file. Returns (public_url, kind) where
@@ -60,7 +62,7 @@ def save_upload_file(
         max_bytes = MAX_IMAGE_BYTES
     elif allow_video and content_type in ALLOWED_VIDEO_TYPES:
         kind = "video"
-        max_bytes = MAX_VIDEO_BYTES
+        max_bytes = max_video_bytes
     elif allow_audio and content_type in ALLOWED_AUDIO_TYPES:
         kind = "audio"
         max_bytes = MAX_AUDIO_BYTES
@@ -252,3 +254,33 @@ def delete_media_file(public_url: str) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def get_video_metadata(video_public_url: str) -> dict | None:
+    """Read duration and first video-stream dimensions with ffprobe."""
+    video_path = _local_path_from_url(video_public_url)
+    if video_path is None or not video_path.exists():
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=codec_type,width,height",
+        "-of", "json", str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Video metadata extraction failed for %s: %s", video_path.name, exc)
+        return None
+    if result.returncode != 0:
+        logger.warning("ffprobe metadata failed for %s: %s", video_path.name, result.stderr[-500:])
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+        stream = next((s for s in payload.get("streams", []) if s.get("codec_type") == "video"), {})
+        duration = float(payload.get("format", {}).get("duration"))
+        width, height = int(stream.get("width")), int(stream.get("height"))
+        if duration <= 0 or width <= 0 or height <= 0:
+            return None
+        return {"duration_seconds": duration, "width": width, "height": height}
+    except (ValueError, TypeError, StopIteration):
+        return None

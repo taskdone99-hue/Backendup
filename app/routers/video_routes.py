@@ -45,7 +45,7 @@ from app.services.media_service import generate_video_thumbnail, save_upload_fil
 from app.services.location_service import find_or_create_location
 from app.services import editor_state_service, video_settings_service as vss
 
-router = APIRouter(prefix="/api/videos", tags=["videos"])
+router = APIRouter(prefix="/api/reel-tools", tags=["legacy reel upload settings"])
 
 
 def _get_owned_video_or_404(

@@ -396,6 +396,10 @@ async def create_post(
             db, current_user, "post", SimpleNamespace(user=current_user), tag_ids
         )
 
+    source = source.strip().lower()
+    if source not in {"gallery", "camera"}:
+        raise HTTPException(status_code=400, detail="source must be gallery or camera")
+
     if location_latitude is not None and not (-90 <= location_latitude <= 90):
         raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
     if location_longitude is not None and not (-180 <= location_longitude <= 180):
@@ -898,6 +902,7 @@ async def create_reel(
     file: UploadFile,
     caption: str | None = Form(default=None),
     thumbnail: UploadFile | None = File(default=None),
+    source: str = Form(default="gallery", description="gallery or camera; camera means recorded in-app"),
     location_name: str | None = Form(default=None),
     location_latitude: OptionalFloatForm(
         description="Optional. Leave unset (or blank) for no coordinates."
@@ -1057,6 +1062,7 @@ async def create_reel(
         video_url=url,
         thumbnail_url=thumbnail_url,
         duration_seconds=duration_seconds,
+        source=source,
         location_name=location.name if location else location_name,
         location_latitude=location.latitude if location else location_latitude,
         location_longitude=location.longitude if location else location_longitude,
@@ -1258,6 +1264,8 @@ async def update_reel(
 
     if "caption" in updates:
         reel.caption = updates["caption"]
+    if "source" in updates and updates["source"] is not None:
+        reel.source = updates["source"]
 
     if "ai_generated" in updates and updates["ai_generated"] is not None:
         reel.ai_generated = updates["ai_generated"]

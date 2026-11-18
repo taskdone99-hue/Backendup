@@ -760,6 +760,8 @@ class Reel(Base):
     video_url = Column(String(500), nullable=False)
     thumbnail_url = Column(String(500), nullable=True)
     duration_seconds = Column(Float, nullable=True)
+    # How the creator supplied this reel: gallery selection or in-app camera recording.
+    source = Column(String(20), nullable=False, default="gallery", server_default="gallery")
     # Deliberately NOT a ForeignKey: a real FK with the default RESTRICT
     # behavior would block deleting an original reel once anything remixes
     # its audio. This is an informal reference to reels.id instead — a
@@ -2591,3 +2593,30 @@ class StickerUsage(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     sticker_id = Column(Integer, ForeignKey("stickers.id", ondelete="CASCADE"), nullable=False, index=True)
     used_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class Video(Base):
+    """Independent long-form video entity; deliberately separate from Reel."""
+    __tablename__ = "videos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(150), nullable=False)
+    description = Column(Text, nullable=True)
+    video_url = Column(String(500), nullable=False)
+    thumbnail_url = Column(String(500), nullable=True)
+    mime_type = Column(String(100), nullable=False)
+    file_size = Column(Integer, nullable=False, default=0)
+    duration_seconds = Column(Float, nullable=False)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    aspect_ratio = Column(String(20), nullable=True)
+    orientation = Column(String(20), nullable=False, default="horizontal", server_default="horizontal")
+    visibility = Column(String(20), nullable=False, default="public", server_default="public", index=True)
+    allow_comments = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    allow_sharing = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    location = Column(String(150), nullable=True)
+    category = Column(String(80), nullable=True)
+    tags = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

@@ -498,6 +498,7 @@ class ReelOut(BaseModel):
     thumbnail_url: str | None
     created_at: datetime
     editor_state: dict | None = None
+    source: str = "gallery"
 
     class Config:
         from_attributes = True
@@ -870,6 +871,7 @@ class ReelUpdate(BaseModel):
     The uploaded video itself is not replaced by this endpoint.
     """
     caption: str | None = Field(default=None, max_length=2200)
+    source: str | None = Field(default=None, pattern="^(gallery|camera)$")
     audio_id: int | None = Field(default=None, ge=1)
     tag_user_ids: list[int] | None = None
     location: LocationIn | None = None
