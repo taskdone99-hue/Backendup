@@ -673,6 +673,19 @@ async def update_post(
                 target_id=post.id,
             )
 
+    if "media" in updates and updates["media"] is not None:
+        # Apply captions only to matching media rows; omitted items stay unchanged.
+        media_by_id = {item.id: item for item in post.media_items}
+        for media_update in updates["media"]:
+            media_item = media_by_id.get(media_update["id"])
+            if media_item is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Media item {media_update['id']} was not found on this post",
+                )
+            if "caption" in media_update:
+                media_item.caption = media_update["caption"]
+
     if "alt_text" in updates:
         post.alt_text = updates["alt_text"]
 

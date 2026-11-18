@@ -832,6 +832,12 @@ class MusicIn(BaseModel):
     start_seconds: int = Field(default=0, ge=0)
 
 
+class PostMediaCaptionUpdate(BaseModel):
+    """Update the caption for one existing media item in a post carousel."""
+    id: int = Field(..., ge=1, description="Existing PostMedia ID returned in the post's media array.")
+    caption: str | None = Field(default=None, max_length=2200)
+
+
 class PostUpdate(BaseModel):
     """
     PUT /api/posts/:id. Every field is optional and only touched if present
@@ -843,6 +849,9 @@ class PostUpdate(BaseModel):
     than JSON.
     """
     caption: str | None = Field(default=None, max_length=2200)
+    # Update captions independently for existing carousel media items.
+    # Omit media to leave every per-photo caption unchanged.
+    media: list[PostMediaCaptionUpdate] | None = None
     music: MusicIn | None = None
     location: LocationIn | None = None
     alt_text: str | None = Field(default=None, max_length=1000)
