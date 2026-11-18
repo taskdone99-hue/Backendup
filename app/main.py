@@ -52,6 +52,7 @@ from app.routers import (
     call_feature_routes,
     reel_insights_routes,
     kpp_analytics_routes,
+    sticker_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -120,6 +121,7 @@ app.include_router(content_routes.reels_router)
 app.include_router(watch_routes.router)
 app.include_router(comment_routes.router)
 app.include_router(video_routes.router)
+app.include_router(sticker_routes.router)
 app.include_router(highlight_routes.router)
 app.include_router(saved_routes.router)
 app.include_router(share_routes.router)

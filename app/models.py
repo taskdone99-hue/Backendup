@@ -2553,3 +2553,41 @@ class KPPApplication(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     user = relationship("User", foreign_keys=[user_id])
+
+# ======================================================================
+# User stickers (private by default; public stickers require moderation)
+# ======================================================================
+class Sticker(Base):
+    __tablename__ = "stickers"
+    __table_args__ = (
+        Index("ix_stickers_visibility_approval", "visibility", "approval_status"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    name = Column(String(100), nullable=False)
+    sticker_url = Column(String(500), nullable=False)
+    thumbnail_url = Column(String(500), nullable=True)
+    mime_type = Column(String(100), nullable=False)
+    visibility = Column(String(20), nullable=False, default="private", server_default="private")
+    approval_status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class StickerFavorite(Base):
+    __tablename__ = "sticker_favorites"
+    __table_args__ = (UniqueConstraint("user_id", "sticker_id", name="uq_sticker_favorite"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    sticker_id = Column(Integer, ForeignKey("stickers.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class StickerUsage(Base):
+    __tablename__ = "sticker_usage"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    sticker_id = Column(Integer, ForeignKey("stickers.id", ondelete="CASCADE"), nullable=False, index=True)
+    used_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
