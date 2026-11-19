@@ -35,7 +35,7 @@ in production — nothing in the routes below needs to change either way).
 from pathlib import Path
 import uuid
 
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app import models, schemas
@@ -62,6 +62,55 @@ def _get_owned_video_or_404(
 
 
 from app.routers.content_routes import _to_reel_detail
+
+
+@router.get("/audience-options")
+def get_reel_audience_options(
+    current_user: models.User = Depends(get_current_user),
+):
+    """Static choices used by the Share Reel audience picker."""
+    return {
+        "audiences": [
+            {"value": "everyone", "label": "Everyone"},
+            {"value": "followers", "label": "Followers"},
+            {"value": "close_friends", "label": "Close Friends"},
+        ],
+        "age_restrictions": [
+            {"value": "below_18", "label": "All ages"},
+            {"value": "18_plus", "label": "18+"},
+        ],
+    }
+
+
+@router.get("/collaborators/search")
+def search_reel_collaborators(
+    q: str = Query(..., min_length=1, max_length=50),
+    limit: int = Query(10, ge=1, le=30),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Search active accounts that can be selected as reel collaborators."""
+    term = f"%{q.strip()}%"
+    users = (
+        db.query(models.User)
+        .filter(
+            models.User.is_active.is_(True),
+            models.User.id != current_user.id,
+            (models.User.username.ilike(term) | models.User.full_name.ilike(term)),
+        )
+        .order_by(models.User.username.asc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "avatar_url": user.avatar_url,
+        }
+        for user in users
+    ]
 
 
 @router.post("/upload", response_model=schemas.ReelDetailOut, status_code=status.HTTP_201_CREATED)
@@ -665,6 +714,24 @@ def create_reel_draft(
         editor_state=parsed_editor_state,
     )
     db.add(draft)
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+@router.post("/drafts/{draft_id}/thumbnail", response_model=schemas.ReelDraftOut)
+def upload_reel_draft_thumbnail(
+    draft_id: int,
+    file: UploadFile,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Replace the cover image on an unpublished reel draft."""
+    draft = _get_owned_draft_or_404(db, draft_id, current_user)
+    thumbnail_url, kind = save_upload_file(file, "thumbnails", allow_video=False)
+    if kind != "image":
+        raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+    draft.thumbnail_url = thumbnail_url
     db.commit()
     db.refresh(draft)
     return draft

@@ -135,6 +135,32 @@ def get_trending_hashtags(
     )
 
 
+@router.get("/search", response_model=list[schemas.HashtagOut])
+def search_hashtags(
+    q: str = Query(..., min_length=1, max_length=50),
+    limit: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    """Autocomplete hashtags for the Share Reel composer.
+
+    Existing hashtags are returned by prefix/substring match. New hashtag
+    rows are still created automatically when content containing them is
+    published; this endpoint does not create empty hashtags.
+    """
+    term = _normalize(q)
+    rows = (
+        db.query(models.Hashtag)
+        .filter(models.Hashtag.name.ilike(f"%{term}%"))
+        .order_by(models.Hashtag.name.asc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        schemas.HashtagOut(name=row.name, posts_count=hashtag_posts_count(db, row))
+        for row in rows
+    ]
+
+
 @router.get("/{name}", response_model=schemas.HashtagOut)
 def get_hashtag(name: str, db: Session = Depends(get_db)):
     hashtag = _get_hashtag_or_404(db, name)
