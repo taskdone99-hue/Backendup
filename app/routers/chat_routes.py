@@ -192,6 +192,22 @@ def _to_message_out(
     """`viewer_id` only matters for shared-reel messages, whose preview depends
     on who's looking (see _build_shared_reel_out)."""
     out = schemas.MessageOut.model_validate(message)
+    if message.sticker_id is not None and not message.is_deleted:
+        sticker = db.query(models.Sticker).filter(models.Sticker.id == message.sticker_id).first()
+        if sticker is not None:
+            favorite = False
+            if viewer_id is not None:
+                favorite = db.query(models.StickerFavorite.id).filter_by(
+                    user_id=viewer_id, sticker_id=sticker.id
+                ).first() is not None
+            out.sticker = {
+                "id": sticker.id, "owner_id": sticker.owner_id, "name": sticker.name,
+                "sticker_url": f"/api/stickers/{sticker.id}/file",
+                "thumbnail_url": f"/api/stickers/{sticker.id}/file?thumbnail=true",
+                "mime_type": sticker.mime_type, "visibility": sticker.visibility,
+                "approval_status": sticker.approval_status,
+                "created_at": sticker.created_at, "is_favorite": favorite,
+            }
     if message.is_deleted:
         out.content = "This message was deleted"
         out.media_url = None
@@ -845,7 +861,11 @@ async def _push_message_event(
     recipient gets the same payload; a shared reel/post's preview depends on
     who's looking, so those are built and sent per recipient."""
     base = {"type": event_type, "conversation_id": message.conversation_id}
-    if message.shared_reel_id is None and message.shared_post_id is None:
+    if (
+        message.shared_reel_id is None
+        and message.shared_post_id is None
+        and message.sticker_id is None
+    ):
         await manager.send_to_users(
             recipient_ids, {**base, "message": default_out.model_dump(mode="json")}
         )
@@ -961,6 +981,8 @@ async def _create_and_dispatch_message(
     short text used in that notification (e.g. the caption, or "Sent a
     photo" for a caption-less media message)."""
     db.add(message)
+    if message.message_type == "sticker" and message.sticker_id is not None:
+        db.add(models.StickerUsage(user_id=current_user.id, sticker_id=message.sticker_id))
     for position, option in enumerate(options or []):
         message.options.append(models.ChatMessageOption(
             title=option.title, action=option.action, display_order=position
@@ -1043,6 +1065,21 @@ async def send_message(
         # Backend-enforced: only Business / active-Premium accounts may attach buttons.
         chat_option_service.require_eligible_sender(db, current_user)
 
+    sticker_row = None
+    if payload.message_type == "sticker":
+        sticker_row = db.query(models.Sticker).filter(models.Sticker.id == payload.sticker_id).first()
+        if sticker_row is None:
+            raise HTTPException(status_code=404, detail="Sticker not found")
+        can_use = (
+            (sticker_row.owner_id == current_user.id and sticker_row.visibility == "private")
+            or (sticker_row.visibility == "public" and sticker_row.approval_status == "approved")
+            or db.query(models.Message.id).filter(
+                models.Message.conversation_id == conversation_id,
+                models.Message.sticker_id == sticker_row.id,
+            ).first() is not None
+        )
+        if not can_use:
+            raise HTTPException(status_code=404, detail="Sticker not found")
     if payload.shared_reel_id is not None:
         # Share a reel as a card (optionally with a note in `content`).
         _get_shareable_reel_or_404(db, payload.shared_reel_id, current_user.id)
@@ -1054,6 +1091,8 @@ async def send_message(
         conversation_id=conversation_id,
         sender_id=current_user.id,
         content=payload.content,
+        message_type=payload.message_type,
+        sticker_id=payload.sticker_id if payload.message_type == "sticker" else None,
         reply_to_message_id=reply_to_id,
         shared_reel_id=payload.shared_reel_id,
         shared_post_id=payload.shared_post_id,
@@ -1063,7 +1102,7 @@ async def send_message(
         else "Sent a post" if payload.shared_post_id is not None
         else ""
     )
-    text = payload.content or default_preview
+    text = payload.content or ("Sent a sticker" if payload.message_type == "sticker" else default_preview)
     preview = text if len(text) <= 80 else text[:77] + "..."
     message_out = await _create_and_dispatch_message(
         db, conversation_id, message, current_user, preview, options=payload.options

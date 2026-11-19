@@ -2063,6 +2063,8 @@ class MessageCreate(BaseModel):
     share; without either, `content` is required. Only one of the two
     share ids may be set on a given message."""
     content: str | None = Field(default=None, min_length=1, max_length=2200)
+    message_type: str = Field(default="text", pattern="^(text|sticker)$")
+    sticker_id: int | None = Field(default=None, gt=0)
     reply_to_message_id: int | None = Field(
         default=None, gt=0, description="Reply to another message in this conversation"
     )
@@ -2088,7 +2090,16 @@ class MessageCreate(BaseModel):
 
     @model_validator(mode="after")
     def require_content_or_share(self):
-        if self.content is None and self.shared_reel_id is None and self.shared_post_id is None:
+        if self.message_type == "sticker":
+            if self.sticker_id is None:
+                raise ValueError("sticker_id is required for sticker messages")
+            if self.content is not None or self.shared_reel_id is not None or self.shared_post_id is not None:
+                raise ValueError("Sticker messages cannot include text or shared content")
+            if self.options:
+                raise ValueError("Sticker messages cannot include options")
+        elif self.sticker_id is not None:
+            raise ValueError("sticker_id is only valid when message_type is 'sticker'")
+        elif self.content is None and self.shared_reel_id is None and self.shared_post_id is None:
             raise ValueError("Message can't be empty")
         if self.options:
             if self.content is None:
@@ -2165,6 +2176,9 @@ class MessageOut(BaseModel):
     conversation_id: int
     sender_id: int
     content: str | None
+    message_type: str = "text"
+    sticker_id: int | None = None
+    sticker: dict | None = None
     media_url: str | None = None
     media_type: MediaType | None = None
     reply_to_message_id: int | None = None

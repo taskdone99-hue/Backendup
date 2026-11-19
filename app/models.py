@@ -1680,6 +1680,8 @@ class Message(Base):
     content = Column(String(2200), nullable=True)
     media_url = Column(String(500), nullable=True)
     media_type = Column(Enum(MediaType), nullable=True)
+    message_type = Column(String(20), nullable=False, default="text", server_default="text")
+    sticker_id = Column(Integer, ForeignKey("stickers.id", ondelete="SET NULL"), nullable=True, index=True)
     # Reply-to-another-message (distinct from reply_to_story_id below, which
     # is specifically "this DM was sent by tapping reply on a story"). SET
     # NULL so deleting/unsending the original doesn't break the reply chain.
