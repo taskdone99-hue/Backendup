@@ -2195,6 +2195,7 @@ class MessageOut(BaseModel):
     shared_post: SharedPostOut | None = None
     is_auto_message: bool = False
     edited_at: datetime | None = None
+    expires_at: datetime | None = None
     is_deleted: bool = False
     reactions: list[MessageReactionOut] = []
     # Clickable buttons (Business / Premium senders). Always present; [] for an

@@ -23,6 +23,15 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 logger = logging.getLogger(__name__)
 
+def _message_expiry(db: Session, conversation_id: int):
+    setting = db.query(models.ConversationDisappearingSetting).filter_by(
+        conversation_id=conversation_id
+    ).first()
+    if not setting or not setting.duration_seconds:
+        return None
+    from datetime import timedelta
+    return datetime.now(timezone.utc) + timedelta(seconds=setting.duration_seconds)
+
 
 # ---- internal helpers ----
 
@@ -208,11 +217,21 @@ def _to_message_out(
                 "approval_status": sticker.approval_status,
                 "created_at": sticker.created_at, "is_favorite": favorite,
             }
-    if message.is_deleted:
-        out.content = "This message was deleted"
+    expiry_at = message.expires_at
+    if expiry_at is not None and expiry_at.tzinfo is None:
+        expiry_at = expiry_at.replace(tzinfo=timezone.utc)
+    expired = expiry_at is not None and expiry_at <= datetime.now(timezone.utc)
+    if message.is_deleted or expired:
+        out.content = "This message has expired" if expired and not message.is_deleted else "This message was deleted"
         out.media_url = None
+        out.sticker = None
+        out.shared_story = None
+        out.shared_story_id = None
+        out.shared_reel = None
         out.shared_reel_id = None
+        out.shared_post = None
         out.shared_post_id = None
+        out.options = []
     elif message.shared_reel_id is not None:
         out.shared_reel = _build_shared_reel_out(db, message.shared_reel_id, viewer_id)
     elif message.shared_post_id is not None:
@@ -1096,6 +1115,7 @@ async def send_message(
         reply_to_message_id=reply_to_id,
         shared_reel_id=payload.shared_reel_id,
         shared_post_id=payload.shared_post_id,
+        expires_at=_message_expiry(db, conversation_id),
     )
     default_preview = (
         "Sent a reel" if payload.shared_reel_id is not None
@@ -1153,6 +1173,7 @@ async def send_media_message(
         media_url=url,
         media_type=media_type,
         reply_to_message_id=reply_to_id,
+        expires_at=_message_expiry(db, conversation_id),
     )
     preview = caption or {"image": "Sent a photo", "video": "Sent a video", "audio": "Sent a voice message"}[kind]
     message_out = await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)

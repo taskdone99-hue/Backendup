@@ -24,6 +24,7 @@ from app.routers import (
     share_routes,
     snap_routes,
     chat_routes,
+    chat_conversation_settings_routes,
     chat_option_routes,
     notification_routes,
     post_details_routes,
@@ -55,6 +56,7 @@ from app.routers import (
     kpp_analytics_routes,
     sticker_routes,
     long_video_routes,
+    video_engagement_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -123,6 +125,7 @@ app.include_router(content_routes.reels_router)
 app.include_router(watch_routes.router)
 app.include_router(comment_routes.router)
 app.include_router(long_video_routes.router)
+app.include_router(video_engagement_routes.router)
 app.include_router(video_routes.router)  # Legacy Reel-specific upload settings: /api/reel-tools
 app.include_router(sticker_routes.router)
 app.include_router(highlight_routes.router)
@@ -130,6 +133,7 @@ app.include_router(saved_routes.router)
 app.include_router(share_routes.router)
 app.include_router(snap_routes.router)
 app.include_router(chat_routes.router)
+app.include_router(chat_conversation_settings_routes.router)
 app.include_router(chat_option_routes.router)
 app.include_router(notification_routes.router)
 app.include_router(post_details_routes.router)

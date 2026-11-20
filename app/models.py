@@ -1722,6 +1722,7 @@ class Message(Base):
     # what "unsend" (DELETE /api/chat/messages/:id) uses — same mechanism.
     is_deleted = Column(Boolean, default=False, nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")
@@ -2466,6 +2467,7 @@ class NotInterested(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     content_type = Column(String(10), nullable=False)  # post or reel
     content_id = Column(Integer, nullable=False)
+    reason = Column(String(30), nullable=False, default="not_relevant", server_default="not_relevant")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

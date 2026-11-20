@@ -50,8 +50,9 @@ class CallAction(BaseModel):
     action: Literal["accept", "reject", "end"]
 
 class NotInterestedIn(BaseModel):
-    content_type: Literal["post", "reel"]
+    content_type: Literal["post", "reel", "video"]
     content_id: int = Field(gt=0)
+    reason: Literal["not_relevant", "seen_too_often", "dont_like", "inappropriate", "other"] = "not_relevant"
 
 class ThemeIn(BaseModel):
     theme: Literal["light", "dark", "system"]
@@ -147,26 +148,30 @@ async def call_signaling_ws(websocket: WebSocket, token: str = Query(...)):
 def mark_not_interested(data: NotInterestedIn, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     if data.content_type == "post":
         exists = db.query(models.Post.id).filter(models.Post.id == data.content_id).first()
-    else:
+    elif data.content_type == "reel":
         exists = db.query(models.Reel.id).filter(models.Reel.id == data.content_id).first()
+    else:
+        exists = db.query(models.Video.id).filter(models.Video.id == data.content_id).first()
     if not exists: raise HTTPException(status_code=404, detail=f"{data.content_type.title()} not found")
     row = db.query(models.NotInterested).filter_by(user_id=user.id, content_type=data.content_type, content_id=data.content_id).first()
     if row:
-        return {"message": "Content already marked not interested", "content_type": data.content_type, "content_id": data.content_id}
-    row = models.NotInterested(user_id=user.id, content_type=data.content_type, content_id=data.content_id)
+        row.reason = data.reason
+        db.commit()
+        return {"message": "Content already marked not interested; reason updated", "content_type": data.content_type, "content_id": data.content_id, "reason": row.reason}
+    row = models.NotInterested(user_id=user.id, content_type=data.content_type, content_id=data.content_id, reason=data.reason)
     db.add(row)
     try: db.commit()
     except IntegrityError:
         db.rollback()
-    return {"message": "Content marked not interested", "content_type": data.content_type, "content_id": data.content_id}
+    return {"message": "Content marked not interested", "content_type": data.content_type, "content_id": data.content_id, "reason": data.reason}
 
 @router.get("/api/not-interested")
 def list_not_interested(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     rows = db.query(models.NotInterested).filter(models.NotInterested.user_id == user.id).order_by(models.NotInterested.id.desc()).all()
-    return {"items": [{"content_type": r.content_type, "content_id": r.content_id, "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]}
+    return {"items": [{"content_type": r.content_type, "content_id": r.content_id, "reason": getattr(r, "reason", "not_relevant"), "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]}
 
 @router.delete("/api/not-interested/{content_type}/{content_id}")
-def undo_not_interested(content_type: Literal["post", "reel"], content_id: int, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def undo_not_interested(content_type: Literal["post", "reel", "video"], content_id: int, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     row = db.query(models.NotInterested).filter_by(user_id=user.id, content_type=content_type, content_id=content_id).first()
     if not row: raise HTTPException(status_code=404, detail="Not Interested record not found")
     db.delete(row); db.commit()

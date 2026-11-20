@@ -217,6 +217,35 @@ def sticker_file(sticker_id: int, thumbnail: bool = Query(False),
     return FileResponse(path, media_type=row.mime_type, filename=path.name)
 
 
+@router.put("/{sticker_id}/image")
+def replace_sticker_image(
+    sticker_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Replace a sticker's image asset while preserving its ID and name."""
+    row = db.query(models.Sticker).filter_by(id=sticker_id, owner_id=user.id).first()
+    if row is None:
+        raise HTTPException(404, "Sticker not found")
+    image = _read_image(file)
+    new_url, new_thumbnail = _save_sticker_images(image)
+    old_path = _sticker_path(row.sticker_url)
+    old_thumb = _sticker_path(row.thumbnail_url)
+    row.sticker_url = new_url
+    row.thumbnail_url = new_thumbnail
+    row.mime_type = "image/png"
+    db.commit()
+    db.refresh(row)
+    for path in (old_path, old_thumb):
+        if path and path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    return _out(row, db, user.id)
+
+
 @router.get("/{sticker_id}")
 def get_sticker(sticker_id: int, db: Session = Depends(get_db),
                 user: models.User = Depends(get_current_user)):
