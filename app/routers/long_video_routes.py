@@ -4,6 +4,7 @@ not in `reels`; Reel endpoints and engagement remain separate.
 from pathlib import Path
 from typing import Literal
 import mimetypes
+import json
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field, field_validator
@@ -156,39 +157,94 @@ def upload_video_media(
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_video(
-    payload: VideoCreate,
+    file: UploadFile = File(..., description="Upload the actual video file (MP4 recommended)"),
+    title: str = Form(..., min_length=1, max_length=150),
+    description: str | None = Form(default=None, max_length=5000),
+    thumbnail: UploadFile | None = File(default=None, description="Optional custom thumbnail; generated automatically if omitted"),
+    visibility: Literal["public", "private"] = Form(default="public"),
+    allow_comments: bool = Form(default=True),
+    allow_sharing: bool = Form(default=True),
+    location: str | None = Form(default=None, max_length=150),
+    category: str | None = Form(default=None, max_length=80),
+    tags: str | None = Form(default=None, description="Comma-separated tags or a JSON string array"),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    path, metadata = _validate_video_asset(payload.video_url)
-    thumbnail_url = payload.thumbnail_url
-    if thumbnail_url:
-        thumb_path = _local_path_from_url(thumbnail_url)
+    """Create a long-form video in one multipart request, like POST /api/reels.
+
+    The client uploads `file`; it does not send a video_url. The server stores
+    the file, reads its metadata, generates a thumbnail when needed, and then
+    creates the videos-table record.
+    """
+    clean_title = title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=422, detail="title is required")
+
+    parsed_tags: list[str] = []
+    if tags:
+        raw_tags = tags.strip()
         try:
-            if thumb_path is None:
-                raise ValueError()
-            thumb_path.resolve().relative_to((STATIC_ROOT / "video_thumbnails").resolve())
-            if not thumb_path.is_file():
-                raise ValueError()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="thumbnail_url must reference an uploaded video thumbnail")
-    else:
-        thumbnail_url = generate_video_thumbnail(payload.video_url, subfolder="video_thumbnails")
-    row = models.Video(
-        user_id=current_user.id, title=payload.title, description=payload.description,
-        video_url=payload.video_url, thumbnail_url=thumbnail_url,
-        mime_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
-        file_size=path.stat().st_size,
-        duration_seconds=metadata["duration_seconds"], width=metadata["width"],
-        height=metadata["height"], aspect_ratio=f"{metadata['width']}:{metadata['height']}",
-        orientation="horizontal", visibility=payload.visibility,
-        allow_comments=payload.allow_comments, allow_sharing=payload.allow_sharing,
-        location=payload.location, category=payload.category, tags=payload.tags,
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return _out(row)
+            decoded = json.loads(raw_tags)
+            if isinstance(decoded, list):
+                parsed_tags = [str(item).strip().lstrip("#") for item in decoded if str(item).strip()]
+            else:
+                parsed_tags = [part.strip().lstrip("#") for part in raw_tags.split(",") if part.strip()]
+        except json.JSONDecodeError:
+            parsed_tags = [part.strip().lstrip("#") for part in raw_tags.split(",") if part.strip()]
+    parsed_tags = list(dict.fromkeys(parsed_tags))
+    if len(parsed_tags) > 30:
+        raise HTTPException(status_code=422, detail="A maximum of 30 tags is allowed")
+
+    video_url = None
+    thumbnail_url = None
+    try:
+        video_url, kind = save_upload_file(
+            file, "videos", allow_video=True, max_video_bytes=VIDEO_MAX_BYTES
+        )
+        if kind != "video":
+            raise HTTPException(status_code=400, detail="File must be a video")
+
+        path, metadata = _validate_video_asset(video_url)
+        if thumbnail is not None and thumbnail.filename:
+            thumbnail_url, thumb_kind = save_upload_file(
+                thumbnail, "video_thumbnails", allow_video=False
+            )
+            if thumb_kind != "image":
+                raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+        else:
+            thumbnail_url = generate_video_thumbnail(video_url, subfolder="video_thumbnails")
+
+        row = models.Video(
+            user_id=current_user.id,
+            title=clean_title,
+            description=description.strip() if description else None,
+            video_url=video_url,
+            thumbnail_url=thumbnail_url,
+            mime_type=file.content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            file_size=path.stat().st_size,
+            duration_seconds=metadata["duration_seconds"],
+            width=metadata["width"],
+            height=metadata["height"],
+            aspect_ratio=f"{metadata['width']}:{metadata['height']}",
+            orientation="horizontal",
+            visibility=visibility,
+            allow_comments=allow_comments,
+            allow_sharing=allow_sharing,
+            location=location.strip() if location else None,
+            category=category.strip() if category else None,
+            tags=parsed_tags,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _out(row)
+    except Exception:
+        db.rollback()
+        if video_url:
+            delete_media_file(video_url)
+        if thumbnail_url:
+            delete_media_file(thumbnail_url)
+        raise
 
 
 @router.get("")
