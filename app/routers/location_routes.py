@@ -1,377 +1,382 @@
+"""Independent long-form Videos API. Videos are stored in the `videos` table,
+not in `reels`; Reel endpoints and engagement remain separate.
 """
-Location APIs — attach a place to a post/story/reel, look it up, search
-saved locations, and browse content tagged at a location.
+from pathlib import Path
+from typing import Literal
+import mimetypes
+import json
 
-Not user-location tracking: every Location row exists only because someone
-explicitly attached it to a post/story/reel — see
-app/services/location_service.py.
-"""
-
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
+from app import models
+from app.auth import get_current_user
 from app.database import get_db
-from app import models, schemas
-from app.auth import get_current_user, get_current_user_optional
-from app.services import geocoding_service
-from app.services.video_settings_service import visible_reels_clause
-from app.services.location_service import (
-    find_or_create_location,
-    get_location_or_404,
-    search_locations,
-    find_nearby_locations,
+from app.services.media_service import (
+    STATIC_ROOT, _local_path_from_url, delete_media_file,
+    generate_video_thumbnail, get_video_metadata, save_upload_file,
 )
-from app.routers.content_routes import (
-    _visible_authors_clause,
-    _to_post_detail,
-    _to_reel_detail,
-)
-from app.routers.story_routes import _active_story_query, _to_story_out
+
+router = APIRouter(prefix="/api/videos", tags=["long-form videos"])
+VIDEO_MIN_SECONDS = 300
+VIDEO_MAX_SECONDS = 420
+VIDEO_MAX_BYTES = 500 * 1024 * 1024
 
 
-router = APIRouter(prefix="/api/locations", tags=["locations"])
+class VideoCreate(BaseModel):
+    video_url: str = Field(..., min_length=1, max_length=500)
+    thumbnail_url: str | None = Field(default=None, max_length=500)
+    title: str = Field(..., min_length=1, max_length=150)
+    description: str | None = Field(default=None, max_length=5000)
+    visibility: Literal["public", "private"] = "public"
+    allow_comments: bool = True
+    allow_sharing: bool = True
+    location: str | None = Field(default=None, max_length=150)
+    category: str | None = Field(default=None, max_length=80)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title is required")
+        return value
+
+    @field_validator("tags")
+    @classmethod
+    def clean_tags(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(v.strip().lstrip("#") for v in values if v.strip()))
 
 
-@router.post(
-    "",
-    response_model=schemas.LocationOut,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_location(
-    payload: schemas.LocationCreate,
-    db: Session = Depends(get_db),
+class VideoUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=150)
+    description: str | None = Field(default=None, max_length=5000)
+    visibility: Literal["public", "private"] | None = None
+    allow_comments: bool | None = None
+    allow_sharing: bool | None = None
+    location: str | None = Field(default=None, max_length=150)
+    category: str | None = Field(default=None, max_length=80)
+    tags: list[str] | None = Field(default=None, max_length=30)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("title cannot be blank")
+        return value
+
+    @field_validator("tags")
+    @classmethod
+    def clean_tags(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        return list(dict.fromkeys(v.strip().lstrip("#") for v in values if v.strip()))
+
+
+def _validate_video_asset(url: str) -> tuple[Path, dict]:
+    path = _local_path_from_url(url)
+    if path is None:
+        raise HTTPException(status_code=400, detail="video_url must reference an uploaded local video")
+    try:
+        path.resolve().relative_to((STATIC_ROOT / "videos").resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="video_url must reference the videos upload folder")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=400, detail="Uploaded video file was not found")
+    metadata = get_video_metadata(url)
+    if metadata is None:
+        raise HTTPException(status_code=400, detail="Could not read video metadata; ensure ffprobe is installed")
+    duration = metadata["duration_seconds"]
+    if not VIDEO_MIN_SECONDS <= duration <= VIDEO_MAX_SECONDS:
+        raise HTTPException(status_code=400, detail="Long-form videos must be between 300 and 420 seconds (5–7 minutes)")
+    if metadata["width"] < metadata["height"]:
+        raise HTTPException(status_code=400, detail="Long-form videos must be horizontal (width must be greater than or equal to height)")
+    return path, metadata
+
+
+def _out(row: models.Video) -> dict:
+    return {
+        "id": row.id, "user_id": row.user_id, "title": row.title,
+        "description": row.description, "video_url": row.video_url,
+        "thumbnail_url": row.thumbnail_url, "mime_type": row.mime_type,
+        "file_size": row.file_size, "duration_seconds": row.duration_seconds,
+        "width": row.width, "height": row.height, "aspect_ratio": row.aspect_ratio,
+        "orientation": row.orientation, "visibility": row.visibility,
+        "allow_comments": row.allow_comments, "allow_sharing": row.allow_sharing,
+        "location": row.location, "category": row.category, "tags": row.tags or [],
+        "created_at": row.created_at, "updated_at": row.updated_at,
+    }
+
+
+def _owned(db: Session, video_id: int, user: models.User) -> models.Video:
+    row = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if row.user_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only manage your own videos")
+    return row
+
+
+@router.post("/upload", status_code=status.HTTP_201_CREATED)
+def upload_video_media(
+    file: UploadFile = File(..., description="5–7 minute horizontal video from gallery"),
+    thumbnail: UploadFile | None = File(default=None, description="Optional custom poster image"),
+    current_user: models.User = Depends(get_current_user),
 ):
-    # Reuses an existing row for the same place_id (e.g. a result from
-    # /places/search picked by several users) or same name+coordinates,
-    # instead of inserting a duplicate each time.
-    location = find_or_create_location(
-        db,
-        name=payload.name,
-        address=payload.address,
-        city=payload.city,
-        state=payload.state,
-        country=payload.country,
-        latitude=payload.latitude,
-        longitude=payload.longitude,
-        place_id=payload.place_id,
-    )
+    url, kind = save_upload_file(file, "videos", allow_video=True, max_video_bytes=VIDEO_MAX_BYTES)
+    if kind != "video":
+        delete_media_file(url)
+        raise HTTPException(status_code=400, detail="File must be a video")
+    try:
+        path, metadata = _validate_video_asset(url)
+        thumb_url = None
+        if thumbnail is not None and thumbnail.filename:
+            thumb_url, thumb_kind = save_upload_file(thumbnail, "video_thumbnails", allow_video=False)
+            if thumb_kind != "image":
+                delete_media_file(url)
+                raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+        else:
+            thumb_url = generate_video_thumbnail(url, subfolder="video_thumbnails")
+        return {
+            "message": "Video media uploaded successfully",
+            "video_url": url, "thumbnail_url": thumb_url,
+            "mime_type": file.content_type or "video/mp4",
+            "file_size": path.stat().st_size, **metadata,
+            "orientation": "horizontal",
+            "aspect_ratio": f"{metadata['width']}:{metadata['height']}",
+        }
+    except Exception:
+        delete_media_file(url)
+        raise
 
-    return schemas.LocationOut.model_validate(location)
 
-
-@router.get(
-    "/search",
-    response_model=schemas.PaginatedLocationSearchResponse,
-)
-def search_locations_endpoint(
-    q: str = Query(..., min_length=1),
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+@router.post("", status_code=status.HTTP_201_CREATED)
+def create_video(
+    file: UploadFile = File(..., description="Upload the actual video file (MP4 recommended)"),
+    title: str = Form(..., min_length=1, max_length=150),
+    description: str | None = Form(default=None, max_length=5000),
+    thumbnail: UploadFile | None = File(default=None, description="Optional custom thumbnail; generated automatically if omitted"),
+    visibility: Literal["public", "private"] = Form(default="public"),
+    allow_comments: bool = Form(default=True),
+    allow_sharing: bool = Form(default=True),
+    location: str | None = Form(default=None, max_length=150),
+    category: str | None = Form(default=None, max_length=80),
+    tags: str | None = Form(default=None, description="Comma-separated tags or a JSON string array"),
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
-    """Search locations already saved in this app."""
+    """Create a long-form video in one multipart request, like POST /api/reels.
 
-    total, rows = search_locations(db, q, limit, offset)
+    The client uploads `file`; it does not send a video_url. The server stores
+    the file, reads its metadata, generates a thumbnail when needed, and then
+    creates the videos-table record.
+    """
+    clean_title = title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=422, detail="title is required")
 
-    return schemas.PaginatedLocationSearchResponse(
-        total=total,
-        limit=limit,
-        offset=offset,
-        items=[
-            schemas.LocationOut.model_validate(r)
-            for r in rows
-        ],
-    )
+    parsed_tags: list[str] = []
+    if tags:
+        raw_tags = tags.strip()
+        try:
+            decoded = json.loads(raw_tags)
+            if isinstance(decoded, list):
+                parsed_tags = [str(item).strip().lstrip("#") for item in decoded if str(item).strip()]
+            else:
+                parsed_tags = [part.strip().lstrip("#") for part in raw_tags.split(",") if part.strip()]
+        except json.JSONDecodeError:
+            parsed_tags = [part.strip().lstrip("#") for part in raw_tags.split(",") if part.strip()]
+    parsed_tags = list(dict.fromkeys(parsed_tags))
+    if len(parsed_tags) > 30:
+        raise HTTPException(status_code=422, detail="A maximum of 30 tags is allowed")
 
-
-@router.get(
-    "/nearby",
-    response_model=schemas.NearbyLocationsResponse,
-)
-def nearby_locations(
-    latitude: float = Query(...),
-    longitude: float = Query(...),
-    radius_km: float = Query(10, gt=0, le=500),
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-):
-    """Find saved locations within radius, sorted nearest first."""
-
-    if not (-90 <= latitude <= 90):
-        raise HTTPException(
-            status_code=400,
-            detail="latitude must be between -90 and 90",
+    video_url = None
+    thumbnail_url = None
+    try:
+        video_url, kind = save_upload_file(
+            file, "videos", allow_video=True, max_video_bytes=VIDEO_MAX_BYTES
         )
+        if kind != "video":
+            raise HTTPException(status_code=400, detail="File must be a video")
 
-    if not (-180 <= longitude <= 180):
-        raise HTTPException(
-            status_code=400,
-            detail="longitude must be between -180 and 180",
-        )
-
-    total, rows = find_nearby_locations(
-        db,
-        latitude=latitude,
-        longitude=longitude,
-        radius_km=radius_km,
-        limit=limit,
-        offset=offset,
-    )
-
-    return schemas.NearbyLocationsResponse(
-        total=total,
-        limit=limit,
-        offset=offset,
-        items=[
-            schemas.NearbyLocationOut(
-                **schemas.LocationOut.model_validate(location).model_dump(),
-                distance_km=round(distance_km, 3),
+        path, metadata = _validate_video_asset(video_url)
+        if thumbnail is not None and thumbnail.filename:
+            thumbnail_url, thumb_kind = save_upload_file(
+                thumbnail, "video_thumbnails", allow_video=False
             )
-            for location, distance_km in rows
-        ],
-    )
+            if thumb_kind != "image":
+                raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+        else:
+            thumbnail_url = generate_video_thumbnail(video_url, subfolder="video_thumbnails")
 
-
-def _raise_for_geocoding_error(exc: geocoding_service.GeocodingError):
-    if isinstance(exc, geocoding_service.GeocodingNotConfigured):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Place lookup is not available right now",
+        row = models.Video(
+            user_id=current_user.id,
+            title=clean_title,
+            description=description.strip() if description else None,
+            video_url=video_url,
+            thumbnail_url=thumbnail_url,
+            mime_type=file.content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            file_size=path.stat().st_size,
+            duration_seconds=metadata["duration_seconds"],
+            width=metadata["width"],
+            height=metadata["height"],
+            aspect_ratio=f"{metadata['width']}:{metadata['height']}",
+            orientation="horizontal",
+            visibility=visibility,
+            allow_comments=allow_comments,
+            allow_sharing=allow_sharing,
+            location=location.strip() if location else None,
+            category=category.strip() if category else None,
+            tags=parsed_tags,
         )
-    raise HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        detail="Place lookup failed, please try again",
-    )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _out(row)
+    except Exception:
+        db.rollback()
+        if video_url:
+            delete_media_file(video_url)
+        if thumbnail_url:
+            delete_media_file(thumbnail_url)
+        raise
 
 
-@router.get(
-    "/places/search",
-    response_model=schemas.PlaceSearchResponse,
-)
-def search_places_endpoint(
-    q: str = Query(..., min_length=2, max_length=200),
-    latitude: float | None = Query(None, ge=-90, le=90),
-    longitude: float | None = Query(None, ge=-180, le=180),
-    limit: int = Query(5, ge=1, le=10),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Search real-world places through the configured places provider (not
-    just locations already saved in this app — that's GET /search).
-
-    Pass latitude+longitude to prefer results near the caller. Login is
-    required because every call spends the provider quota. Nothing about
-    the query or coordinates is stored.
-    """
-
-    if (latitude is None) != (longitude is None):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="latitude and longitude must be provided together",
-        )
-
-    query = q.strip()
-    if len(query) < 2:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="q must be at least 2 characters",
-        )
-
-    try:
-        places = geocoding_service.search_places(
-            query, latitude=latitude, longitude=longitude, limit=limit
-        )
-    except geocoding_service.GeocodingError as exc:
-        _raise_for_geocoding_error(exc)
-
-    return schemas.PlaceSearchResponse(
-        items=[schemas.PlaceOut(**vars(p)) for p in places]
-    )
-
-
-@router.get(
-    "/reverse-geocode",
-    response_model=schemas.PlaceOut,
-)
-def reverse_geocode_endpoint(
-    latitude: float = Query(..., ge=-90, le=90),
-    longitude: float = Query(..., ge=-180, le=180),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Turn coordinates into the address / place name at that point (for
-    "use my current location"). One-shot lookup: the coordinates are not
-    saved or logged, and no history of them is kept.
-    """
-
-    try:
-        place = geocoding_service.reverse_geocode(latitude, longitude)
-    except geocoding_service.GeocodingError as exc:
-        _raise_for_geocoding_error(exc)
-
-    if place is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No place found at these coordinates",
-        )
-
-    return schemas.PlaceOut(**vars(place))
-
-
-# NOTE: /search, /nearby, /places/search and /reverse-geocode must be
-# registered before /{location_id}.
-@router.get(
-    "/{location_id}",
-    response_model=schemas.LocationOut,
-)
-def get_location(
-    location_id: int,
-    db: Session = Depends(get_db),
-):
-    location = get_location_or_404(db, location_id)
-
-    if location is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Location not found",
-        )
-
-    return schemas.LocationOut.model_validate(location)
-
-
-@router.get(
-    "/{location_id}/posts",
-    response_model=schemas.PaginatedPostDetailResponse,
-)
-def get_location_posts(
-    location_id: int,
+@router.get("")
+def list_videos(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
+    current_user: models.User = Depends(get_current_user),
 ):
-    """Posts tagged at this location."""
-
-    if get_location_or_404(db, location_id) is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Location not found",
-        )
-
-    viewer_id = current_user.id if current_user else None
-
-    query = (
-        db.query(models.Post)
-        .join(models.User, models.Post.user_id == models.User.id)
-        .filter(models.Post.location_id == location_id)
-        .filter(_visible_authors_clause(db, viewer_id))
+    query = db.query(models.Video).filter(
+        (models.Video.visibility == "public") | (models.Video.user_id == current_user.id)
     )
-
     total = query.count()
-
-    posts = (
-        query
-        .order_by(models.Post.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-
-    items = [
-        _to_post_detail(db, p, viewer_id)
-        for p in posts
-    ]
-
-    return schemas.PaginatedPostDetailResponse(
-        total=total,
-        limit=limit,
-        offset=offset,
-        items=items,
-    )
+    rows = query.order_by(models.Video.created_at.desc(), models.Video.id.desc()).offset(offset).limit(limit).all()
+    return {"total": total, "limit": limit, "offset": offset, "items": [_out(row) for row in rows]}
 
 
-@router.get(
-    "/{location_id}/reels",
-    response_model=schemas.PaginatedReelDetailResponse,
-)
-def get_location_reels(
-    location_id: int,
+@router.get("/mine")
+def my_videos(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
+    current_user: models.User = Depends(get_current_user),
 ):
-    """Reels tagged at this location."""
-
-    if get_location_or_404(db, location_id) is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Location not found",
-        )
-
-    viewer_id = current_user.id if current_user else None
-
-    query = (
-        db.query(models.Reel)
-        .join(models.User, models.Reel.user_id == models.User.id)
-        .filter(models.Reel.location_id == location_id)
-        .filter(_visible_authors_clause(db, viewer_id))
-        .filter(visible_reels_clause(db, viewer_id))
-    )
-
+    query = db.query(models.Video).filter(models.Video.user_id == current_user.id)
     total = query.count()
-
-    reels = (
-        query
-        .order_by(models.Reel.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-
-    items = [
-        _to_reel_detail(db, r, viewer_id)
-        for r in reels
-    ]
-
-    return schemas.PaginatedReelDetailResponse(
-        total=total,
-        limit=limit,
-        offset=offset,
-        items=items,
-    )
+    rows = query.order_by(models.Video.created_at.desc(), models.Video.id.desc()).offset(offset).limit(limit).all()
+    return {"total": total, "limit": limit, "offset": offset, "items": [_out(row) for row in rows]}
 
 
-@router.get(
-    "/{location_id}/stories",
-    response_model=schemas.MyStoriesResponse,
-)
-def get_location_stories(
-    location_id: int,
+@router.get("/{video_id}")
+def get_video(
+    video_id: int,
     db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
+    current_user: models.User = Depends(get_current_user),
 ):
-    """Currently-active stories tagged at this location."""
+    row = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if row is None or (row.visibility == "private" and row.user_id != current_user.id):
+        raise HTTPException(status_code=404, detail="Video not found")
+    return _out(row)
 
-    if get_location_or_404(db, location_id) is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Location not found",
-        )
 
-    viewer_id = current_user.id if current_user else None
+@router.patch("/{video_id}")
+def update_video(
+    video_id: int,
+    payload: VideoUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = _owned(db, video_id, current_user)
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(row, key, value)
+    db.commit()
+    db.refresh(row)
+    return _out(row)
 
-    stories = (
-        _active_story_query(db)
-        .join(models.User, models.Story.user_id == models.User.id)
-        .filter(models.Story.location_id == location_id)
-        .filter(_visible_authors_clause(db, viewer_id))
-        .order_by(models.Story.created_at.desc())
-        .all()
-    )
 
-    return schemas.MyStoriesResponse(
-        items=[
-            _to_story_out(s, viewer_id)
-            for s in stories
-        ]
-    )
+@router.put("/{video_id}/media")
+def replace_video_media(
+    video_id: int,
+    file: UploadFile = File(...),
+    thumbnail: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = _owned(db, video_id, current_user)
+    new_url, kind = save_upload_file(file, "videos", allow_video=True, max_video_bytes=VIDEO_MAX_BYTES)
+    if kind != "video":
+        delete_media_file(new_url)
+        raise HTTPException(status_code=400, detail="File must be a video")
+    try:
+        path, metadata = _validate_video_asset(new_url)
+        if thumbnail is not None and thumbnail.filename:
+            new_thumb, thumb_kind = save_upload_file(thumbnail, "video_thumbnails", allow_video=False)
+            if thumb_kind != "image":
+                delete_media_file(new_url)
+                raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+        else:
+            new_thumb = generate_video_thumbnail(new_url, subfolder="video_thumbnails")
+        old_url, old_thumb = row.video_url, row.thumbnail_url
+        row.video_url = new_url
+        row.thumbnail_url = new_thumb
+        row.mime_type = file.content_type or "video/mp4"
+        row.file_size = path.stat().st_size
+        row.duration_seconds = metadata["duration_seconds"]
+        row.width, row.height = metadata["width"], metadata["height"]
+        row.aspect_ratio = f"{metadata['width']}:{metadata['height']}"
+        row.orientation = "horizontal"
+        db.commit()
+        db.refresh(row)
+        delete_media_file(old_url)
+        if old_thumb:
+            delete_media_file(old_thumb)
+        return _out(row)
+    except Exception:
+        delete_media_file(new_url)
+        raise
+
+
+@router.put("/{video_id}/thumbnail")
+def replace_video_thumbnail(
+    video_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = _owned(db, video_id, current_user)
+    url, kind = save_upload_file(file, "video_thumbnails", allow_video=False)
+    if kind != "image":
+        delete_media_file(url)
+        raise HTTPException(status_code=400, detail="Thumbnail must be an image")
+    old = row.thumbnail_url
+    row.thumbnail_url = url
+    db.commit()
+    db.refresh(row)
+    if old:
+        delete_media_file(old)
+    return {"message": "Thumbnail updated", "thumbnail_url": url, "video": _out(row)}
+
+
+@router.delete("/{video_id}")
+def delete_video(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = _owned(db, video_id, current_user)
+    video_url, thumbnail_url = row.video_url, row.thumbnail_url
+    db.delete(row)
+    db.commit()
+    delete_media_file(video_url)
+    if thumbnail_url:
+        delete_media_file(thumbnail_url)
+    return {"message": "Video deleted successfully", "video_id": video_id}
