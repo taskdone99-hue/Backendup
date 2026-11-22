@@ -2624,3 +2624,83 @@ class Video(Base):
     tags = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Long-form Video parity models. Kept separate from Reel tables by design.
+# ---------------------------------------------------------------------------
+class VideoComment(Base):
+    __tablename__ = "video_comments"
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class VideoLike(Base):
+    __tablename__ = "video_likes"
+    __table_args__ = (UniqueConstraint("video_id", "user_id", name="uq_video_like_user"),)
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class VideoSavedItem(Base):
+    __tablename__ = "video_saved_items"
+    __table_args__ = (UniqueConstraint("video_id", "user_id", name="uq_video_saved_user"),)
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class VideoTag(Base):
+    __tablename__ = "video_tags"
+    __table_args__ = (UniqueConstraint("video_id", "user_id", name="uq_video_tag_user"),)
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    x_position = Column(Float, nullable=True)
+    y_position = Column(Float, nullable=True)
+    tagged_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class VideoInsightEvent(Base):
+    __tablename__ = "video_insight_events"
+    __table_args__ = (
+        UniqueConstraint("video_id", "viewer_id", "client_event_id", name="uq_video_insight_client_event"),
+        Index("ix_video_insight_video_created", "video_id", "created_at"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    viewer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(24), nullable=False, index=True)
+    source = Column(String(24), nullable=True, index=True)
+    watched_seconds = Column(Float, nullable=True)
+    progress_percent = Column(Float, nullable=True)
+    client_event_id = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class VideoAudioRemix(Base):
+    __tablename__ = "video_audio_remixes"
+    __table_args__ = (UniqueConstraint("video_id", "user_id", name="uq_video_audio_remix_user"),)
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    audio_id = Column(Integer, ForeignKey("audio_tracks.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ContentInteractionEvent(Base):
+    __tablename__ = "content_interaction_events"
+    id = Column(Integer, primary_key=True, index=True)
+    content_type = Column(String(20), nullable=False, index=True)
+    content_id = Column(Integer, nullable=False, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(24), nullable=False, index=True)
+    watched_seconds = Column(Float, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

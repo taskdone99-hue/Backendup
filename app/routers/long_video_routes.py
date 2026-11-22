@@ -288,6 +288,7 @@ def get_video(
 
 
 @router.patch("/{video_id}")
+@router.put("/{video_id}")
 def update_video(
     video_id: int,
     payload: VideoUpdate,
