@@ -12,6 +12,7 @@ from app.database import Base, engine
 from app.routers import (
     auth_routes,
     user_routes,
+    privacy_routes,
     settings_routes,
     story_routes,
     content_routes,
@@ -113,6 +114,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 app.include_router(auth_routes.router)
+app.include_router(privacy_routes.router)  # Privacy routes, including /api/privacy/blocked
 app.include_router(user_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(translation_routes.router)

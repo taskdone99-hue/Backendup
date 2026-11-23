@@ -151,6 +151,71 @@ def update_my_engagement_settings(
     )
 
 
+@router.get("/api/users/blocked", response_model=schemas.PaginatedUsersResponse)
+def get_my_blocked_users(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """List accounts blocked by the authenticated user."""
+    query = (
+        db.query(models.User)
+        .join(models.UserBlock, models.UserBlock.blocked_id == models.User.id)
+        .filter(models.UserBlock.blocker_id == current_user.id)
+    )
+    total = query.count()
+    users = query.order_by(models.UserBlock.created_at.desc()).offset(offset).limit(limit).all()
+    return schemas.PaginatedUsersResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=[schemas.UserSummaryOut.model_validate(user) for user in users],
+    )
+
+
+@router.get("/api/users/me/interactions")
+def get_my_interactions(
+    content_type: str | None = Query(None, pattern="^(post|reel|video)$"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """List interaction events made by the authenticated user on content."""
+    query = db.query(models.ContentInteractionEvent).filter(
+        models.ContentInteractionEvent.actor_id == current_user.id
+    )
+    if content_type is not None:
+        query = query.filter(models.ContentInteractionEvent.content_type == content_type)
+    total = query.count()
+    rows = (
+        query.order_by(
+            models.ContentInteractionEvent.created_at.desc(),
+            models.ContentInteractionEvent.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            {
+                "id": row.id,
+                "content_type": row.content_type,
+                "content_id": row.content_id,
+                "event_type": row.event_type,
+                "watched_seconds": row.watched_seconds,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ],
+    }
+
+
 @router.get("/api/users/{user_id}", response_model=schemas.UserProfileOut)
 def get_user_profile(
     user_id: int,
