@@ -941,7 +941,10 @@ class PostDetailOut(PostOut):
         default=None,
         description="The client editor's full state, stored and returned verbatim. `null` if none was saved.",
     )
-    share_count: int = 0
+    share_count: int | None = 0
+    share_count_hidden: bool = False
+    saved_count: int | None = 0
+    save_count_hidden: bool = False
     hashtags: list[str] = []
     # All media attached to the post, in upload order. `media_url`/
     # `media_type` above keep mirroring media[0] for any client that only
@@ -1159,6 +1162,10 @@ class ReelDetailOut(ReelOut):
         description="`null` when the owner turned on `hide_like_count` and the viewer is not the owner.",
     )
     comments_count: int = 0
+    share_count: int | None = 0
+    share_count_hidden: bool = False
+    saved_count: int | None = 0
+    save_count_hidden: bool = False
     is_liked: bool = False
     like_id: int | None = None
     is_saved: bool = False
@@ -1223,6 +1230,9 @@ class UserEngagementSettingsOut(BaseModel):
         False, description="Hide the comment thread on all my posts and reels from other users"
     )
     hide_share_count: bool = False
+    # hide_save_count is the preferred API name; hide_saved_count remains
+    # for backward compatibility with existing clients.
+    hide_save_count: bool = False
     hide_saved_count: bool = False
 
 
@@ -1231,11 +1241,12 @@ class UserEngagementSettingsUpdate(BaseModel):
     hide_like_count: bool | None = None
     hide_comments: bool | None = None
     hide_share_count: bool | None = None
+    hide_save_count: bool | None = None
     hide_saved_count: bool | None = None
 
     @model_validator(mode="after")
     def validate_fields(self):
-        sent = self.model_fields_set & {"hide_like_count", "hide_comments", "hide_share_count", "hide_saved_count"}
+        sent = self.model_fields_set & {"hide_like_count", "hide_comments", "hide_share_count", "hide_save_count", "hide_saved_count"}
         if not sent:
             raise ValueError("Send hide_like_count and/or hide_comments")
         for name in sent:

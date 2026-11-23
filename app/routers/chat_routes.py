@@ -252,15 +252,18 @@ def _to_message_out(
             .first()
         )
         if original is not None:
-            out.reply_to = schemas.MessageRepliedToOut(
-                id=original.id,
-                sender_id=original.sender_id,
-                content="This message was deleted" if original.is_deleted else original.content,
-                media_type=original.media_type,
-                is_deleted=original.is_deleted,
-                is_reel_share=original.shared_reel_id is not None and not original.is_deleted,
-                is_post_share=original.shared_post_id is not None and not original.is_deleted,
-            )
+            # A deleted original should not leave a "message deleted" stub
+            # in the reply preview. Keep the reply itself, but omit its preview.
+            if not original.is_deleted:
+                out.reply_to = schemas.MessageRepliedToOut(
+                    id=original.id,
+                    sender_id=original.sender_id,
+                    content=original.content,
+                    media_type=original.media_type,
+                    is_deleted=False,
+                    is_reel_share=original.shared_reel_id is not None,
+                    is_post_share=original.shared_post_id is not None,
+                )
 
     out.reactions = [
         schemas.MessageReactionOut(user_id=r.user_id, emoji=r.emoji) for r in message.reactions
@@ -804,7 +807,10 @@ def get_messages(
     _get_conversation_or_404(db, conversation_id)
     _require_participant(db, conversation_id, current_user.id)
 
-    query = db.query(models.Message).filter(models.Message.conversation_id == conversation_id)
+    query = db.query(models.Message).filter(
+        models.Message.conversation_id == conversation_id,
+        models.Message.is_deleted.is_(False),
+    )
     total = query.count()
     # Most recent first, same convention as every other paginated feed here.
     messages = (
@@ -858,6 +864,7 @@ def get_conversation_media(
 
     query = db.query(models.Message).filter(
         models.Message.conversation_id == conversation_id,
+        models.Message.is_deleted.is_(False),
         models.Message.media_url.isnot(None),
     )
     if media_type is not None:

@@ -110,7 +110,9 @@ def get_my_engagement_settings(current_user: models.User = Depends(get_current_u
     """
     return schemas.UserEngagementSettingsOut(
         hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments,
-        hide_share_count=current_user.hide_share_count, hide_saved_count=current_user.hide_saved_count
+        hide_share_count=current_user.hide_share_count,
+        hide_save_count=current_user.hide_saved_count,
+        hide_saved_count=current_user.hide_saved_count,
     )
 
 
@@ -143,11 +145,15 @@ def update_my_engagement_settings(
     for field in ("hide_like_count", "hide_comments", "hide_share_count", "hide_saved_count"):
         if field in updates:
             setattr(current_user, field, updates[field])
+    if "hide_save_count" in updates:
+        current_user.hide_saved_count = updates["hide_save_count"]
     db.commit()
     db.refresh(current_user)
     return schemas.UserEngagementSettingsOut(
         hide_like_count=current_user.hide_like_count, hide_comments=current_user.hide_comments,
-        hide_share_count=current_user.hide_share_count, hide_saved_count=current_user.hide_saved_count
+        hide_share_count=current_user.hide_share_count,
+        hide_save_count=current_user.hide_saved_count,
+        hide_saved_count=current_user.hide_saved_count,
     )
 
 

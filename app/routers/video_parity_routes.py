@@ -31,17 +31,17 @@ def _public_clause(user_id: int):
     return (models.Video.visibility == "public") | (models.Video.user_id == user_id)
 
 
-def _page(db, query, limit, offset):
+def _page(db, query, limit, offset, viewer_id):
     total = query.count()
     rows = query.order_by(models.Video.created_at.desc(), models.Video.id.desc()).offset(offset).limit(limit).all()
-    return {"total": total, "limit": limit, "offset": offset, "items": [_out(v) for v in rows]}
+    return {"total": total, "limit": limit, "offset": offset, "items": [_out(v, db, viewer_id) for v in rows]}
 
 
 @router.get("/api/videos/home")
 def video_home(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0),
                db: Session = Depends(get_db), user=Depends(get_current_user)):
     q = db.query(models.Video).filter(_public_clause(user.id))
-    return _page(db, q, limit, offset)
+    return _page(db, q, limit, offset, user.id)
 
 
 @router.get("/api/videos/feed")
@@ -49,7 +49,7 @@ def video_feed(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0
                db: Session = Depends(get_db), user=Depends(get_current_user)):
     # Chronological public feed; private videos are visible only to their owner.
     q = db.query(models.Video).filter(_public_clause(user.id))
-    return _page(db, q, limit, offset)
+    return _page(db, q, limit, offset, user.id)
 
 
 @router.get("/api/videos/trending")
@@ -59,7 +59,7 @@ def trending_videos(limit: int = Query(20, ge=1, le=100), offset: int = Query(0,
     views = db.query(models.VideoInsightEvent.video_id, func.count(models.VideoInsightEvent.id).label("views")).filter(models.VideoInsightEvent.event_type == "view").group_by(models.VideoInsightEvent.video_id).subquery()
     q = db.query(models.Video).filter(_public_clause(user.id)).outerjoin(likes, likes.c.video_id == models.Video.id).outerjoin(views, views.c.video_id == models.Video.id)
     q = q.order_by((func.coalesce(likes.c.likes, 0) + func.coalesce(views.c.views, 0)).desc(), models.Video.created_at.desc())
-    return _page(db, q, limit, offset)
+    return _page(db, q, limit, offset, user.id)
 
 
 @router.post("/api/videos/{video_id}/save", status_code=201)
@@ -72,7 +72,9 @@ def save_video(video_id: int, db: Session = Depends(get_db), user=Depends(get_cu
         saved = models.VideoSavedItem(video_id=video_id, user_id=user.id)
         db.add(saved); db.commit(); db.refresh(saved)
     count = db.query(models.VideoSavedItem).filter_by(video_id=video_id).count()
-    return {"message": "Video saved", "video_id": video_id, "saved": True, "saves_count": count}
+    hidden = bool(video.user.hide_saved_count and user.id != video.user_id)
+    return {"message": "Video saved", "video_id": video_id, "saved": True,
+            "saves_count": None if hidden else count, "save_count_hidden": hidden}
 
 
 @router.delete("/api/videos/{video_id}/save")
@@ -82,7 +84,10 @@ def unsave_video(video_id: int, db: Session = Depends(get_db), user=Depends(get_
     if saved:
         db.delete(saved); db.commit()
     count = db.query(models.VideoSavedItem).filter_by(video_id=video_id).count()
-    return {"message": "Video unsaved", "video_id": video_id, "saved": False, "saves_count": count}
+    video = _video(db, video_id)
+    hidden = bool(video.user.hide_saved_count and user.id != video.user_id)
+    return {"message": "Video unsaved", "video_id": video_id, "saved": False,
+            "saves_count": None if hidden else count, "save_count_hidden": hidden}
 
 
 class VideoTagIn(BaseModel):
