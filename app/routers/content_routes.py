@@ -1232,6 +1232,31 @@ def get_trending_reels(
     return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
 
 
+@reels_router.get("/{reel_id}/audience-options")
+def get_reel_audience_options(
+    reel_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Choices used by the Share Reel audience picker."""
+    reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
+    if reel is None:
+        raise HTTPException(status_code=404, detail="Reel not found")
+    if reel.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only manage your own reels")
+    return {
+        "audiences": [
+            {"value": "everyone", "label": "Everyone"},
+            {"value": "followers", "label": "Followers"},
+            {"value": "close_friends", "label": "Close Friends"},
+        ],
+        "age_restrictions": [
+            {"value": "below_18", "label": "All ages"},
+            {"value": "18_plus", "label": "18+"},
+        ],
+    }
+
+
 @reels_router.get("/{reel_id}", response_model=schemas.ReelDetailOut)
 def get_reel(
     reel_id: int,

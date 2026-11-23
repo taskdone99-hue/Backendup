@@ -19,7 +19,6 @@ from app.services.media_service import (
 )
 
 router = APIRouter(prefix="/api/videos", tags=["long-form videos"])
-VIDEO_MIN_SECONDS = 300
 VIDEO_MAX_SECONDS = 420
 VIDEO_MAX_BYTES = 500 * 1024 * 1024
 
@@ -92,10 +91,10 @@ def _validate_video_asset(url: str) -> tuple[Path, dict]:
     if metadata is None:
         raise HTTPException(status_code=400, detail="Could not read video metadata; ensure ffprobe is installed")
     duration = metadata["duration_seconds"]
-    if not VIDEO_MIN_SECONDS <= duration <= VIDEO_MAX_SECONDS:
-        raise HTTPException(status_code=400, detail="Long-form videos must be between 300 and 420 seconds (5–7 minutes)")
-    if metadata["width"] < metadata["height"]:
-        raise HTTPException(status_code=400, detail="Long-form videos must be horizontal (width must be greater than or equal to height)")
+    if duration > VIDEO_MAX_SECONDS:
+        raise HTTPException(status_code=400, detail="Videos must be no longer than 420 seconds (7 minutes)")
+    if metadata["width"] <= metadata["height"]:
+        raise HTTPException(status_code=400, detail="Videos must be horizontal (width must be greater than height)")
     return path, metadata
 
 
@@ -122,42 +121,9 @@ def _owned(db: Session, video_id: int, user: models.User) -> models.Video:
     return row
 
 
-@router.post("/upload", status_code=status.HTTP_201_CREATED)
-def upload_video_media(
-    file: UploadFile = File(..., description="5–7 minute horizontal video from gallery"),
-    thumbnail: UploadFile | None = File(default=None, description="Optional custom poster image"),
-    current_user: models.User = Depends(get_current_user),
-):
-    url, kind = save_upload_file(file, "videos", allow_video=True, max_video_bytes=VIDEO_MAX_BYTES)
-    if kind != "video":
-        delete_media_file(url)
-        raise HTTPException(status_code=400, detail="File must be a video")
-    try:
-        path, metadata = _validate_video_asset(url)
-        thumb_url = None
-        if thumbnail is not None and thumbnail.filename:
-            thumb_url, thumb_kind = save_upload_file(thumbnail, "video_thumbnails", allow_video=False)
-            if thumb_kind != "image":
-                delete_media_file(url)
-                raise HTTPException(status_code=400, detail="Thumbnail must be an image")
-        else:
-            thumb_url = generate_video_thumbnail(url, subfolder="video_thumbnails")
-        return {
-            "message": "Video media uploaded successfully",
-            "video_url": url, "thumbnail_url": thumb_url,
-            "mime_type": file.content_type or "video/mp4",
-            "file_size": path.stat().st_size, **metadata,
-            "orientation": "horizontal",
-            "aspect_ratio": f"{metadata['width']}:{metadata['height']}",
-        }
-    except Exception:
-        delete_media_file(url)
-        raise
-
-
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_video(
-    file: UploadFile = File(..., description="Upload the actual video file (MP4 recommended)"),
+    file: UploadFile = File(..., description="Upload a horizontal video up to 7 minutes (MP4 recommended)"),
     title: str = Form(..., min_length=1, max_length=150),
     description: str | None = Form(default=None, max_length=5000),
     thumbnail: UploadFile | None = File(default=None, description="Optional custom thumbnail; generated automatically if omitted"),
@@ -273,6 +239,27 @@ def my_videos(
     total = query.count()
     rows = query.order_by(models.Video.created_at.desc(), models.Video.id.desc()).offset(offset).limit(limit).all()
     return {"total": total, "limit": limit, "offset": offset, "items": [_out(row) for row in rows]}
+
+
+@router.get("/{video_id}/audience-options")
+def get_video_audience_options(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Choices used by the Share Video audience picker."""
+    _owned(db, video_id, current_user)
+    return {
+        "audiences": [
+            {"value": "everyone", "label": "Everyone"},
+            {"value": "followers", "label": "Followers"},
+            {"value": "close_friends", "label": "Close Friends"},
+        ],
+        "age_restrictions": [
+            {"value": "below_18", "label": "All ages"},
+            {"value": "18_plus", "label": "18+"},
+        ],
+    }
 
 
 @router.get("/{video_id}")
