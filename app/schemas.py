@@ -190,6 +190,7 @@ class RegisterRequest(BaseModel):
     username: str = Field(description="Unique username, 3-30 characters (letters, numbers, '.', '_')")
     identifier: str = Field(description="Email address or E.164 phone number")
     password: str
+    confirm_password: str = Field(description="Must match password; used only for validation")
     date_of_birth: date
     gender: Gender | None = Field(
         default=None, description="Optional — male, female, non_binary, or prefer_not_to_say"
@@ -215,6 +216,12 @@ class RegisterRequest(BaseModel):
     @classmethod
     def validate_dob(cls, v: date) -> date:
         return _validate_dob(v)
+
+    @model_validator(mode="after")
+    def validate_password_confirmation(self) -> "RegisterRequest":
+        if self.password != self.confirm_password:
+            raise ValueError("Password and confirm password do not match")
+        return self
 
 
 class LoginRequest(BaseModel):
