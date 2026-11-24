@@ -1524,6 +1524,8 @@ class CommentOut(BaseModel):
     user: UserSummaryOut | None = None
     parent_id: int | None
     content: str
+    media_url: str | None = None
+    media_type: str | None = None
     created_at: datetime
     likes_count: int = 0
     replies_count: int = 0

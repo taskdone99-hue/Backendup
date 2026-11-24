@@ -3,7 +3,7 @@ Comments (on posts) and the generic like system (posts, reels, and comments
 can all be liked through the same /api/likes endpoints — see models.Like).
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from app import models, schemas
 from app.auth import get_current_user, get_current_user_optional
 from app.database import get_db
+from app.services.media_service import save_upload_file
 from app.services import engagement
 from app.services.mention_service import sync_mentions
 from app.services.notification_service import notify_user
@@ -158,6 +159,7 @@ def _enforce_owner_comment_settings(db: Session, owner_id: int, commenter_id: in
         "following": follows_owner,
         "people_you_follow": follows_owner,
         "followers": owner_follows,
+        "your_followers": owner_follows,
         "mutuals": follows_owner and owner_follows,
         "people_you_follow_and_your_followers": follows_owner and owner_follows,
     }.get(audience, False)
@@ -189,6 +191,49 @@ async def add_comment(
     db.refresh(comment)
     await _notify_comment_mentions(db, comment, current_user)
     return _to_comment_out(db, comment, current_user.id)
+
+
+async def _create_media_comment(db: Session, owner_id: int, post_id: int | None, reel_id: int | None,
+                                current_user: models.User, media: UploadFile, caption: str):
+    content_type = (media.content_type or "").lower()
+    is_gif = content_type == "image/gif"
+    if content_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP, and GIF comments are supported")
+    settings = db.query(models.UserCommentSettings).filter_by(user_id=owner_id).first()
+    if is_gif and settings and not settings.allow_gif_comments:
+        raise HTTPException(status_code=403, detail="GIF comments are disabled")
+    if not is_gif and settings and not settings.allow_photo_comments:
+        raise HTTPException(status_code=403, detail="Photo comments are disabled")
+    _enforce_owner_comment_settings(db, owner_id, current_user.id)
+    media_url, kind = save_upload_file(media, "comments")
+    comment = models.Comment(post_id=post_id, reel_id=reel_id, user_id=current_user.id,
+                             content=caption.strip(), media_url=media_url,
+                             media_type="gif" if is_gif else "photo")
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    await _notify_comment_mentions(db, comment, current_user)
+    return _to_comment_out(db, comment, current_user.id)
+
+
+@router.post("/api/posts/{post_id}/comments/media", response_model=schemas.CommentOut, status_code=status.HTTP_201_CREATED)
+async def add_post_media_comment(post_id: int, media: UploadFile = File(...), caption: str = Form(""),
+                                 db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    post = _get_post_or_404(db, post_id)
+    if is_blocked(db, current_user.id, post.user_id):
+        raise HTTPException(status_code=403, detail="Not found")
+    return await _create_media_comment(db, post.user_id, post_id, None, current_user, media, caption)
+
+
+@router.post("/api/reels/{reel_id}/comments/media", response_model=schemas.CommentOut, status_code=status.HTTP_201_CREATED)
+async def add_reel_media_comment(reel_id: int, media: UploadFile = File(...), caption: str = Form(""),
+                                 db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    reel = _get_reel_or_404(db, reel_id)
+    if is_blocked(db, current_user.id, reel.user_id):
+        raise HTTPException(status_code=403, detail="Not found")
+    require_reel_viewable(db, reel, current_user.id)
+    require_comments_open(reel)
+    return await _create_media_comment(db, reel.user_id, None, reel_id, current_user, media, caption)
 
 
 @router.get("/api/posts/{post_id}/comments", response_model=schemas.PaginatedCommentsResponse)
@@ -278,6 +323,13 @@ async def reply_to_comment(
 ):
     parent = _get_comment_or_404(db, comment_id)
     _guard_reel_comment(db, parent, current_user.id, writing=True)
+    owner_id = None
+    if parent.post_id is not None:
+        owner_id = _get_post_or_404(db, parent.post_id).user_id
+    elif parent.reel_id is not None:
+        owner_id = _get_reel_or_404(db, parent.reel_id).user_id
+    if owner_id is not None:
+        _enforce_owner_comment_settings(db, owner_id, current_user.id)
     if parent.parent_id is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Replies can only be made to top-level comments")

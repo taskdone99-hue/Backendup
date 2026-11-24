@@ -130,7 +130,8 @@ app.include_router(comment_routes.router)
 app.include_router(video_parity_routes.router)  # Static Video routes before /{video_id}
 app.include_router(long_video_routes.router)
 app.include_router(video_engagement_routes.router)
-app.include_router(video_routes.router)  # Legacy Reel-specific upload settings: /api/reel-tools
+app.include_router(video_routes.router)
+app.include_router(video_routes.videos_router)  # Legacy Reel-specific upload settings: /api/reel-tools
 app.include_router(sticker_routes.router)
 app.include_router(highlight_routes.router)
 app.include_router(saved_routes.router)

@@ -396,10 +396,6 @@ async def create_post(
             db, current_user, "post", SimpleNamespace(user=current_user), tag_ids
         )
 
-    source = source.strip().lower()
-    if source not in {"gallery", "camera"}:
-        raise HTTPException(status_code=400, detail="source must be gallery or camera")
-
     if location_latitude is not None and not (-90 <= location_latitude <= 90):
         raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
     if location_longitude is not None and not (-180 <= location_longitude <= 180):

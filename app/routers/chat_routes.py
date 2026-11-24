@@ -808,9 +808,8 @@ def get_messages(
     _require_participant(db, conversation_id, current_user.id)
 
     query = db.query(models.Message).filter(
-        models.Message.conversation_id == conversation_id,
-        models.Message.is_deleted.is_(False),
-    )
+    models.Message.conversation_id == conversation_id,
+)
     total = query.count()
     # Most recent first, same convention as every other paginated feed here.
     messages = (

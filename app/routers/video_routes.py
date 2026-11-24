@@ -46,6 +46,10 @@ from app.services.location_service import find_or_create_location
 from app.services import editor_state_service, video_settings_service as vss
 
 router = APIRouter(prefix="/api/reel-tools", tags=["legacy reel upload settings"])
+videos_router = APIRouter(
+    prefix="/api/videos",
+    tags=["Video Settings"]
+)
 
 
 def _get_owned_video_or_404(
@@ -113,6 +117,7 @@ def search_reel_collaborators(
     ]
 
 
+@videos_router.post("/upload", response_model=schemas.ReelDetailOut, status_code=status.HTTP_201_CREATED)
 @router.post("/upload", response_model=schemas.ReelDetailOut, status_code=status.HTTP_201_CREATED)
 def upload_video(
     file: UploadFile,
@@ -141,6 +146,7 @@ def upload_video(
     return _to_reel_detail(db, video, current_user.id)
 
 
+@videos_router.post("/{video_id}/thumbnail", response_model=schemas.ThumbnailUploadResponse)
 @router.post("/{video_id}/thumbnail", response_model=schemas.ThumbnailUploadResponse)
 def upload_thumbnail(
     video_id: int,
@@ -155,6 +161,7 @@ def upload_thumbnail(
     return schemas.ThumbnailUploadResponse(message="Thumbnail updated", thumbnail_url=url)
 
 
+@videos_router.put("/{video_id}/metadata", response_model=schemas.ReelDetailOut)
 @router.put("/{video_id}/metadata", response_model=schemas.ReelDetailOut)
 def update_video_metadata(
     video_id: int,
@@ -303,6 +310,10 @@ def _detail(db: Session, video: models.Reel, current_user: models.User) -> schem
     return _to_reel_detail(db, video, current_user.id)
 
 
+@videos_router.put(
+    "/{video_id}/language",
+    response_model=schemas.VideoLanguageResponse,
+)
 @router.put(
     "/{video_id}/language",
     response_model=schemas.VideoLanguageResponse,
@@ -331,7 +342,10 @@ def update_video_language(
         video=_detail(db, video, current_user),
     )
 
-
+@videos_router.put(
+    "/{video_id}/ai-content",
+    response_model=schemas.VideoAIContentResponse,
+)
 @router.put(
     "/{video_id}/ai-content",
     response_model=schemas.VideoAIContentResponse,
@@ -358,6 +372,11 @@ def update_video_ai_content(
     )
 
 
+@videos_router.put(
+    "/{video_id}/engagement-settings",
+    response_model=schemas.VideoEngagementSettingsResponse,
+    summary="Comments on/off, hide like count, hide comments",
+)
 @router.put(
     "/{video_id}/engagement-settings",
     response_model=schemas.VideoEngagementSettingsResponse,
@@ -401,6 +420,11 @@ def update_video_engagement_settings(
     )
 
 
+@videos_router.put(
+    "/{video_id}/audience",
+    response_model=schemas.VideoAudienceResponse,
+    summary="Set who can view the video (everyone, followers, close_friends)",
+)
 @router.put(
     "/{video_id}/audience",
     response_model=schemas.VideoAudienceResponse,
@@ -427,6 +451,11 @@ def update_video_audience(
     )
 
 
+@videos_router.put(
+    "/{video_id}/age-restriction",
+    response_model=schemas.VideoAgeRestrictionResponse,
+    summary="Set the video's age restriction",
+)
 @router.put(
     "/{video_id}/age-restriction",
     response_model=schemas.VideoAgeRestrictionResponse,
@@ -457,6 +486,11 @@ def update_video_age_restriction(
         video=_detail(db, video, current_user),
     )
 
+@videos_router.put(
+    "/{video_id}/visibility",
+    response_model=schemas.VideoVisibilityResponse,
+    summary="Set who can see the video (public, private, members)",
+)
 @router.put(
     "/{video_id}/visibility",
     response_model=schemas.VideoVisibilityResponse,
@@ -492,6 +526,11 @@ def update_video_visibility(
     )
 
 
+@videos_router.put(
+    "/{video_id}/schedule",
+    response_model=schemas.VideoScheduleResponse,
+    summary="Schedule the video to go live at a future time",
+)
 @router.put(
     "/{video_id}/schedule",
     response_model=schemas.VideoScheduleResponse,
@@ -552,6 +591,11 @@ def update_video_schedule(
     )
 
 
+@videos_router.delete(
+    "/{video_id}/schedule",
+    response_model=schemas.VideoScheduleResponse,
+    summary="Cancel the schedule",
+)
 @router.delete(
     "/{video_id}/schedule",
     response_model=schemas.VideoScheduleResponse,
@@ -796,6 +840,7 @@ def _owned_automation_video(db: Session, video_id: int, current_user: models.Use
     return _get_owned_video_or_404(db, video_id, current_user)
 
 
+@videos_router.put("/{video_id}/comment-dm-automation", response_model=schemas.CommentDMAutomationOut)
 @router.put("/{video_id}/comment-dm-automation", response_model=schemas.CommentDMAutomationOut)
 def upsert_comment_dm_automation(
     video_id: int, payload: schemas.CommentDMAutomationUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user),
@@ -812,6 +857,7 @@ def upsert_comment_dm_automation(
     return automation
 
 
+@videos_router.get("/{video_id}/comment-dm-automation", response_model=schemas.CommentDMAutomationOut | None)
 @router.get("/{video_id}/comment-dm-automation", response_model=schemas.CommentDMAutomationOut | None)
 def get_comment_dm_automation(
     video_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user),

@@ -1201,6 +1201,8 @@ class Comment(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True, index=True)
     content = Column(String(2200), nullable=False)
+    media_url = Column(String(1000), nullable=True)
+    media_type = Column(String(20), nullable=True)  # photo or gif
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     post = relationship("Post", foreign_keys=[post_id])
@@ -1665,6 +1667,65 @@ class ConversationParticipant(Base):
 
     conversation = relationship("Conversation", back_populates="participants")
     user = relationship("User", foreign_keys=[user_id])
+
+class ConversationDisappearingSetting(Base):
+    __tablename__ = "conversation_disappearing_settings"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            name="uq_conversation_disappearing_setting",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(
+        Integer,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    duration_seconds = Column(Integer, nullable=False, default=0)
+    updated_by = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class ConversationThemePreference(Base):
+    __tablename__ = "conversation_theme_preferences"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "user_id",
+            name="uq_conversation_theme_user",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(
+        Integer,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    theme = Column(String(30), nullable=False, default="default")
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
 
 class Message(Base):

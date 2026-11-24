@@ -1668,6 +1668,28 @@ def reply_to_story(
             ),
         )
 
+    story_settings = db.query(models.UserCommentSettings).filter_by(user_id=story.user_id).first()
+    story_audience = story_settings.allow_story_comments_from if story_settings else "people_you_follow"
+    if story_audience == "off":
+        raise HTTPException(status_code=403, detail="Story replies are turned off")
+    if story_audience != "everyone":
+        viewer_follows_owner = db.query(models.Follow).filter_by(
+            follower_id=current_user.id, following_id=story.user_id
+        ).first() is not None
+        owner_follows_viewer = db.query(models.Follow).filter_by(
+            follower_id=story.user_id, following_id=current_user.id
+        ).first() is not None
+        allowed = {
+            "people_you_follow": viewer_follows_owner,
+            "following": viewer_follows_owner,
+            "your_followers": owner_follows_viewer,
+            "followers": owner_follows_viewer,
+            "people_you_follow_and_your_followers": viewer_follows_owner and owner_follows_viewer,
+            "mutuals": viewer_follows_owner and owner_follows_viewer,
+        }.get(story_audience, False)
+        if not allowed:
+            raise HTTPException(status_code=403, detail="You are not allowed to reply to this story")
+
     conversation = _get_or_create_direct_conversation(
         db,
         current_user.id,
