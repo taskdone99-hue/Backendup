@@ -2485,10 +2485,23 @@ class UserCommentSettings(Base):
     __tablename__ = "user_comment_settings"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
-    allow_comments_from = Column(String(20), nullable=False, default="everyone", server_default="everyone")
+    allow_comments_from = Column(String(40), nullable=False, default="everyone", server_default="everyone")
+    allow_story_comments_from = Column(String(30), nullable=False, default="people_you_follow", server_default="people_you_follow")
+    allow_gif_comments = Column(Boolean, nullable=False, default=True, server_default=expression.true())
+    allow_photo_comments = Column(Boolean, nullable=False, default=True, server_default=expression.true())
     filter_offensive_comments = Column(Boolean, nullable=False, default=False, server_default=expression.false())
     manual_filter_enabled = Column(Boolean, nullable=False, default=False, server_default=expression.false())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class UserCommentBlock(Base):
+    """Accounts whose comments are blocked on this user's content."""
+    __tablename__ = "user_comment_blocks"
+    __table_args__ = (UniqueConstraint("owner_id", "blocked_user_id", name="uq_user_comment_block"),)
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    blocked_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class UserMentionSettings(Base):

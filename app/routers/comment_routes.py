@@ -133,6 +133,38 @@ async def _notify_comment_mentions(db: Session, comment: models.Comment, author:
 
 
 # ==========================================================================
+def _enforce_owner_comment_settings(db: Session, owner_id: int, commenter_id: int) -> None:
+    """Apply the content owner's comment audience and blocked-commenter list."""
+    if owner_id == commenter_id:
+        return
+    blocked = db.query(models.UserCommentBlock).filter_by(
+        owner_id=owner_id, blocked_user_id=commenter_id
+    ).first()
+    if blocked:
+        raise HTTPException(status_code=403, detail="You are not allowed to comment on this content")
+    settings = db.query(models.UserCommentSettings).filter_by(user_id=owner_id).first()
+    audience = settings.allow_comments_from if settings else "everyone"
+    if audience == "everyone":
+        return
+    if audience == "off":
+        raise HTTPException(status_code=403, detail="Comments are turned off for this account")
+    follows_owner = db.query(models.Follow).filter_by(
+        follower_id=commenter_id, following_id=owner_id
+    ).first() is not None
+    owner_follows = db.query(models.Follow).filter_by(
+        follower_id=owner_id, following_id=commenter_id
+    ).first() is not None
+    allowed = {
+        "following": follows_owner,
+        "people_you_follow": follows_owner,
+        "followers": owner_follows,
+        "mutuals": follows_owner and owner_follows,
+        "people_you_follow_and_your_followers": follows_owner and owner_follows,
+    }.get(audience, False)
+    if not allowed:
+        raise HTTPException(status_code=403, detail="You are not allowed to comment on this content")
+
+
 # Comments
 # ==========================================================================
 
@@ -150,6 +182,7 @@ async def add_comment(
     post = _get_post_or_404(db, post_id)
     if is_blocked(db, current_user.id, post.user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not found")
+    _enforce_owner_comment_settings(db, post.user_id, current_user.id)
     comment = models.Comment(post_id=post_id, user_id=current_user.id, content=payload.content)
     db.add(comment)
     db.commit()
@@ -200,6 +233,7 @@ async def add_reel_comment(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not found")
     require_reel_viewable(db, reel, current_user.id)
     require_comments_open(reel)
+    _enforce_owner_comment_settings(db, reel.user_id, current_user.id)
     comment = models.Comment(reel_id=reel_id, user_id=current_user.id, content=payload.content)
     db.add(comment)
     db.commit()
