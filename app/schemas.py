@@ -1280,12 +1280,12 @@ class TagSettingsUpdate(BaseModel):
 
 
 class TaggedItemOut(BaseModel):
-    """One entry in a user's Tagged tab: exactly one of `post` / `reel` is set,
-    matching `content_type`."""
+    """One entry in a user's Tagged tab; exactly one content payload is set."""
     content_type: str
     tagged_at: datetime
     post: PostDetailOut | None = None
     reel: ReelDetailOut | None = None
+    video: dict[str, Any] | None = None
 
 
 class PaginatedTaggedResponse(BaseModel):

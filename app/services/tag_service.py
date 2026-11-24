@@ -1,7 +1,7 @@
 """
-Shared rules for tagging users on posts, reels and stories, so every path
+Shared rules for tagging users on posts, reels, stories and long videos, so every path
 that creates a tag (POST /api/posts/{id}/tags, /api/reels/{id}/tags,
-/api/stories/{id}/tags, and the `tag_user_ids` field on post create/update)
+/api/stories/{id}/tags, /api/videos/{id}/tags, and the `tag_user_ids` field on post create/update)
 enforces the same thing:
 
   * the tagged user exists;
@@ -29,18 +29,20 @@ from app import models
 from app.services.notification_service import notify_user
 from app.services.privacy_service import is_blocked, is_close_friend
 
-CONTENT_TYPES = ("post", "reel", "story")
+CONTENT_TYPES = ("post", "reel", "story", "video")
 
 TAG_MODEL = {
     "post": models.PostTag,
     "reel": models.ReelTag,
     "story": models.StoryTag,
+    "video": models.VideoTag,
 }
-_FK_NAME = {"post": "post_id", "reel": "reel_id", "story": "story_id"}
+_FK_NAME = {"post": "post_id", "reel": "reel_id", "story": "story_id", "video": "video_id"}
 CONTENT_MODEL = {
     "post": models.Post,
     "reel": models.Reel,
     "story": models.Story,
+    "video": models.Video,
 }
 
 TAGGING_DENIED = "Can't tag one or more of these users"
@@ -85,6 +87,8 @@ def can_view_content(db: Session, content_type: str, content, user_id: int) -> b
     if is_blocked(db, owner.id, user_id):
         return False
     if owner.is_private and not _follows(db, user_id, owner.id):
+        return False
+    if content_type == "video" and content.visibility != "public" and user_id != owner.id:
         return False
     if (
         content_type == "story"

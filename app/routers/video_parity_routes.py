@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.auth import get_current_user
 from app.database import get_db
+from app.services import tag_service
 from app.routers.long_video_routes import _out
 
 router = APIRouter(tags=["Videos", "Video Insights"])
@@ -97,25 +98,25 @@ class VideoTagIn(BaseModel):
 
 
 @router.post("/api/videos/{video_id}/tags", status_code=201)
-def add_video_tag(video_id: int, payload: VideoTagIn, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    _owned(db, video_id, user)
-    target = db.query(models.User).filter(models.User.id == payload.user_id).first()
-    if target is None:
-        raise HTTPException(404, "User to tag not found")
+async def add_video_tag(video_id: int, payload: VideoTagIn, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    video = _owned(db, video_id, user)
+    created = tag_service.add_tags(db, "video", video, user,
+                                   [(payload.user_id, payload.x_position, payload.y_position)])
+    db.commit()
+    await tag_service.notify_new_tags(db, "video", video.id, user, created)
     row = db.query(models.VideoTag).filter_by(video_id=video_id, user_id=payload.user_id).first()
-    if row is None:
-        row = models.VideoTag(video_id=video_id, user_id=payload.user_id)
-        db.add(row)
-    row.x_position, row.y_position = payload.x_position, payload.y_position
-    db.commit(); db.refresh(row)
-    return {"id": row.id, "video_id": video_id, "user_id": row.user_id, "x_position": row.x_position, "y_position": row.y_position, "tagged_at": row.tagged_at}
+    return {"id": row.id, "video_id": video_id, "user_id": row.user_id,
+            "x_position": row.x_position, "y_position": row.y_position,
+            "tagged_at": row.tagged_at, "is_approved": row.is_approved}
 
 
 @router.get("/api/videos/{video_id}/tags")
 def list_video_tags(video_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
     _video(db, video_id)
-    rows = db.query(models.VideoTag).filter_by(video_id=video_id).order_by(models.VideoTag.tagged_at.asc()).all()
-    return {"total": len(rows), "items": [{"id": r.id, "video_id": r.video_id, "user_id": r.user_id, "x_position": r.x_position, "y_position": r.y_position, "tagged_at": r.tagged_at} for r in rows]}
+    rows = db.query(models.VideoTag).filter_by(video_id=video_id).filter(
+        (models.VideoTag.is_approved.is_(True)) | (models.Video.user_id == user.id)
+    ).join(models.Video, models.Video.id == models.VideoTag.video_id).order_by(models.VideoTag.tagged_at.asc()).all()
+    return {"total": len(rows), "items": [{"id": r.id, "video_id": r.video_id, "user_id": r.user_id, "x_position": r.x_position, "y_position": r.y_position, "tagged_at": r.tagged_at, "is_approved": r.is_approved} for r in rows]}
 
 
 @router.delete("/api/videos/{video_id}/tags/{user_id}")

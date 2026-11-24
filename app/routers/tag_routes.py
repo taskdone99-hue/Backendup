@@ -12,7 +12,7 @@ app/services/tag_service.py):
   Hide           POST/DELETE /api/tags/{type}/{id}/hide   hide from your profile
   Story tags     POST/GET/DELETE /api/stories/{id}/tags
 
-`{type}` is post | reel | story.
+`{type}` is post | reel | story | video.
 """
 
 from typing import Literal
@@ -38,7 +38,7 @@ from app.services.privacy_service import blocked_user_ids, is_blocked
 
 router = APIRouter(tags=["tags"])
 
-ContentType = Literal["post", "reel", "story"]
+ContentType = Literal["post", "reel", "story", "video"]
 
 
 # ==========================================================================
@@ -201,7 +201,7 @@ def search_taggable_users(
 @router.get("/api/users/{user_id}/tagged", response_model=schemas.PaginatedTaggedResponse)
 def get_user_tagged(
     user_id: int,
-    content_type: Literal["all", "post", "reel"] = Query("all"),
+    content_type: Literal["all", "post", "reel", "video"] = Query("all"),
     include_hidden: bool = Query(
         False, description="Only honored when viewing your own tagged feed"
     ),
@@ -222,12 +222,13 @@ def get_user_tagged(
     _require_content_visible(db, target, viewer_id)
     show_hidden = include_hidden and viewer_id == target.id
 
-    def _base(Tag, Content):
-        fk = tag_service.fk_column("post" if Content is models.Post else "reel")
+    def _base(ctype: str):
+        Tag = tag_service.TAG_MODEL[ctype]
+        Content = tag_service.CONTENT_MODEL[ctype]
         query = (
             db.query(Content.id, Tag.tagged_at, Tag.id.label("tag_id"))
             .select_from(Tag)
-            .join(Content, Content.id == fk)
+            .join(Content, Content.id == tag_service.fk_column(ctype))
             .join(models.User, models.User.id == Content.user_id)
             .filter(
                 Tag.user_id == user_id,
@@ -236,17 +237,16 @@ def get_user_tagged(
             )
             .filter(_visible_authors_clause(db, viewer_id))
         )
-        if Content is models.Reel:
+        if ctype == "reel":
             query = query.filter(visible_reels_clause(db, viewer_id))
+        elif ctype == "video":
+            query = query.filter(or_(models.Video.visibility == "public", models.Video.user_id == viewer_id))
         if not show_hidden:
             query = query.filter(Tag.hidden_from_profile.is_(False))
         return query
 
-    sources = []
-    if content_type in ("all", "post"):
-        sources.append(("post", _base(models.PostTag, models.Post)))
-    if content_type in ("all", "reel"):
-        sources.append(("reel", _base(models.ReelTag, models.Reel)))
+    sources = [(ctype, _base(ctype)) for ctype in ("post", "reel", "video")
+               if content_type in ("all", ctype)]
 
     total = 0
     entries = []  # (tagged_at, tag_id, type, content_id)
@@ -264,12 +264,14 @@ def get_user_tagged(
 
     post_ids = [e[3] for e in page if e[2] == "post"]
     reel_ids = [e[3] for e in page if e[2] == "reel"]
+    video_ids = [e[3] for e in page if e[2] == "video"]
     posts = {
         p.id: p for p in db.query(models.Post).filter(models.Post.id.in_(post_ids)).all()
     } if post_ids else {}
     reels = {
         r.id: r for r in db.query(models.Reel).filter(models.Reel.id.in_(reel_ids)).all()
     } if reel_ids else {}
+    videos = {v.id: v for v in db.query(models.Video).filter(models.Video.id.in_(video_ids)).all()} if video_ids else {}
 
     items = []
     for tagged_at, _tag_id, ctype, cid in page:
@@ -278,20 +280,31 @@ def get_user_tagged(
                 content_type="post", tagged_at=tagged_at,
                 post=_to_post_detail(db, posts[cid], viewer_id),
             ))
-        else:
+        elif ctype == "reel":
             items.append(schemas.TaggedItemOut(
                 content_type="reel", tagged_at=tagged_at,
                 reel=_to_reel_detail(db, reels[cid], viewer_id),
+            ))
+        else:
+            video = videos[cid]
+            items.append(schemas.TaggedItemOut(
+                content_type="video", tagged_at=tagged_at,
+                video={"id": video.id, "user_id": video.user_id, "title": video.title,
+                       "description": video.description, "video_url": video.video_url,
+                       "thumbnail_url": video.thumbnail_url, "media_type": "video",
+                       "duration_seconds": video.duration_seconds,
+                       "user": schemas.UserSummaryOut.model_validate(video.user),
+                       "created_at": video.created_at},
             ))
     return schemas.PaginatedTaggedResponse(total=total, limit=limit, offset=offset, items=items)
 
 
 def _order_col(ctype: str):
-    return (models.PostTag if ctype == "post" else models.ReelTag).tagged_at
+    return tag_service.TAG_MODEL[ctype].tagged_at
 
 
 def _tag_id_col(ctype: str):
-    return (models.PostTag if ctype == "post" else models.ReelTag).id
+    return tag_service.TAG_MODEL[ctype].id
 
 
 # ==========================================================================
@@ -303,7 +316,7 @@ def _preview_url(content_type: str, content) -> str | None:
         if content.media_items:
             return content.media_items[0].media_url
         return content.media_url
-    if content_type == "reel":
+    if content_type in ("reel", "video"):
         return content.thumbnail_url or content.video_url
     return content.media_url
 
@@ -321,7 +334,7 @@ def get_pending_tags(
     blocked = set(blocked_user_ids(db, current_user.id))
     entries = []
 
-    for ctype in ("post", "reel"):
+    for ctype in ("post", "reel", "video"):
         Tag = tag_service.TAG_MODEL[ctype]
         Content = tag_service.CONTENT_MODEL[ctype]
         rows = (
@@ -337,6 +350,15 @@ def get_pending_tags(
         .filter(models.StoryTag.user_id == current_user.id, models.StoryTag.is_approved.is_(False))
         .all()
     )
+    pending_video_tags = (
+        db.query(models.VideoTag)
+        .filter(models.VideoTag.user_id == current_user.id, models.VideoTag.is_approved.is_(False))
+        .all()
+    )
+    if pending_video_tags:
+        video_map = {v.id: v for v in db.query(models.Video).filter(models.Video.id.in_([t.video_id for t in pending_video_tags])).all()}
+        entries.extend((t, "video", video_map[t.video_id]) for t in pending_video_tags if t.video_id in video_map)
+
     if pending_story_tags:
         active = {
             s.id: s

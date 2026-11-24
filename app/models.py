@@ -2496,6 +2496,7 @@ class UserMentionSettings(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
     allow_mentions_from = Column(String(20), nullable=False, default="everyone", server_default="everyone")
+    allow_story_mention_boost = Column(Boolean, nullable=False, default=True, server_default=expression.true())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
@@ -2624,6 +2625,7 @@ class Video(Base):
     tags = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    user = relationship("User", foreign_keys=[user_id])
 
 
 # ---------------------------------------------------------------------------
@@ -2665,6 +2667,8 @@ class VideoTag(Base):
     x_position = Column(Float, nullable=True)
     y_position = Column(Float, nullable=True)
     tagged_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    is_approved = Column(Boolean, default=True, nullable=False, server_default=expression.true())
+    hidden_from_profile = Column(Boolean, default=False, nullable=False, server_default=expression.false())
 
 
 class VideoInsightEvent(Base):
