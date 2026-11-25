@@ -7,6 +7,7 @@ from fastapi import (
 )
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
+from pydantic import BaseModel, Field
 
 from app.database import get_db, SessionLocal
 from app import models, schemas
@@ -22,6 +23,12 @@ from app.services import chat_option_service
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 logger = logging.getLogger(__name__)
+
+
+class BulkMessageDeleteRequest(BaseModel):
+    chat_id: int = Field(gt=0)
+    message_ids: list[int] = Field(min_length=1, max_length=500)
+
 
 def _message_expiry(db: Session, conversation_id: int):
     setting = db.query(models.ConversationDisappearingSetting).filter_by(
@@ -1288,6 +1295,102 @@ async def edit_message(
     ]
     await _push_message_event(db, other_ids, message, "message_edited", message_out)
     return message_out
+
+
+@router.post("/messages/bulk-delete")
+async def bulk_delete_messages(
+    payload: BulkMessageDeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Soft-delete up to 500 of the caller's own messages in one conversation."""
+    _require_participant(db, payload.chat_id, current_user.id)
+    ids = list(dict.fromkeys(payload.message_ids))
+    messages = (
+        db.query(models.Message)
+        .filter(
+            models.Message.conversation_id == payload.chat_id,
+            models.Message.id.in_(ids),
+        )
+        .all()
+    )
+    found_ids = {message.id for message in messages}
+    if found_ids != set(ids):
+        raise HTTPException(status_code=404, detail="One or more messages were not found in this chat")
+    if any(message.sender_id != current_user.id for message in messages):
+        raise HTTPException(status_code=403, detail="You can only delete your own messages")
+
+    active_messages = [message for message in messages if not message.is_deleted]
+    now = datetime.now(timezone.utc)
+    for message in active_messages:
+        message.is_deleted = True
+        message.deleted_at = now
+        db.query(models.MessageReaction).filter(
+            models.MessageReaction.message_id == message.id
+        ).delete(synchronize_session=False)
+    db.commit()
+
+    deleted_ids = [message.id for message in active_messages]
+    other_ids = [uid for uid in _conversation_participant_ids(db, payload.chat_id) if uid != current_user.id]
+    if deleted_ids:
+        await manager.send_to_users(
+            other_ids,
+            {
+                "type": "messages_bulk_deleted",
+                "conversation_id": payload.chat_id,
+                "message_ids": deleted_ids,
+            },
+        )
+    return {
+        "success": True,
+        "message": "Messages deleted successfully",
+        "chat_id": payload.chat_id,
+        "deleted_count": len(deleted_ids),
+        "deleted_message_ids": deleted_ids,
+    }
+
+
+@router.post("/conversations/{conversation_id}/leave")
+async def leave_chat_screen(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Call when the chat screen is closed. In disappearing mode, clear all
+    conversation messages for everyone. In regular mode, preserve history."""
+    _require_participant(db, conversation_id, current_user.id)
+    setting = db.query(models.ConversationDisappearingSetting).filter_by(
+        conversation_id=conversation_id
+    ).first()
+    mode = setting.chat_mode if setting else "disappearing"
+    deleted_count = 0
+    if mode == "disappearing":
+        messages = db.query(models.Message).filter(
+            models.Message.conversation_id == conversation_id
+        ).all()
+        deleted_count = len(messages)
+        for message in messages:
+            db.delete(message)
+        db.commit()
+        participant_ids = [
+            uid for uid in _conversation_participant_ids(db, conversation_id)
+            if uid != current_user.id
+        ]
+        await manager.send_to_users(
+            participant_ids,
+            {
+                "type": "conversation_messages_cleared",
+                "conversation_id": conversation_id,
+                "reason": "disappearing_chat_left",
+            },
+        )
+    return {
+        "success": True,
+        "conversation_id": conversation_id,
+        "mode": mode,
+        "deleted_count": deleted_count,
+        "messages_cleared": mode == "disappearing",
+    }
 
 
 @router.delete("/messages/{message_id}", response_model=schemas.MessageResponse)

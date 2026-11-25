@@ -1685,6 +1685,7 @@ class ConversationDisappearingSetting(Base):
         index=True,
     )
     duration_seconds = Column(Integer, nullable=False, default=0)
+    chat_mode = Column(String(20), nullable=False, default="disappearing", server_default="disappearing")
     updated_by = Column(
         Integer,
         ForeignKey("users.id"),
