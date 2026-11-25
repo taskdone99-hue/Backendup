@@ -126,6 +126,7 @@ def _validate_video_asset(url: str) -> tuple[Path, dict]:
 def _out(row: models.Video, db: Session | None = None, viewer_id: int | None = None) -> dict:
     owner = row.user
     save_count_hidden = bool(owner and owner.hide_saved_count and viewer_id != row.user_id)
+    share_count_hidden = bool(owner and owner.hide_share_count and viewer_id != row.user_id)
     saves_count = None
     if db is not None and not save_count_hidden:
         saves_count = db.query(models.VideoSavedItem).filter_by(video_id=row.id).count()
@@ -146,9 +147,11 @@ def _out(row: models.Video, db: Session | None = None, viewer_id: int | None = N
         ),
         "category": row.category, "tags": row.tags or [],
         "share_count": None,
-        "share_count_hidden": bool(owner and owner.hide_share_count and viewer_id != row.user_id),
+        "share_count_hidden": share_count_hidden,
         "saved_count": saves_count,
         "save_count_hidden": save_count_hidden,
+        "like_count_hidden": bool(owner and owner.hide_like_count and viewer_id != row.user_id),
+        "comments_hidden": bool(owner and owner.hide_comments and viewer_id != row.user_id),
         "editor_state": row.editor_state,
         "audio_id": row.audio_id,
         "recording_duration_seconds": row.recording_duration_seconds,
