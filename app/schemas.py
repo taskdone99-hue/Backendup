@@ -2201,6 +2201,7 @@ class MessageOut(BaseModel):
     sticker: dict | None = None
     media_url: str | None = None
     media_type: MediaType | None = None
+    forwarded_from_message_id: int | None = None
     reply_to_message_id: int | None = None
     reply_to: "MessageRepliedToOut | None" = None
     reply_to_story_id: int | None = None

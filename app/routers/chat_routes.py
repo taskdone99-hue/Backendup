@@ -1645,3 +1645,234 @@ async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
                 )
     finally:
         db.close()
+
+# ---------------------------------------------------------------------------
+# Message actions: forward, favourites, message info, and pinning
+# --------------------------------------------------------------------------------------
+
+class ForwardMessageRequest(BaseModel):
+    target_chat_ids: list[int] = Field(..., min_length=1, max_length=20)
+    caption: str | None = Field(default=None, max_length=2200)
+
+
+@router.post("/messages/{message_id}/forward", status_code=status.HTTP_201_CREATED)
+async def forward_message(
+    message_id: int,
+    payload: ForwardMessageRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    original = db.query(models.Message).filter(
+        models.Message.id == message_id, models.Message.is_deleted.is_(False)
+    ).first()
+    if original is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, original.conversation_id, current_user.id)
+    if original.expires_at is not None:
+        expiry = original.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="Expired messages cannot be forwarded")
+
+    if len(set(payload.target_chat_ids)) != len(payload.target_chat_ids):
+        raise HTTPException(status_code=400, detail="Duplicate target_chat_ids are not allowed")
+
+    forwarded = []
+    for target_id in payload.target_chat_ids:
+        _get_conversation_or_404(db, target_id)
+        _get_participant_or_403(db, target_id, current_user.id)
+        _reject_if_blocked_in_conversation(db, target_id, current_user.id)
+        if target_id == original.conversation_id:
+            raise HTTPException(status_code=400, detail="Cannot forward a message to its same conversation")
+        clone = models.Message(
+            conversation_id=target_id,
+            sender_id=current_user.id,
+            content=payload.caption if payload.caption is not None else original.content,
+            media_url=original.media_url,
+            media_type=original.media_type,
+            message_type=original.message_type,
+            sticker_id=original.sticker_id,
+            shared_reel_id=original.shared_reel_id,
+            shared_post_id=original.shared_post_id,
+            shared_story_id=original.shared_story_id,
+            forwarded_from_message_id=original.id,
+            expires_at=_message_expiry(db, target_id),
+        )
+        preview = clone.content or (
+            "Forwarded a photo" if clone.media_type == models.MediaType.image else
+            "Forwarded a video" if clone.media_type == models.MediaType.video else
+            "Forwarded a message"
+        )
+        forwarded_out = await _create_and_dispatch_message(
+            db, target_id, clone, current_user, preview[:80]
+        )
+        forwarded.append(forwarded_out)
+    return {"message": "Message forwarded successfully", "items": forwarded}
+
+
+@router.post("/messages/{message_id}/favorite")
+def add_message_favorite(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = db.query(models.Message).filter(
+        models.Message.id == message_id, models.Message.is_deleted.is_(False)
+    ).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, message.conversation_id, current_user.id)
+    existing = db.query(models.MessageFavorite).filter_by(
+        message_id=message_id, user_id=current_user.id
+    ).first()
+    if existing is None:
+        existing = models.MessageFavorite(message_id=message_id, user_id=current_user.id)
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+    return {"message": "Message added to favourites", "message_id": message_id,
+            "is_favorite": True, "created_at": existing.created_at}
+
+
+@router.delete("/messages/{message_id}/favorite")
+def remove_message_favorite(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = db.query(models.Message).filter(models.Message.id == message_id).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, message.conversation_id, current_user.id)
+    db.query(models.MessageFavorite).filter_by(
+        message_id=message_id, user_id=current_user.id
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"message": "Message removed from favourites", "message_id": message_id,
+            "is_favorite": False}
+
+
+@router.get("/favorites")
+def get_favorite_messages(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    rows = (db.query(models.MessageFavorite)
+            .join(models.Message, models.Message.id == models.MessageFavorite.message_id)
+            .filter(models.MessageFavorite.user_id == current_user.id,
+                    models.Message.is_deleted.is_(False))
+            .order_by(models.MessageFavorite.created_at.desc())
+            .offset(offset).limit(limit).all())
+    items = []
+    for row in rows:
+        message = db.query(models.Message).filter_by(id=row.message_id).first()
+        if message is not None:
+            items.append({"favorite_id": row.id, "saved_at": row.created_at,
+                          "message": _to_message_out(db, message, current_user.id)})
+    total = db.query(models.MessageFavorite).filter_by(user_id=current_user.id).count()
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+
+@router.get("/messages/{message_id}/info")
+def get_message_info(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = db.query(models.Message).filter_by(id=message_id).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, message.conversation_id, current_user.id)
+    statuses = db.query(models.MessageStatus).filter_by(message_id=message_id).all()
+    recipient_ids = [uid for uid in _conversation_participant_ids(db, message.conversation_id)
+                     if uid != message.sender_id]
+    status_by_user = {s.user_id: s for s in statuses}
+    recipients = []
+    for uid in recipient_ids:
+        user = db.query(models.User).filter_by(id=uid).first()
+        row = status_by_user.get(uid)
+        recipients.append({
+            "user_id": uid,
+            "username": user.username if user else None,
+            "delivered_at": row.delivered_at if row else None,
+            "read_at": row.read_at if row else None,
+            "status": "read" if row and row.read_at else
+                      "delivered" if row and row.delivered_at else "sent",
+        })
+    aggregate = "read" if recipients and all(r["status"] == "read" for r in recipients) else (
+        "delivered" if recipients and all(r["status"] in ("delivered", "read") for r in recipients)
+        else "sent"
+    )
+    return {"message_id": message.id, "conversation_id": message.conversation_id,
+            "sender_id": message.sender_id, "sent_at": message.created_at,
+            "status": aggregate, "recipients": recipients}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/pin")
+def pin_message(
+    conversation_id: int,
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    message = db.query(models.Message).filter_by(
+        id=message_id, conversation_id=conversation_id
+    ).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found in this conversation")
+    if message.is_deleted:
+        raise HTTPException(status_code=400, detail="Deleted messages cannot be pinned")
+    row = db.query(models.PinnedMessage).filter_by(
+        conversation_id=conversation_id, message_id=message_id
+    ).first()
+    if row is None:
+        row = models.PinnedMessage(conversation_id=conversation_id,
+                                   message_id=message_id, pinned_by=current_user.id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return {"message": "Message pinned successfully", "conversation_id": conversation_id,
+            "message_id": message_id, "pinned_by": row.pinned_by, "pinned_at": row.created_at}
+
+
+@router.delete("/conversations/{conversation_id}/messages/{message_id}/pin")
+def unpin_message(
+    conversation_id: int,
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    row = db.query(models.PinnedMessage).filter_by(
+        conversation_id=conversation_id, message_id=message_id
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Pinned message not found")
+    db.delete(row)
+    db.commit()
+    return {"message": "Message unpinned successfully", "conversation_id": conversation_id,
+            "message_id": message_id, "is_pinned": False}
+
+
+@router.get("/conversations/{conversation_id}/pinned-messages")
+def get_pinned_messages(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    rows = (db.query(models.PinnedMessage)
+            .filter_by(conversation_id=conversation_id)
+            .order_by(models.PinnedMessage.created_at.desc()).all())
+    items = []
+    for row in rows:
+        message = db.query(models.Message).filter_by(id=row.message_id).first()
+        if message is not None and not message.is_deleted:
+            items.append({"pinned_by": row.pinned_by, "pinned_at": row.created_at,
+                          "message": _to_message_out(db, message, current_user.id)})
+    return {"conversation_id": conversation_id, "total": len(items), "items": items}
+
