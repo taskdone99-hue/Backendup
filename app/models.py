@@ -1739,6 +1739,7 @@ class Message(Base):
     # caption) has no text content — see chat_routes.send_message /
     # send_media_message, which enforce "at least one of content/media_url"
     # at the request layer since the DB alone can't express that OR.
+    forwarded_from_message_id = Column(Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True)
     content = Column(String(2200), nullable=True)
     media_url = Column(String(500), nullable=True)
     media_type = Column(Enum(MediaType), nullable=True)
@@ -1872,6 +1873,29 @@ class ChatMessageOptionSelection(Base):
 
     option = relationship("ChatMessageOption", back_populates="selections")
     user = relationship("User", foreign_keys=[user_id])
+
+
+class MessageFavorite(Base):
+    """A message saved to one user's favourites."""
+    __tablename__ = "message_favorites"
+    __table_args__ = (UniqueConstraint("message_id", "user_id", name="uq_message_favorite"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PinnedMessage(Base):
+    """A message pinned in a conversation, with the participant who pinned it."""
+    __tablename__ = "pinned_messages"
+    __table_args__ = (UniqueConstraint("conversation_id", "message_id", name="uq_pinned_conversation_message"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    pinned_by = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class MessageReaction(Base):
@@ -2797,3 +2821,4 @@ class ContentInteractionEvent(Base):
     event_type = Column(String(24), nullable=False, index=True)
     watched_seconds = Column(Float, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
