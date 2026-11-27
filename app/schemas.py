@@ -499,6 +499,9 @@ class PostOut(BaseModel):
 
 class ReelOut(BaseModel):
     id: int
+    video_uid: str | None = None
+    upload_status: str = "PUBLISHED"
+    upload_progress: int = 100
     user_id: int
     caption: str | None
     video_url: str

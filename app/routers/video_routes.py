@@ -137,7 +137,8 @@ def upload_video(
     thumbnail_url = generate_video_thumbnail(url)
 
     video = models.Reel(
-        user_id=current_user.id, title=title, caption=caption, video_url=url,
+        user_id=current_user.id, video_uid=str(uuid.uuid4()), upload_status="PUBLISHED", upload_progress=100,
+        title=title, caption=caption, video_url=url,
         thumbnail_url=thumbnail_url, editor_state=parsed_editor_state,
     )
     db.add(video)
@@ -820,7 +821,8 @@ def publish_reel_draft(draft_id: int, db: Session = Depends(get_db), current_use
     if not draft.video_url:
         raise HTTPException(status_code=400, detail="A video is required before publishing")
     reel = models.Reel(
-        user_id=current_user.id, video_url=draft.video_url, thumbnail_url=draft.thumbnail_url, title=draft.title, caption=draft.caption,
+        user_id=current_user.id, video_uid=str(uuid.uuid4()), upload_status="PUBLISHED", upload_progress=100,
+        video_url=draft.video_url, thumbnail_url=draft.thumbnail_url, title=draft.title, caption=draft.caption,
         language=draft.language, ai_generated=draft.ai_generated, audience=draft.audience,
         age_restriction=draft.age_restriction, visibility=draft.visibility,
         comments_enabled=draft.comments_enabled, hide_like_count=draft.hide_like_count,

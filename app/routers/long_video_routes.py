@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 import mimetypes
 import json
+import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field, field_validator
@@ -131,7 +132,8 @@ def _out(row: models.Video, db: Session | None = None, viewer_id: int | None = N
     if db is not None and not save_count_hidden:
         saves_count = db.query(models.VideoSavedItem).filter_by(video_id=row.id).count()
     return {
-        "id": row.id, "user_id": row.user_id, "title": row.title,
+        "id": row.id, "video_uid": row.video_uid, "upload_status": row.upload_status,
+        "upload_progress": row.upload_progress, "user_id": row.user_id, "title": row.title,
         "description": row.description, "video_url": row.video_url,
         "thumbnail_url": row.thumbnail_url, "mime_type": row.mime_type,
         "file_size": row.file_size, "duration_seconds": row.duration_seconds,
@@ -272,6 +274,7 @@ def create_video(
 
         row = models.Video(
             user_id=current_user.id,
+            video_uid=str(uuid.uuid4()), upload_status="PUBLISHED", upload_progress=100,
             title=clean_title,
             description=description.strip() if description else None,
             video_url=video_url,

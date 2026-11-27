@@ -752,6 +752,10 @@ class Reel(Base):
     __tablename__ = "reels"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Stable public identifier for the complete upload/publish lifecycle.
+    video_uid = Column(String(36), unique=True, nullable=True, index=True)
+    upload_status = Column(String(20), nullable=False, default="PUBLISHED", server_default="PUBLISHED")
+    upload_progress = Column(Integer, nullable=False, default=100, server_default="100")
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     caption = Column(Text, nullable=True)
     # Separate from `caption` — metadata endpoints (PUT /api/videos/:id/metadata)
@@ -2704,6 +2708,10 @@ class Video(Base):
     __tablename__ = "videos"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Stable public identifier for the complete upload/publish lifecycle.
+    video_uid = Column(String(36), unique=True, nullable=True, index=True)
+    upload_status = Column(String(20), nullable=False, default="PUBLISHED", server_default="PUBLISHED")
+    upload_progress = Column(Integer, nullable=False, default=100, server_default="100")
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     title = Column(String(150), nullable=False)
     description = Column(Text, nullable=True)
