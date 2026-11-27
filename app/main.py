@@ -59,6 +59,7 @@ from app.routers import (
     long_video_routes,
     video_engagement_routes,
     video_parity_routes,
+    upload_lifecycle_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -129,6 +130,7 @@ app.include_router(watch_routes.router)
 app.include_router(comment_routes.router)
 app.include_router(video_parity_routes.router)  # Static Video routes before /{video_id}
 app.include_router(long_video_routes.router)
+app.include_router(upload_lifecycle_routes.router)
 app.include_router(video_engagement_routes.router)
 app.include_router(video_routes.router)
 app.include_router(video_routes.videos_router)  # Legacy Reel-specific upload settings: /api/reel-tools
