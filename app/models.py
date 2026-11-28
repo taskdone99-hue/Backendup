@@ -1795,7 +1795,11 @@ class Message(Base):
 
     conversation = relationship("Conversation", back_populates="messages")
     sender = relationship("User", foreign_keys=[sender_id])
-    reply_to_message = relationship("Message", remote_side=[id])
+    reply_to_message = relationship(
+        "Message",
+        foreign_keys=[reply_to_message_id],
+        remote_side=[id]
+    )
     reactions = relationship(
         "MessageReaction", back_populates="message", cascade="all, delete-orphan"
     )
