@@ -1,5 +1,7 @@
 """Pre-publish settings addressed by stable Reel/Video upload UIDs."""
 
+import json
+
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy.orm import Session
 
@@ -85,6 +87,65 @@ def _uid_from_request(request: Request, uid_name: str) -> str:
 def _register(kind: str, model, uid_name: str, base: str):
     def get_row(db: Session, uid: str, user):
         return _record(db, model, uid, user)
+
+    @router.get(f"{base}/{{{uid_name}}}/editor-state")
+    def get_editor_state(
+        request: Request,
+        db: Session = Depends(get_db),
+        user=Depends(get_current_user),
+    ):
+        uid = _uid_from_request(request, uid_name)
+        row = get_row(db, uid, user)
+        return {
+            uid_name: uid,
+            "editor_state": row.editor_state,
+        }
+
+    @router.put(f"{base}/{{{uid_name}}}/editor-state")
+    def save_editor_state(
+        request: Request,
+        payload: dict,
+        db: Session = Depends(get_db),
+        user=Depends(get_current_user),
+    ):
+        uid = _uid_from_request(request, uid_name)
+        row = get_row(db, uid, user)
+        if "editor_state" not in payload or not isinstance(payload["editor_state"], dict):
+            raise HTTPException(
+                status_code=422,
+                detail="editor_state must be a JSON object",
+            )
+        try:
+            encoded = json.dumps(payload["editor_state"], ensure_ascii=False)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="editor_state must contain valid JSON data")
+        if len(encoded.encode("utf-8")) > 2 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="editor_state cannot exceed 2 MB")
+
+        row.editor_state = payload["editor_state"]
+        db.commit()
+        db.refresh(row)
+        return {
+            uid_name: uid,
+            "message": "Editor state saved",
+            "editor_state": row.editor_state,
+        }
+
+    @router.delete(f"{base}/{{{uid_name}}}/editor-state")
+    def clear_editor_state(
+        request: Request,
+        db: Session = Depends(get_db),
+        user=Depends(get_current_user),
+    ):
+        uid = _uid_from_request(request, uid_name)
+        row = get_row(db, uid, user)
+        row.editor_state = None
+        db.commit()
+        return {
+            uid_name: uid,
+            "message": "Editor state cleared",
+            "editor_state": None,
+        }
 
     @router.put(f"{base}/{{{uid_name}}}/audience")
     def set_audience(
@@ -344,4 +405,4 @@ def _register(kind: str, model, uid_name: str, base: str):
 
 
 _register("reel", models.Reel, "reel_uid", "/api/reels")
-_register("video", models.Video, "video_uid", "/api/videos")
+_register("video", models.Video, "video_uid", "/api/videos/uid")
