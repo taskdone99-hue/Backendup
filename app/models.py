@@ -803,6 +803,7 @@ class Reel(Base):
     hide_comments = Column(Boolean, default=False, nullable=False, server_default=expression.false())
     audience = Column(String(20), nullable=False, default=ReelAudience.everyone.value, server_default=ReelAudience.everyone.value)
     age_restriction = Column(String(20), nullable=True)
+    hashtags = Column(JSON, nullable=True, default=list)
     remixing_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
     downloads_enabled = Column(Boolean, default=True, nullable=False, server_default=expression.true())
     visibility = Column(
@@ -2724,6 +2725,7 @@ class Video(Base):
     height = Column(Integer, nullable=True)
     aspect_ratio = Column(String(20), nullable=True)
     orientation = Column(String(20), nullable=False, default="horizontal", server_default="horizontal")
+    age_restriction = Column(String(20), nullable=True)
     visibility = Column(String(20), nullable=False, default="public", server_default="public", index=True)
     allow_comments = Column(Boolean, nullable=False, default=True, server_default=expression.true())
     allow_sharing = Column(Boolean, nullable=False, default=True, server_default=expression.true())
