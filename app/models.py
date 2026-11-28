@@ -2830,3 +2830,14 @@ class ContentInteractionEvent(Base):
     watched_seconds = Column(Float, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+
+
+class UploadUIDSettings(Base):
+    """Settings saved against a pending Reel/Video upload UID before publish."""
+    __tablename__ = "upload_uid_settings"
+    id = Column(Integer, primary_key=True, index=True)
+    content_type = Column(String(10), nullable=False, index=True)
+    content_id = Column(Integer, nullable=False, index=True)
+    settings = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (UniqueConstraint("content_type", "content_id", name="uq_upload_uid_settings_content"),)

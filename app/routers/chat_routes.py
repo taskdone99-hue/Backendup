@@ -1,1702 +1,1877 @@
-"""
-Posts and Reels: creation, CRUD, feeds, and reel-audio remixing.
+import logging
+from datetime import datetime, timezone
 
-Comments and likes for these live in comment_routes.py; the "video upload /
-thumbnail / metadata / collaborators / revenue-split" flow lives in
-video_routes.py (it operates on the same Reel rows created here, since this
-app has a rom asingle video-content type).
-"""
+from fastapi import (
+    APIRouter, Depends, Form, HTTPException, Query, UploadFile,
+    WebSocket, WebSocketDisconnect, status
+)
+from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload
+from pydantic import BaseModel, Field
 
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import and_, func, or_
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
-
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app import models, schemas
-from app.auth import get_current_user, get_current_user_optional
-from app.form_fields import OptionalFloatForm, OptionalIntForm
-from app.services.media_service import (
-    delete_media_file,
-    generate_video_thumbnail,
-    get_video_duration,
-    save_upload_file,
-)
-from app.services import editor_state_service, engagement, tag_service
-from app.services import video_settings_service as vss
-from app.services.video_settings_service import (
-    as_utc,
-    comments_hidden,
-    like_count_hidden,
-    likes_hidden_from,
-    require_reel_viewable,
-    visible_reels_clause,
-)
-from app.services.location_service import resolve_location_from_form, find_or_create_location
-from app.services.hashtag_service import extract_hashtags, sync_post_hashtags
-from app.services.mention_service import sync_mentions
+from app.auth import get_current_user, get_user_from_raw_token
+from app.ws_manager import manager
 from app.services.notification_service import notify_user
-from app.services.privacy_service import blocked_user_ids, muted_user_ids, is_blocked
+from app.services.privacy_service import is_blocked, is_conversation_muted
+from app.services.media_service import save_upload_file
+from app.routers.content_routes import _require_author_visible
+from app.services.video_settings_service import require_reel_viewable, viewer_can_view
+from app.services import chat_option_service
 
-router = APIRouter(prefix="/api/posts", tags=["posts"])
-reels_router = APIRouter(prefix="/api/reels", tags=["reels"])
+router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+logger = logging.getLogger(__name__)
+
+
+class BulkMessageDeleteRequest(BaseModel):
+    chat_id: int = Field(gt=0)
+    message_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+def _message_expiry(db: Session, conversation_id: int):
+    setting = db.query(models.ConversationDisappearingSetting).filter_by(
+        conversation_id=conversation_id
+    ).first()
+    if not setting or not setting.duration_seconds:
+        return None
+    from datetime import timedelta
+    return datetime.now(timezone.utc) + timedelta(seconds=setting.duration_seconds)
 
 
 # ---- internal helpers ----
 
-def _to_post_detail(
-    db: Session, post: models.Post, viewer_id: int | None
-) -> schemas.PostDetailOut:
-    detail = schemas.PostDetailOut.model_validate(post)
-    detail.user = schemas.UserSummaryOut.model_validate(post.user)
-    detail.likes_count = (
-        None
-        if likes_hidden_from(post, viewer_id)
-        else engagement.likes_count(db, models.LikeTargetType.post, post.id)
+def _get_conversation_or_404(db: Session, conversation_id: int) -> models.Conversation:
+    conversation = (
+        db.query(models.Conversation)
+        .filter(models.Conversation.id == conversation_id)
+        .first()
     )
-    detail.like_count_hidden = like_count_hidden(post)
-    detail.comments_hidden = comments_hidden(post)
-    detail.comments_count = engagement.comments_count(db, post.id)
-    detail.share_count = engagement.shares_count(db, models.ShareContentType.post, post.id)
-    detail.hashtags = extract_hashtags(post.caption)
-    if post.media_items:
-        detail.media = [
-            schemas.MediaItemOut.model_validate(m) for m in post.media_items
-        ]
-        # Backwards-friendly top-level thumbnail: first video item's thumbnail.
-        detail.thumbnail_url = next(
-            (item.thumbnail_url for item in detail.media if item.media_type == models.MediaType.video and item.thumbnail_url),
-            None,
-        )
-    else:
-        # Legacy post created before the post_media table existed — synthesize
-        # a single-item list from the flat columns so `media` is never empty.
-        detail.media = [
-            schemas.MediaItemOut(
-                id=post.id, media_url=post.media_url, media_type=post.media_type, position=0,
-                caption=post.caption, thumbnail_url=None,
-            )
-        ]
-        detail.thumbnail_url = None
-    detail.media_count = len(detail.media)
-    detail.like_id = engagement.get_like_id(
-        db, viewer_id, models.LikeTargetType.post, post.id
-    )
-    detail.is_liked = detail.like_id is not None
-    detail.is_saved = engagement.is_saved_by(
-        db, viewer_id, post.id, models.SavedItemType.post
-    )
-    if post.music_url:
-        detail.music = schemas.MusicOut(
-            title=post.music_title,
-            artist=post.music_artist,
-            audio_url=post.music_url,
-            start_seconds=post.music_start_seconds or 0,
-        )
-    if post.location_id and post.location is not None:
-        detail.location = schemas.LocationOut.model_validate(post.location)
-    elif post.location_name:
-        # Pre-Location-table posts (or ones only given flat fields) —
-        # same fallback shape as before, just with the new optional fields
-        # left null.
-        detail.location = schemas.LocationOut(
-            name=post.location_name,
-            latitude=post.location_latitude,
-            longitude=post.location_longitude,
-        )
-    # Pending (not-yet-approved) tags aren't on the post yet — see tag_service.
-    post_tags = tag_service.approved_tags(db, "post", post.id)
-    detail.tags_count = len(post_tags)
-    detail.members_count = (
-        db.query(models.PostMember).filter(models.PostMember.post_id == post.id).count()
-    )
-    detail.tags = [schemas.UserSummaryOut.model_validate(t.user) for t in post_tags]
-    detail.members = [
-        schemas.UserSummaryOut.model_validate(m.user)
-        for m in db.query(models.PostMember).filter(models.PostMember.post_id == post.id).all()
-    ]
-    return detail
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    return conversation
 
 
-def _parse_ids(raw: str | None, field_name: str) -> list[int]:
-    """Multipart form fields can't carry lists, so ids arrive as "12,15,20"."""
-    if not raw or not raw.strip():
-        return []
-    try:
-        return [int(x.strip()) for x in raw.split(",") if x.strip()]
-    except ValueError:
+def _get_participant_or_403(db: Session, conversation_id: int, user_id: int) -> models.ConversationParticipant:
+    participant = (
+        db.query(models.ConversationParticipant)
+        .filter(
+            models.ConversationParticipant.conversation_id == conversation_id,
+            models.ConversationParticipant.user_id == user_id,
+        )
+        .first()
+    )
+    if participant is None:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"{field_name} must be comma-separated integers, e.g. '12,15,20'",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You're not a participant in this conversation",
         )
+    return participant
 
 
-def _replace_post_tags(
-    db: Session, post: models.Post, user_ids: list[int], tagger: models.User
-) -> list[models.PostTag]:
-    """Full replace: tags the given users (through the same block / tag
-    setting / visibility checks as POST /api/posts/:id/tags), untags anyone
-    left off the list. Returns newly created tags to notify after commit."""
-    return tag_service.replace_post_tags(db, post, user_ids, tagger)
+def _require_participant(db: Session, conversation_id: int, user_id: int) -> None:
+    _get_participant_or_403(db, conversation_id, user_id)
 
 
-def _replace_post_members(db: Session, post: models.Post, user_ids: list[int]) -> None:
-    """Full replace of the post's collaborators/members list."""
-    user_ids = list(dict.fromkeys(user_ids))
-    if user_ids:
-        found = db.query(models.User.id).filter(models.User.id.in_(user_ids)).all()
-        found_ids = {row[0] for row in found}
-        missing = set(user_ids) - found_ids
-        if missing:
+def _conversation_participant_ids(db: Session, conversation_id: int) -> list[int]:
+    rows = (
+        db.query(models.ConversationParticipant.user_id)
+        .filter(models.ConversationParticipant.conversation_id == conversation_id)
+        .all()
+    )
+    return [r[0] for r in rows]
+
+
+def _reject_if_blocked_in_conversation(db: Session, conversation_id: int, sender_id: int) -> None:
+    """A block, in either direction, between the sender and any other
+    participant stops the message — same rule as content_routes.is_blocked,
+    applied here rather than at conversation-creation time so it also
+    covers a block that happens *after* a thread already exists (an
+    existing group chat with a later-blocked member, for instance)."""
+    other_ids = [uid for uid in _conversation_participant_ids(db, conversation_id) if uid != sender_id]
+    for uid in other_ids:
+        if is_blocked(db, sender_id, uid):
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User id(s) not found: {sorted(missing)}",
+                status_code=status.HTTP_403_FORBIDDEN, detail="Can't send messages in this conversation"
             )
 
-    existing = {
-        m.user_id: m
-        for m in db.query(models.PostMember).filter(models.PostMember.post_id == post.id).all()
-    }
-    for uid in set(existing) - set(user_ids):
-        db.delete(existing[uid])
-    for uid in user_ids:
-        if uid not in existing:
-            db.add(models.PostMember(post_id=post.id, user_id=uid))
 
-
-def _to_reel_detail(
-    db: Session, reel: models.Reel, viewer_id: int | None
-) -> schemas.ReelDetailOut:
-    detail = schemas.ReelDetailOut.model_validate(reel)
-    detail.user = schemas.UserSummaryOut.model_validate(reel.user)
-    detail.likes_count = (
-        None
-        if likes_hidden_from(reel, viewer_id)
-        else engagement.likes_count(db, models.LikeTargetType.reel, reel.id)
-    )
-    detail.scheduled_at = as_utc(reel.scheduled_at)
-    detail.like_count_hidden = like_count_hidden(reel)
-    detail.comments_hidden = comments_hidden(reel)
-    detail.like_id = engagement.get_like_id(db, viewer_id, models.LikeTargetType.reel, reel.id)
-    detail.is_liked = detail.like_id is not None
-    detail.comments_count = engagement.comments_count(db, reel_id=reel.id)
-    detail.is_saved = engagement.is_saved_by(
-        db, viewer_id, reel.id, models.SavedItemType.reel
-    )
-    if reel.location_id and reel.location is not None:
-        detail.location = schemas.LocationOut.model_validate(reel.location)
-    elif reel.location_name:
-        detail.location = schemas.LocationOut(
-            name=reel.location_name,
-            latitude=reel.location_latitude,
-            longitude=reel.location_longitude,
+def _validate_reply_target(
+    db: Session, conversation_id: int, reply_to_message_id: int | None
+) -> int | None:
+    if reply_to_message_id is None:
+        return None
+    original = (
+        db.query(models.Message)
+        .filter(
+            models.Message.id == reply_to_message_id,
+            models.Message.conversation_id == conversation_id,
         )
-    # Collaborators tagged via POST /api/videos/:id/collaborators (and, since
-    # accept_request in collaboration_service.py writes to the same table,
-    # anyone who came in through an accepted creator-collaboration request)
-    # weren't previously surfaced here at all — a client had no way to know
-    # a reel had a co-creator without a separate call.
-    detail.collaborators = [
-        schemas.CollaboratorOut.model_validate(c) for c in reel.collaborators
-    ]
-    reel_tags = tag_service.approved_tags(db, "reel", reel.id)
-    detail.tags_count = len(reel_tags)
-    detail.tags = [schemas.UserSummaryOut.model_validate(t.user) for t in reel_tags]
-    if reel.audio_id and reel.audio is not None:
-        detail.audio = schemas.AudioOut.model_validate(reel.audio)
-    return detail
+        .first()
+    )
+    if original is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="reply_to_message_id must refer to a message in this conversation",
+        )
+    return reply_to_message_id
 
 
-def _get_post_or_404(db: Session, post_id: int) -> models.Post:
-    post = db.query(models.Post).filter(models.Post.id == post_id).first()
-    if post is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
-    return post
+def _reel_visible_to(db: Session, reel: models.Reel, viewer_id: int | None) -> bool:
+    """Same visibility rule as GET /api/reels/{id} (block either way, or a
+    private account the viewer doesn't follow), as a yes/no."""
+    try:
+        _require_author_visible(db, reel.user, viewer_id)
+    except HTTPException:
+        return False
+    # Private / members-only / not-yet-published reels follow the owner's
+    # upload-page settings (video_settings_service).
+    return viewer_can_view(db, reel, viewer_id)
 
 
-def _get_reel_or_404(db: Session, reel_id: int) -> models.Reel:
+def _build_shared_reel_out(
+    db: Session, reel_id: int, viewer_id: int | None
+) -> schemas.SharedReelOut:
+    """Preview for a reel shared in chat, resolved for one viewer. A deleted
+    or not-visible-to-this-viewer reel comes back as is_available=False with
+    no details, so a share can't expose a private account's reel to someone
+    who couldn't open it directly. viewer_id=None is treated as a logged-out
+    viewer (public accounts only)."""
+    reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
+    if reel is None or not _reel_visible_to(db, reel, viewer_id):
+        return schemas.SharedReelOut(reel_id=reel_id, is_available=False)
+    return schemas.SharedReelOut(
+        reel_id=reel.id,
+        is_available=True,
+        video_url=reel.video_url,
+        thumbnail_url=reel.thumbnail_url,
+        caption=reel.caption,
+        duration_seconds=reel.duration_seconds,
+        user=schemas.UserSummaryOut.model_validate(reel.user),
+    )
+
+
+def _get_shareable_reel_or_404(db: Session, reel_id: int, sender_id: int) -> models.Reel:
     reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
     if reel is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reel not found")
+    # You can only share what you could open yourself (404 if blocked, 403
+    # if private and not followed) — same responses as GET /api/reels/{id}.
+    _require_author_visible(db, reel.user, sender_id)
+    require_reel_viewable(db, reel, sender_id)
     return reel
 
 
-def _following_ids(db: Session, user_id: int) -> list[int]:
-    return [
-        row[0]
-        for row in db.query(models.Follow.following_id)
-        .filter(models.Follow.follower_id == user_id)
-        .all()
+def _post_visible_to(db: Session, post: models.Post, viewer_id: int | None) -> bool:
+    """Same visibility rule as GET /api/posts/{id} (block either way, or a
+    private account the viewer doesn't follow), as a yes/no — mirrors
+    _reel_visible_to above."""
+    try:
+        _require_author_visible(db, post.user, viewer_id)
+    except HTTPException:
+        return False
+    return True
+
+
+def _build_shared_post_out(
+    db: Session, post_id: int, viewer_id: int | None
+) -> schemas.SharedPostOut:
+    """Preview for a post shared in chat, resolved for one viewer — same
+    is_available fallback as _build_shared_reel_out, for the same reasons."""
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if post is None or not _post_visible_to(db, post, viewer_id):
+        return schemas.SharedPostOut(post_id=post_id, is_available=False)
+    return schemas.SharedPostOut(
+        post_id=post.id,
+        is_available=True,
+        media_url=post.media_url,
+        media_type=post.media_type,
+        caption=post.caption,
+        user=schemas.UserSummaryOut.model_validate(post.user),
+    )
+
+
+def _get_shareable_post_or_404(db: Session, post_id: int, sender_id: int) -> models.Post:
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if post is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
+    # Same visibility rule as reels above — you can only share what you
+    # could open yourself.
+    _require_author_visible(db, post.user, sender_id)
+    return post
+
+
+def _to_message_out(
+    db: Session, message: models.Message, viewer_id: int | None = None
+) -> schemas.MessageOut:
+    """`viewer_id` only matters for shared-reel messages, whose preview depends
+    on who's looking (see _build_shared_reel_out)."""
+    out = schemas.MessageOut.model_validate(message)
+    if message.sticker_id is not None and not message.is_deleted:
+        sticker = db.query(models.Sticker).filter(models.Sticker.id == message.sticker_id).first()
+        if sticker is not None:
+            favorite = False
+            if viewer_id is not None:
+                favorite = db.query(models.StickerFavorite.id).filter_by(
+                    user_id=viewer_id, sticker_id=sticker.id
+                ).first() is not None
+            out.sticker = {
+                "id": sticker.id, "owner_id": sticker.owner_id, "name": sticker.name,
+                "sticker_url": f"/api/stickers/{sticker.id}/file",
+                "thumbnail_url": f"/api/stickers/{sticker.id}/file?thumbnail=true",
+                "mime_type": sticker.mime_type, "visibility": sticker.visibility,
+                "approval_status": sticker.approval_status,
+                "created_at": sticker.created_at, "is_favorite": favorite,
+            }
+    expiry_at = message.expires_at
+    if expiry_at is not None and expiry_at.tzinfo is None:
+        expiry_at = expiry_at.replace(tzinfo=timezone.utc)
+    expired = expiry_at is not None and expiry_at <= datetime.now(timezone.utc)
+    if message.is_deleted or expired:
+        out.content = "This message has expired" if expired and not message.is_deleted else "This message was deleted"
+        out.media_url = None
+        out.sticker = None
+        out.shared_story = None
+        out.shared_story_id = None
+        out.shared_reel = None
+        out.shared_reel_id = None
+        out.shared_post = None
+        out.shared_post_id = None
+        out.options = []
+    elif message.shared_reel_id is not None:
+        out.shared_reel = _build_shared_reel_out(db, message.shared_reel_id, viewer_id)
+    elif message.shared_post_id is not None:
+        out.shared_post = _build_shared_post_out(db, message.shared_post_id, viewer_id)
+    if message.shared_story_id is not None:
+        story = db.query(models.Story).filter(models.Story.id == message.shared_story_id).first()
+        if story is not None:
+            out.shared_story = schemas.StoryPreviewOut(
+                id=story.id, user_id=story.user_id, media_url=story.media_url,
+                media_type=story.media_type, caption=story.caption,
+                expires_at=story.expires_at, source_story_id=story.source_story_id,
+            )
+
+    if message.reply_to_message_id is not None:
+        original = (
+            db.query(models.Message)
+            .filter(models.Message.id == message.reply_to_message_id)
+            .first()
+        )
+        if original is not None:
+            # A deleted original should not leave a "message deleted" stub
+            # in the reply preview. Keep the reply itself, but omit its preview.
+            if not original.is_deleted:
+                out.reply_to = schemas.MessageRepliedToOut(
+                    id=original.id,
+                    sender_id=original.sender_id,
+                    content=original.content,
+                    media_type=original.media_type,
+                    is_deleted=False,
+                    is_reel_share=original.shared_reel_id is not None,
+                    is_post_share=original.shared_post_id is not None,
+                )
+
+    out.reactions = [
+        schemas.MessageReactionOut(user_id=r.user_id, emoji=r.emoji) for r in message.reactions
+    ]
+    out.options = [
+        schemas.ChatOptionOut.model_validate(o)
+        for o in chat_option_service.visible_options(message, viewer_id)
     ]
 
-
-def _visible_authors_clause(db: Session, viewer_id: int | None):
-    """
-    Filter clause for discovery-style feeds (explore, global reels feed,
-    trending) that queries across all accounts rather than a specific
-    profile: excludes content from private accounts unless the viewer is
-    the author themselves or already follows them, AND excludes content
-    from anyone blocked in either direction (see
-    app/services/privacy_service.blocked_user_ids) — block is a full,
-    symmetric exclusion, unlike mute, which only touches follows-scoped
-    feeds (see get_home_feed / get_reels_home_feed below). Requires the
-    query to be joined to models.User on the content's user_id first, e.g.:
-        query.join(models.User, models.Post.user_id == models.User.id)
-             .filter(_visible_authors_clause(db, viewer_id))
-    """
-    if viewer_id is None:
-        return models.User.is_private == False
-    base = or_(
-        models.User.is_private == False,
-        models.User.id == viewer_id,
-        models.User.id.in_(_following_ids(db, viewer_id)),
+    # status: "sent" (default) until every recipient's row clears each bar.
+    recipient_statuses = (
+        db.query(models.MessageStatus).filter(models.MessageStatus.message_id == message.id).all()
     )
-    blocked_ids = blocked_user_ids(db, viewer_id)
-    if blocked_ids:
-        return and_(base, models.User.id.notin_(blocked_ids))
-    return base
+    if recipient_statuses:
+        if all(s.read_at is not None for s in recipient_statuses):
+            out.status = "read"
+        elif all(s.delivered_at is not None for s in recipient_statuses):
+            out.status = "delivered"
+    return out
 
 
-def _exclude_not_interested(query, db: Session, viewer_id: int | None, content_type: str, content_id_column):
-    """Hide content the authenticated viewer marked as not interested.
+def _to_conversation_out(
+    db: Session, conversation: models.Conversation, viewer_id: int | None = None
+) -> schemas.ConversationOut:
+    participants = [
+        schemas.ChatParticipantOut(
+            id=p.user.id,
+            username=p.user.username,
+            full_name=p.user.full_name,
+            avatar_url=p.user.avatar_url,
+            is_online=manager.is_online(p.user.id),
+        )
+        for p in conversation.participants
+    ]
+    last_message = (
+        db.query(models.Message)
+        .filter(models.Message.conversation_id == conversation.id)
+        .order_by(models.Message.created_at.desc())
+        .first()
+    )
 
-    Anonymous feed requests are unchanged. Applying this to the SQL query
-    (before count/order/pagination) keeps totals and page boundaries correct.
-    """
-    if viewer_id is None:
-        return query
+    unread_count = 0
+    my_status = "accepted"
+    is_muted = False
+    if viewer_id is not None:
+        my_participant = next((p for p in conversation.participants if p.user_id == viewer_id), None)
+        if my_participant is not None:
+            q = db.query(models.Message).filter(models.Message.conversation_id == conversation.id)
+            if my_participant.last_read_message_id is not None:
+                q = q.filter(models.Message.id > my_participant.last_read_message_id)
+            unread_count = q.filter(models.Message.sender_id != viewer_id).count()
+            my_status = my_participant.status.value
+        is_muted = is_conversation_muted(db, viewer_id, conversation.id)
 
-    excluded = (
-        db.query(models.NotInterested.id)
+    return schemas.ConversationOut(
+        id=conversation.id,
+        is_group=conversation.is_group,
+        title=conversation.title,
+        created_at=conversation.created_at,
+        participants=participants,
+        last_message=_to_message_out(db, last_message, viewer_id) if last_message else None,
+        unread_count=unread_count,
+        status=my_status,
+        is_muted=is_muted,
+    )
+
+
+def _build_intro_message(other_user: models.User) -> str:
+    """The one-time auto-DM sent (as if from `other_user`) the first time
+    someone starts a 1:1 conversation with them."""
+    if other_user.account_type == models.AccountType.business:
+        name = other_user.business_name or other_user.full_name or other_user.username
+        text = f"Hi! \U0001F44B Welcome to {name}."
+        if other_user.business_description:
+            text += f" {other_user.business_description}"
+        text += " Check out our profile to learn more."
+        return text
+
+    display_name = other_user.full_name or other_user.username
+    return (
+        f"Hi! \U0001F44B You're messaging {display_name}. "
+        "Check out my profile to know more about me."
+    )
+
+
+# ==========================================================================
+# Conversations
+# ==========================================================================
+
+def _find_existing_direct_conversation(
+    db: Session, user_id: int, other_id: int
+) -> models.Conversation | None:
+    """A 1:1 (non-group) conversation already containing exactly these two
+    people, if one exists."""
+    my_conversation_ids = select(models.ConversationParticipant.conversation_id).where(
+        models.ConversationParticipant.user_id == user_id
+    )
+    candidates = (
+        db.query(models.Conversation)
         .filter(
-            models.NotInterested.user_id == viewer_id,
-            models.NotInterested.content_type == content_type,
-            models.NotInterested.content_id == content_id_column,
+            models.Conversation.is_group.is_(False),
+            models.Conversation.id.in_(my_conversation_ids),
         )
-        .exists()
+        .all()
     )
-    return query.filter(~excluded)
+    for conv in candidates:
+        participant_ids = {p.user_id for p in conv.participants}
+        if participant_ids == {user_id, other_id}:
+            return conv
+    return None
 
 
-def _require_author_visible(db: Session, author: models.User, viewer_id: int | None) -> None:
-    """Same rule as _visible_authors_clause, but for a single already-fetched
-    item (a specific post/reel by id) rather than a list query. A block
-    (either direction) hides the item entirely — 404, not 403, same as if
-    it never existed for this viewer — checked before the private-account
-    rule below since it's the stricter case."""
-    if viewer_id is not None and viewer_id != author.id and is_blocked(db, viewer_id, author.id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    if not author.is_private:
-        return
-    if viewer_id is not None and (
-        viewer_id == author.id or author.id in _following_ids(db, viewer_id)
-    ):
-        return
-    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account is private")
-
-
-# ==========================================================================
-# Posts
-# ==========================================================================
-
-@router.post("", response_model=schemas.PostDetailOut, status_code=status.HTTP_201_CREATED)
-async def create_post(
-    file: UploadFile | None = File(
-        default=None,
-        description="Single-photo/video post. Keep using this field name for "
-        "existing single-upload clients — unchanged from before.",
-    ),
-    files: list[UploadFile] | None = File(
-        default=None,
-        description="Carousel post: send 2+ files under this field name "
-        "instead of `file` to attach multiple photos/videos to one post. "
-        "The response's `media` array lists all of them, in upload order.",
-    ),
-    caption: str | None = Form(default=None),
-    media_captions: list[str] | None = Form(default=None, description="One caption per uploaded file, in the same order; trailing captions may be omitted."),
-    alt_text: str | None = Form(default=None),
-    ai_generated: bool = Form(default=False),
-    music_title: str | None = Form(default=None),
-    music_artist: str | None = Form(default=None),
-    music_url: str | None = Form(default=None),
-    music_start_seconds: int = Form(default=0),
-    location_name: str | None = Form(default=None),
-    location_latitude: float | None = Form(default=None),
-    location_longitude: float | None = Form(default=None),
-    location_id: int | None = Form(
-        default=None, description="Attach an already-saved location (see POST /api/locations) by id"
-    ),
-    location_address: str | None = Form(default=None),
-    location_city: str | None = Form(default=None),
-    location_state: str | None = Form(default=None),
-    location_country: str | None = Form(default=None),
-    location_place_id: str | None = Form(default=None),
-    tag_user_ids: str | None = Form(
-        default=None, description="Comma-separated user ids, e.g. '12,15,20'"
-    ),
-    member_user_ids: str | None = Form(
-        default=None, description="Comma-separated user ids, e.g. '12,15,20'"
-    ),
-    editor_state: str | None = Form(
-        default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION
-    ),
-    recording_duration_seconds: float | None = Form(default=None, ge=0, le=600),
-    timer_duration_seconds: int | None = Form(default=None, ge=0, le=10),
-    filter_id: str | None = Form(default=None, max_length=100),
-    playback_speed: int | None = Form(default=None, description="Allowed values: 1, 2, or 3"),
-    audio_start_seconds: int | None = Form(default=None, ge=0),
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """
-    Everything a post can carry is settable at creation time now — music,
-    location, alt_text, ai_generated, tags, and collaborators/members — so
-    a client doesn't need a create-then-PUT round trip. All of these stay
-    optional and settable later too, either via PUT /api/posts/{id} (JSON)
-    or the individual post-details endpoints (/tags, /music, /location,
-    etc) if you'd rather set them one at a time or after the fact.
-    Hashtags aren't a separate field — they're parsed out of `caption`
-    automatically (see hashtags in the response), and persisted so they're
-    browsable via GET /api/hashtags/{name}/posts and /api/hashtags/trending.
-    For media, send one file under `file` (unchanged, single-photo/video
-    post) or two-or-more under `files` (carousel post) — not both. The
-    response's `media` list has one entry per attached file, in order;
-    `media_url`/`media_type` keep mirroring the first item for any existing
-    client that only reads those flat fields.
-    tag_user_ids / member_user_ids are multipart form fields, so they're
-    plain comma-separated strings here rather than JSON arrays (multipart
-    can't carry nested types) — e.g. "12,15,20".
-    """
-    # Accept either the original single-file field or the new multi-file
-    # one, but not neither/both — keeps the multipart contract unambiguous
-    # while leaving existing single-`file` clients untouched.
-    upload_files = [f for f in (files or []) if f is not None and f.filename]
-    if file is not None and file.filename:
-        upload_files = [file] + upload_files
-    if not upload_files:
+def get_or_create_direct_conversation(
+    db: Session, current_user: models.User, other_user: models.User
+) -> tuple[models.Conversation, bool]:
+    """Reuses an existing 1:1 thread with `other_user`, or starts one
+    (message-request gating + the other person's auto-intro DM, exactly
+    like POST /conversations below) — factored out so callers that need a
+    conversation to send into, without going through that endpoint, get the
+    same behavior. Used by create_conversation itself for the 1:1 case, and
+    by share_routes.share_internal when sharing a post/reel to someone
+    there's no existing thread with yet. Returns (conversation, is_new)."""
+    if is_blocked(db, current_user.id, other_user.id):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Attach at least one file via `file` (single) or `files` (multiple)",
-        )
-    if media_captions is not None and len(media_captions) > len(upload_files):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="media_captions cannot contain more captions than uploaded files",
+            status_code=status.HTTP_403_FORBIDDEN, detail="Can't message this user"
         )
 
-    tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
-    member_ids = _parse_ids(member_user_ids, "member_user_ids")
-    # Reject un-taggable users up front, before any file is saved or the post
-    # row exists — otherwise a 403 here would leave an untagged post behind.
-    # (The post doesn't exist yet, so only its owner matters for the checks.)
-    if tag_ids:
-        tag_service.assert_can_tag(
-            db, current_user, "post", SimpleNamespace(user=current_user), tag_ids
-        )
+    existing = _find_existing_direct_conversation(db, current_user.id, other_user.id)
+    if existing is not None:
+        return existing, False
 
-    # Validate all per-Reel controls before storing the uploaded media.
-    if audience not in {item.value for item in models.ReelAudience}:
-        raise HTTPException(status_code=400, detail="audience must be everyone, followers, or close_friends")
-    if visibility not in {item.value for item in models.ReelVisibility}:
-        raise HTTPException(status_code=400, detail="visibility must be public, private, or members")
-    if age_restriction not in (None, "18_plus", "below_18"):
-        raise HTTPException(status_code=400, detail="age_restriction must be 18_plus or below_18")
-    if schedule_enabled:
-        if scheduled_at is None:
-            raise HTTPException(status_code=400, detail="scheduled_at is required when schedule_enabled is true")
-        if vss.as_utc(scheduled_at) <= vss.utcnow():
-            raise HTTPException(status_code=400, detail="scheduled_at must be in the future")
-    elif scheduled_at is not None:
-        raise HTTPException(status_code=400, detail="scheduled_at requires schedule_enabled=true")
-
-    if location_latitude is not None and not (-90 <= location_latitude <= 90):
-        raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
-    if location_longitude is not None and not (-180 <= location_longitude <= 180):
-        raise HTTPException(status_code=400, detail="location_longitude must be between -180 and 180")
-
-    try:
-        location = resolve_location_from_form(
-            db,
-            location_id=location_id,
-            location_name=location_name,
-            location_address=location_address,
-            location_city=location_city,
-            location_state=location_state,
-            location_country=location_country,
-            location_latitude=location_latitude,
-            location_longitude=location_longitude,
-            location_place_id=location_place_id,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    # Validate editor settings before writing any media.
-    parsed_editor_state = editor_state_service.parse_form_value(editor_state)
-    if playback_speed is not None and playback_speed not in (1, 2, 3):
-        raise HTTPException(status_code=400, detail="playback_speed must be 1, 2, or 3")
-
-    camera_settings = {
-        "recording_duration_seconds": recording_duration_seconds,
-        "timer_duration_seconds": timer_duration_seconds,
-        "filter_id": filter_id,
-        "playback_speed": playback_speed,
-        "audio_start_seconds": audio_start_seconds,
-    }
-    camera_settings = {k: v for k, v in camera_settings.items() if v is not None}
-    if audio_start_seconds is not None and not (
-        music_title or music_url
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="audio_start_seconds requires music_title or music_url",
-        )
-
-    if camera_settings:
-        parsed_editor_state = {
-            **(parsed_editor_state or {}),
-            **camera_settings,
-        }
-        editor_state_service.check_object(parsed_editor_state)
-
-    saved = [save_upload_file(f, "posts", allow_video=True) for f in upload_files]
-    first_url, first_kind = saved[0]
-    post = models.Post(
-        user_id=current_user.id,
-        editor_state=parsed_editor_state,
-        caption=caption,
-        media_url=first_url,
-        media_type=models.MediaType.video if first_kind == "video" else models.MediaType.image,
-        alt_text=alt_text,
-        ai_generated=ai_generated,
-        music_title=music_title,
-        music_artist=music_artist,
-        music_url=music_url,
-        music_start_seconds=music_start_seconds if music_title or music_url else None,
-        # Flat columns stay populated for any existing reader of them
-        # directly, alongside the richer Location row (location_id) below.
-        location_name=location.name if location else location_name,
-        location_latitude=location.latitude if location else location_latitude,
-        location_longitude=location.longitude if location else location_longitude,
-        location_id=location.id if location else None,
-    )
-    db.add(post)
+    conversation = models.Conversation(is_group=False, title=None)
+    db.add(conversation)
     db.flush()
 
-    for position, (url, kind) in enumerate(saved):
-        media_kind = models.MediaType.video if kind == "video" else models.MediaType.image
-        thumbnail_url = generate_video_thumbnail(url) if media_kind == models.MediaType.video else None
-        db.add(models.PostMedia(
-            post_id=post.id,
-            media_url=url,
-            media_type=media_kind,
-            position=position,
-            caption=media_captions[position] if media_captions and position < len(media_captions) else None,
-            thumbnail_url=thumbnail_url,
-        ))
-
-    sync_post_hashtags(db, post, caption)
-
-    newly_mentioned = sync_mentions(db, models.MentionTargetType.post, post.id, caption, current_user.id)
-    for user in newly_mentioned:
-        await notify_user(
-            db,
-            user_id=user.id,
-            actor=current_user,
-            notif_type=models.NotificationType.mention,
-            message=f"{current_user.username} mentioned you in a post",
-            target_type="post",
-            target_id=post.id,
+    # Message requests: for a brand-new 1:1 thread, if the recipient
+    # doesn't already follow the sender, the thread lands in the
+    # recipient's Message Requests (GET /api/chat/requests) instead of
+    # their main inbox until they accept/decline — same as Instagram.
+    recipient_follows_sender = (
+        db.query(models.Follow)
+        .filter(
+            models.Follow.follower_id == other_user.id,
+            models.Follow.following_id == current_user.id,
         )
+        .first()
+        is not None
+    )
+    recipient_status = (
+        models.ParticipantStatus.accepted if recipient_follows_sender
+        else models.ParticipantStatus.pending
+    )
+    db.add(models.ConversationParticipant(
+        conversation_id=conversation.id, user_id=current_user.id,
+        status=models.ParticipantStatus.accepted,
+    ))
+    db.add(models.ConversationParticipant(
+        conversation_id=conversation.id, user_id=other_user.id, status=recipient_status,
+    ))
 
-    new_tags = _replace_post_tags(db, post, tag_ids, current_user) if tag_ids else []
-    if member_ids:
-        _replace_post_members(db, post, member_ids)
+    # Brand-new 1:1 thread — send the other person's auto-intro DM, as if
+    # it came from them, before either side has typed anything. If the other
+    # account has an enabled Business/Premium default menu, attach its saved
+    # greeting and options here so the customer sees the buttons immediately
+    # when opening the conversation (rather than an empty-options intro).
+    menu = chat_option_service.active_default_menu(db, other_user)
+    intro_text = (
+        chat_option_service.effective_greeting(menu)
+        if menu is not None else _build_intro_message(other_user)
+    )
+    intro = models.Message(
+        conversation_id=conversation.id,
+        sender_id=other_user.id,
+        content=intro_text,
+        is_auto_message=True,
+    )
+    if menu is not None:
+        for position, option in enumerate(menu.options):
+            intro.options.append(models.ChatMessageOption(
+                title=option["title"], action=option["action"], display_order=position
+            ))
+    db.add(intro)
 
     db.commit()
-    await tag_service.notify_new_tags(db, "post", post.id, current_user, new_tags)
-    db.refresh(post)
-    return _to_post_detail(db, post, current_user.id)
+    db.refresh(conversation)
+    return conversation, True
 
 
-# NOTE: /feed and /explore must be registered before the /{post_id} routes
-# below — Starlette matches routes in registration order, so a literal path
-# declared after a "/{post_id}" pattern would never be reached.
-
-@router.get("/feed", response_model=schemas.PaginatedPostDetailResponse)
-def get_home_feed(
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+@router.post(
+    "/conversations", response_model=schemas.ConversationOut, status_code=status.HTTP_201_CREATED
+)
+def create_conversation(
+    payload: schemas.ConversationCreate,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """
-    Posts from public accounts, people the current user follows, and their
-    own posts — newest first. A private account's posts only show up here
-    once the viewer is an approved follower (a pending FollowRequest does
-    not count — see _visible_authors_clause / models.FollowRequest).
-    """
-    query = db.query(models.Post).join(models.User, models.Post.user_id == models.User.id)
-    query = query.filter(_visible_authors_clause(db, current_user.id))
-    muted_ids = muted_user_ids(db, current_user.id, for_stories=False)
-    if muted_ids:
-        query = query.filter(models.Post.user_id.notin_(muted_ids))
-    query = _exclude_not_interested(
-        query, db, current_user.id, "post", models.Post.id
-    )
-    total = query.count()
-    posts = query.order_by(models.Post.created_at.desc()).offset(offset).limit(limit).all()
-    items = [_to_post_detail(db, p, current_user.id) for p in posts]
-    return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
-
-
-@router.get("/explore", response_model=schemas.PaginatedPostDetailResponse)
-def get_explore_feed(
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    days: int = Query(30, ge=1, le=90, description="Engagement window used for ranking, in days"),
-    db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
-):
-    """Posts from accounts the current user doesn't already follow (all
-    posts, if logged out), ranked by recent engagement (likes + comments in
-    the trailing `days` window) rather than plain recency — same idea as
-    GET /api/reels/trending, just without the score>0 filter, so posts with
-    no engagement yet still show up (ordered after everything that has some,
-    newest first).
-
-    The "don't already follow" narrowing is a personalization heuristic on
-    top of the privacy rules, not a privacy rule itself — a logged-in user
-    who already follows every author currently eligible for Explore (a
-    brand-new account that followed a handful of people, a small install
-    with few users, etc.) should still see the same publicly-visible feed
-    an anonymous viewer would, just without their own posts. So if
-    excluding followed authors would leave the feed empty, that exclusion
-    is dropped and Explore falls back to every visible post except the
-    viewer's own — privacy/visibility (_visible_authors_clause: private
-    accounts, blocks) is enforced in both the personalized and fallback
-    query and is never loosened.
-    """
-    viewer_id = current_user.id if current_user else None
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-
-    likes_subq = (
-        db.query(
-            models.Like.target_id.label("post_id"),
-            func.count(models.Like.id).label("like_score"),
-        )
-        .filter(
-            models.Like.target_type == models.LikeTargetType.post,
-            models.Like.created_at >= since,
-        )
-        .group_by(models.Like.target_id)
-        .subquery()
-    )
-    comments_subq = (
-        db.query(
-            models.Comment.post_id.label("post_id"),
-            func.count(models.Comment.id).label("comment_score"),
-        )
-        .filter(models.Comment.created_at >= since)
-        .group_by(models.Comment.post_id)
-        .subquery()
-    )
-    score = func.coalesce(likes_subq.c.like_score, 0) + func.coalesce(comments_subq.c.comment_score, 0)
-
-    def _base_query():
-        return (
-            db.query(models.Post, score.label("score"))
-            .join(models.User, models.Post.user_id == models.User.id)
-            .outerjoin(likes_subq, models.Post.id == likes_subq.c.post_id)
-            .outerjoin(comments_subq, models.Post.id == comments_subq.c.post_id)
-            .filter(_visible_authors_clause(db, viewer_id))
-        )
-
-    # Apply this to the shared base query so both the personalized Explore
-    # query and its fallback exclude the viewer's hidden posts.
-    base_query = _base_query()
-    query = _exclude_not_interested(
-        base_query, db, viewer_id, "post", models.Post.id
-    )
-
-    if current_user is not None:
-        excluded_ids = _following_ids(db, current_user.id) + [current_user.id]
-        personalized_query = query.filter(models.Post.user_id.notin_(excluded_ids))
-        if personalized_query.count() > 0:
-            query = personalized_query
-        else:
-            # Nothing left once followed accounts are excluded — fall back
-            # to every visible post except the viewer's own, rather than
-            # showing an empty Explore feed.
-            query = query.filter(models.Post.user_id != current_user.id)
-    query = query.order_by(score.desc(), models.Post.created_at.desc())
-
-    total = query.count()
-    rows = query.offset(offset).limit(limit).all()
-    items = [_to_post_detail(db, p, viewer_id) for p, _score in rows]
-    return schemas.PaginatedPostDetailResponse(total=total, limit=limit, offset=offset, items=items)
-
-
-@router.get("/{post_id}", response_model=schemas.PostDetailOut)
-def get_post(
-    post_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
-):
-    post = _get_post_or_404(db, post_id)
-    viewer_id = current_user.id if current_user else None
-    _require_author_visible(db, post.user, viewer_id)
-    return _to_post_detail(db, post, viewer_id)
-
-
-@router.put("/{post_id}", response_model=schemas.PostDetailOut)
-async def update_post(
-    post_id: int,
-    payload: schemas.PostUpdate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    post = _get_post_or_404(db, post_id)
-    if post.user_id != current_user.id:
+    other_ids = [uid for uid in payload.participant_ids if uid != current_user.id]
+    if not other_ids:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="You can only update your own posts"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A conversation needs at least one other participant",
         )
+
+    others = db.query(models.User).filter(models.User.id.in_(other_ids)).all()
+    found_ids = {u.id for u in others}
+    missing = [uid for uid in other_ids if uid not in found_ids]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User(s) not found: {', '.join(str(m) for m in missing)}",
+        )
+
+    is_group = len(other_ids) > 1
+
+    if not is_group:
+        conversation, is_new = get_or_create_direct_conversation(db, current_user, others[0])
+        out = _to_conversation_out(db, conversation, viewer_id=current_user.id)
+        out.is_new_conversation = is_new
+        out.profile_message = (
+            schemas.ProfileMessageOut(
+                message=_build_intro_message(others[0]),
+                profile_id=others[0].id,
+                account_type=others[0].account_type,
+            )
+            if is_new else None
+        )
+        return out
+
+    for uid in other_ids:
+        if is_blocked(db, current_user.id, uid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Can't message this user"
+            )
+
+    conversation = models.Conversation(is_group=True, title=payload.title)
+    db.add(conversation)
+    db.flush()
+
+    all_participant_ids = {current_user.id, *other_ids}
+    for uid in all_participant_ids:
+        db.add(models.ConversationParticipant(
+            conversation_id=conversation.id, user_id=uid, status=models.ParticipantStatus.accepted
+        ))
+
+    db.commit()
+    db.refresh(conversation)
+
+    out = _to_conversation_out(db, conversation, viewer_id=current_user.id)
+    out.is_new_conversation = True
+    out.profile_message = None
+    return out
+
+
+@router.get("/conversations", response_model=schemas.ConversationsResponse)
+def get_conversations(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Only conversations this user has accepted — pending message
+    requests live in GET /api/chat/requests until acted on."""
+    conversations = (
+        db.query(models.Conversation)
+        .join(models.ConversationParticipant)
+        .filter(
+            models.ConversationParticipant.user_id == current_user.id,
+            models.ConversationParticipant.status == models.ParticipantStatus.accepted,
+        )
+        .options(joinedload(models.Conversation.participants).joinedload(
+            models.ConversationParticipant.user
+        ))
+        .order_by(models.Conversation.created_at.desc())
+        .all()
+    )
+    items = [_to_conversation_out(db, c, viewer_id=current_user.id) for c in conversations]
+    # Most recently active conversation first.
+    items.sort(
+        key=lambda c: c.last_message.created_at if c.last_message else c.created_at,
+        reverse=True,
+    )
+    return schemas.ConversationsResponse(items=items)
+
+
+@router.get("/requests", response_model=schemas.ConversationsResponse)
+def get_message_requests(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """1:1 threads started by someone this user doesn't yet follow —
+    sitting here, unnotified-as-a-normal-DM, until accepted or declined."""
+    conversations = (
+        db.query(models.Conversation)
+        .join(models.ConversationParticipant)
+        .filter(
+            models.ConversationParticipant.user_id == current_user.id,
+            models.ConversationParticipant.status == models.ParticipantStatus.pending,
+        )
+        .options(joinedload(models.Conversation.participants).joinedload(
+            models.ConversationParticipant.user
+        ))
+        .order_by(models.Conversation.created_at.desc())
+        .all()
+    )
+    items = [_to_conversation_out(db, c, viewer_id=current_user.id) for c in conversations]
+    return schemas.ConversationsResponse(items=items)
+
+
+@router.post(
+    "/conversations/{conversation_id}/accept",
+    response_model=schemas.ConversationRequestActionResponse,
+)
+def accept_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    participant = _get_participant_or_403(db, conversation_id, current_user.id)
+    participant.status = models.ParticipantStatus.accepted
+    db.commit()
+    return schemas.ConversationRequestActionResponse(
+        message="Message request accepted", conversation_id=conversation_id
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/decline",
+    response_model=schemas.ConversationRequestActionResponse,
+)
+def decline_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Declining a request deletes the conversation outright (same as
+    Instagram deleting a declined DM request) — only meaningful for the
+    1:1, still-pending case, since that's the only kind a participant can
+    be 'pending' in."""
+    participant = _get_participant_or_403(db, conversation_id, current_user.id)
+    if participant.status != models.ParticipantStatus.pending:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="This conversation isn't a pending request"
+        )
+    conversation = _get_conversation_or_404(db, conversation_id)
+    db.delete(conversation)
+    db.commit()
+    return schemas.ConversationRequestActionResponse(
+        message="Message request declined", conversation_id=conversation_id
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/notification-settings",
+    response_model=schemas.ConversationNotificationSettingsOut,
+)
+def get_conversation_notification_settings(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    row = (
+        db.query(models.ConversationMute)
+        .filter(
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
+        )
+        .first()
+    )
+    return schemas.ConversationNotificationSettingsOut(
+        conversation_id=conversation_id,
+        mute_messages=bool(row.mute_messages) if row else False,
+        mute_calls=bool(row.mute_calls) if row else False,
+        hide_message_previews=bool(row.hide_message_previews) if row else False,
+    )
+
+
+@router.put(
+    "/conversations/{conversation_id}/notification-settings",
+    response_model=schemas.ConversationNotificationSettingsOut,
+)
+def update_conversation_notification_settings(
+    conversation_id: int,
+    payload: schemas.ConversationNotificationSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    row = (
+        db.query(models.ConversationMute)
+        .filter(
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
+        )
+        .first()
+    )
 
     updates = payload.model_dump(exclude_unset=True)
-
-    if "caption" in updates:
-        post.caption = updates["caption"]
-        db.flush()  # post.id already exists (update, not create), but keep
-        # ordering explicit: hashtag sync reads/writes rows keyed on it.
-        sync_post_hashtags(db, post, post.caption)
-        newly_mentioned = sync_mentions(
-            db, models.MentionTargetType.post, post.id, post.caption, current_user.id
+    if row is None:
+        row = models.ConversationMute(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            mute_messages=False,
+            mute_calls=False,
+            hide_message_previews=False,
         )
-        for user in newly_mentioned:
-            await notify_user(
-                db,
-                user_id=user.id,
-                actor=current_user,
-                notif_type=models.NotificationType.mention,
-                message=f"{current_user.username} mentioned you in a post",
-                target_type="post",
-                target_id=post.id,
-            )
+        db.add(row)
+        db.flush()
 
-    if "media" in updates and updates["media"] is not None:
-        # Apply captions only to matching media rows; omitted items stay unchanged.
-        media_by_id = {item.id: item for item in post.media_items}
-        for media_update in updates["media"]:
-            media_item = media_by_id.get(media_update["id"])
-            if media_item is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Media item {media_update['id']} was not found on this post",
-                )
-            if "caption" in media_update:
-                media_item.caption = media_update["caption"]
+    for field, value in updates.items():
+        if value is not None:
+            setattr(row, field, value)
 
-    if "alt_text" in updates:
-        post.alt_text = updates["alt_text"]
+    result = schemas.ConversationNotificationSettingsOut(
+        conversation_id=conversation_id,
+        mute_messages=bool(row.mute_messages),
+        mute_calls=bool(row.mute_calls),
+        hide_message_previews=bool(row.hide_message_previews),
+    )
 
-    if "ai_generated" in updates and updates["ai_generated"] is not None:
-        post.ai_generated = updates["ai_generated"]
-
-    if "editor_state" in updates:
-        post.editor_state = editor_state_service.check_object(updates["editor_state"])
-
-    if "music" in updates:
-        music = updates["music"]
-        if music is None:
-            post.music_title = None
-            post.music_artist = None
-            post.music_url = None
-            post.music_start_seconds = None
-        else:
-            post.music_title = music["title"]
-            post.music_artist = music.get("artist")
-            post.music_url = music["audio_url"]
-            post.music_start_seconds = music.get("start_seconds", 0)
-
-    if "location" in updates:
-        location = updates["location"]
-        if location is None:
-            post.location_name = None
-            post.location_latitude = None
-            post.location_longitude = None
-            post.location_id = None
-        else:
-            loc_row = find_or_create_location(
-                db,
-                name=location["name"],
-                latitude=location.get("latitude"),
-                longitude=location.get("longitude"),
-            )
-            post.location_name = loc_row.name
-            post.location_latitude = loc_row.latitude
-            post.location_longitude = loc_row.longitude
-            post.location_id = loc_row.id
-
-    new_tags = []
-    if updates.get("tag_user_ids") is not None:
-        new_tags = _replace_post_tags(db, post, updates["tag_user_ids"], current_user)
-
-    if updates.get("member_user_ids") is not None:
-        _replace_post_members(db, post, updates["member_user_ids"])
+    if not (
+        result.mute_messages
+        or result.mute_calls
+        or result.hide_message_previews
+    ):
+        db.delete(row)
 
     db.commit()
-    await tag_service.notify_new_tags(db, "post", post.id, current_user, new_tags)
-    db.refresh(post)
-    return _to_post_detail(db, post, current_user.id)
+    return result
 
 
-@router.put("/{post_id}/media", response_model=schemas.PostDetailOut)
-def update_post_media(
-    post_id: int,
-    file: UploadFile | None = File(default=None, description="Replace with a single file (unchanged behavior)."),
-    files: list[UploadFile] | None = File(
-        default=None, description="Replace with 2+ files instead, for a carousel post."
-    ),
-    media_captions: list[str] | None = Form(
-        default=None, description="One caption per uploaded file, in the same order; trailing captions may be omitted."
-    ),
+@router.post("/conversations/{conversation_id}/mute", response_model=schemas.MessageResponse)
+def mute_conversation(
+    conversation_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Replace all of a post's media in one shot. Separate from PUT /:id
-    because this needs multipart, not JSON. Full replace, same as before:
-    whatever files are sent here become the post's entire media set —
-    anything previously attached is deleted (DB rows and files on disk)."""
-    post = _get_post_or_404(db, post_id)
-    if post.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="You can only update your own posts"
-        )
-
-    upload_files = [f for f in (files or []) if f is not None and f.filename]
-    if file is not None and file.filename:
-        upload_files = [file] + upload_files
-    if not upload_files:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Attach at least one file via `file` (single) or `files` (multiple)",
-        )
-    if media_captions is not None and len(media_captions) > len(upload_files):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="media_captions cannot contain more captions than uploaded files",
-        )
-
-    old_urls = [post.media_url] + [m.media_url for m in post.media_items]
-    old_urls = list(dict.fromkeys(old_urls))  # de-dupe (media_items[0] often == media_url)
-
-    saved = [save_upload_file(f, "posts", allow_video=True) for f in upload_files]
-    first_url, first_kind = saved[0]
-    post.media_url = first_url
-    post.media_type = models.MediaType.video if first_kind == "video" else models.MediaType.image
-
-    for m in list(post.media_items):
-        db.delete(m)
-    db.flush()
-    for position, (url, kind) in enumerate(saved):
-        media_kind = models.MediaType.video if kind == "video" else models.MediaType.image
-        thumbnail_url = generate_video_thumbnail(url) if media_kind == models.MediaType.video else None
-        db.add(models.PostMedia(
-            post_id=post.id,
-            media_url=url,
-            media_type=media_kind,
-            position=position,
-            caption=media_captions[position] if media_captions and position < len(media_captions) else None,
-            thumbnail_url=thumbnail_url,
-        ))
-
-    db.commit()
-    db.refresh(post)
-    for old_url in old_urls:
-        delete_media_file(old_url)
-    return _to_post_detail(db, post, current_user.id)
-
-
-@router.delete("/{post_id}", response_model=schemas.MessageResponse)
-def delete_post(
-    post_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    post = _get_post_or_404(db, post_id)
-    if post.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="You can only delete your own posts"
-        )
-
-    # Comments and likes reference this post by plain id (not a SQLAlchemy
-    # ForeignKey/relationship — see models.Comment / models.Like), so the
-    # ORM can't cascade-delete them automatically the way it does for
-    # `saves` below. Clean them up explicitly.
-    comment_ids = [
-        row[0]
-        for row in db.query(models.Comment.id).filter(models.Comment.post_id == post_id).all()
-    ]
-    if comment_ids:
-        db.query(models.Like).filter(
-            models.Like.target_type == models.LikeTargetType.comment,
-            models.Like.target_id.in_(comment_ids),
-        ).delete(synchronize_session=False)
-        db.query(models.Comment).filter(models.Comment.post_id == post_id).delete(
-            synchronize_session=False
-        )
-
-    db.query(models.Like).filter(
-        models.Like.target_type == models.LikeTargetType.post,
-        models.Like.target_id == post_id,
-    ).delete(synchronize_session=False)
-
-    media_urls = list(dict.fromkeys([post.media_url] + [m.media_url for m in post.media_items]))
-    db.delete(post)  # cascades saved_posts/media_items/hashtag_rows via the ORM relationship
-    db.commit()
-    for url in media_urls:
-        delete_media_file(url)
-    return schemas.MessageResponse(message="Post deleted")
-
-
-def _save_target(
-    db: Session, user_id: int, target_type: models.SavedItemType, target_id: int
-) -> None:
+    _get_participant_or_403(db, conversation_id, current_user.id)
     existing = (
-        db.query(models.SavedItem)
+        db.query(models.ConversationMute)
         .filter(
-            models.SavedItem.user_id == user_id,
-            models.SavedItem.target_type == target_type,
-            models.SavedItem.target_id == target_id,
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
         )
         .first()
     )
     if existing is None:
-        db.add(
-            models.SavedItem(user_id=user_id, target_type=target_type, target_id=target_id)
+        existing = models.ConversationMute(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            mute_messages=True,
+            mute_calls=False,
+            hide_message_previews=False,
         )
+        db.add(existing)
+    else:
+        existing.mute_messages = True
+    db.commit()
+    return schemas.MessageResponse(message="Conversation muted")
+
+
+@router.delete("/conversations/{conversation_id}/mute", response_model=schemas.MessageResponse)
+def unmute_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = (
+        db.query(models.ConversationMute)
+        .filter(
+            models.ConversationMute.user_id == current_user.id,
+            models.ConversationMute.conversation_id == conversation_id,
+        )
+        .first()
+    )
+    if row is not None:
+        row.mute_messages = False
+        if not (row.mute_calls or row.hide_message_previews):
+            db.delete(row)
+        db.commit()
+    return schemas.MessageResponse(message="Conversation unmuted")
+
+
+@router.delete("/conversations/{conversation_id}", response_model=schemas.MessageResponse)
+def delete_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Removes the conversation from the caller's own inbox — same as
+    WhatsApp/Instagram's "delete chat": the other participant(s) keep
+    their copy and their message history untouched. Implemented by
+    removing just the caller's ConversationParticipant row; once nobody
+    is left in a conversation, it (and its messages) are deleted outright.
+    """
+    _get_conversation_or_404(db, conversation_id)
+    my_participant = _get_participant_or_403(db, conversation_id, current_user.id)
+
+    db.delete(my_participant)
+    db.commit()
+
+    remaining = (
+        db.query(models.ConversationParticipant)
+        .filter(models.ConversationParticipant.conversation_id == conversation_id)
+        .count()
+    )
+    if remaining == 0:
+        conversation = _get_conversation_or_404(db, conversation_id)
+        db.delete(conversation)  # cascades messages, reactions, statuses
         db.commit()
 
+    return schemas.MessageResponse(message="Conversation deleted")
 
-def _unsave_target(
-    db: Session, user_id: int, target_type: models.SavedItemType, target_id: int
+
+@router.get("/users/{user_id}/online", response_model=schemas.OnlineStatusOut)
+def get_online_status(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Whether a user currently has an open chat WebSocket connection."""
+    exists = db.query(models.User.id).filter(models.User.id == user_id).first()
+    if exists is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return schemas.OnlineStatusOut(user_id=user_id, is_online=manager.is_online(user_id))
+
+
+# ==========================================================================
+# Messages
+# ==========================================================================
+
+@router.get(
+    "/conversations/{conversation_id}/messages", response_model=schemas.PaginatedMessagesResponse
+)
+def get_messages(
+    conversation_id: int,
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_conversation_or_404(db, conversation_id)
+    _require_participant(db, conversation_id, current_user.id)
+
+    query = db.query(models.Message).filter(
+    models.Message.conversation_id == conversation_id,
+)
+    total = query.count()
+    # Most recent first, same convention as every other paginated feed here.
+    messages = (
+        query.order_by(models.Message.created_at.desc()).offset(offset).limit(limit).all()
+    )
+
+    # Fetching your messages counts as your device having received them —
+    # covers the case where you were offline when they were sent (send_message
+    # only marks delivered_at immediately for recipients who were online).
+    message_ids = [m.id for m in messages if m.sender_id != current_user.id]
+    if message_ids:
+        undelivered = (
+            db.query(models.MessageStatus)
+            .filter(
+                models.MessageStatus.message_id.in_(message_ids),
+                models.MessageStatus.user_id == current_user.id,
+                models.MessageStatus.delivered_at.is_(None),
+            )
+            .all()
+        )
+        if undelivered:
+            now = datetime.now(timezone.utc)
+            for s in undelivered:
+                s.delivered_at = now
+            db.commit()
+
+    items = [_to_message_out(db, m, current_user.id) for m in messages]
+    return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+@router.get(
+    "/conversations/{conversation_id}/media", response_model=schemas.PaginatedMessagesResponse
+)
+def get_conversation_media(
+    conversation_id: int,
+    media_type: models.MediaType | None = Query(
+        default=None, description="Filter to just image, video, or audio (voice notes)"
+    ),
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """The conversation's media gallery — every image/video/voice-note
+    message, newest first, optionally narrowed to one media_type. Same
+    shape as GET .../messages (still individual messages, just filtered to
+    ones with an attachment) so a client can reuse its message-rendering
+    code for grid/gallery view."""
+    _get_conversation_or_404(db, conversation_id)
+    _require_participant(db, conversation_id, current_user.id)
+
+    query = db.query(models.Message).filter(
+        models.Message.conversation_id == conversation_id,
+        models.Message.is_deleted.is_(False),
+        models.Message.media_url.isnot(None),
+    )
+    if media_type is not None:
+        query = query.filter(models.Message.media_type == media_type)
+
+    total = query.count()
+    messages = query.order_by(models.Message.created_at.desc()).offset(offset).limit(limit).all()
+    items = [_to_message_out(db, m, current_user.id) for m in messages]
+    return schemas.PaginatedMessagesResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+async def _push_message_event(
+    db: Session,
+    recipient_ids: list[int],
+    message: models.Message,
+    event_type: str,
+    default_out: schemas.MessageOut,
 ) -> None:
-    existing = (
-        db.query(models.SavedItem)
+    """Send a "message" / "message_edited" socket event. Normally every
+    recipient gets the same payload; a shared reel/post's preview depends on
+    who's looking, so those are built and sent per recipient."""
+    base = {"type": event_type, "conversation_id": message.conversation_id}
+    if (
+        message.shared_reel_id is None
+        and message.shared_post_id is None
+        and message.sticker_id is None
+    ):
+        await manager.send_to_users(
+            recipient_ids, {**base, "message": default_out.model_dump(mode="json")}
+        )
+        return
+    for uid in recipient_ids:
+        out = _to_message_out(db, message, viewer_id=uid)
+        await manager.send_to_users([uid], {**base, "message": out.model_dump(mode="json")})
+
+
+async def _maybe_send_default_menu(
+    db: Session,
+    conversation_id: int,
+    customer: models.User,
+    customer_message: models.Message,
+) -> schemas.MessageOut | None:
+    """Automatic default menu. Called right after `customer` sent
+    `customer_message`; if the other person in this 1:1 conversation is a
+    Business / Premium account with an enabled default menu and the
+    conversation has been inactive, sends that account's greeting — from
+    them, flagged `is_auto_message` — with the menu attached as ordinary
+    message options (so selection and analytics work as usual).
+
+    Returns the greeting as the *customer* sees it (for the `auto_reply`
+    field of their send response), or None. It never fails the customer's
+    send: the customer's message is already saved, so any error here is
+    logged and swallowed.
+    """
+    try:
+        conversation = db.get(models.Conversation, conversation_id)
+        if conversation is None or conversation.is_group:
+            return None
+        participant_ids = _conversation_participant_ids(db, conversation_id)
+        if len(participant_ids) != 2 or customer.id not in participant_ids:
+            return None
+        business = db.get(models.User, next(uid for uid in participant_ids if uid != customer.id))
+        if business is None:
+            return None
+
+        menu = chat_option_service.active_default_menu(db, business)
+        if menu is None:
+            return None
+
+        # If the conversation was just created with the menu-bearing intro,
+        # return that already-persisted message rather than sending a duplicate
+        # greeting after the customer's first message. On later inactive
+        # conversations, the normal 24-hour re-send behavior still applies.
+        prior_human_message = (
+            db.query(models.Message)
+            .filter(
+                models.Message.conversation_id == conversation_id,
+                models.Message.id < customer_message.id,
+                models.Message.is_deleted.is_(False),
+                models.Message.is_auto_message.is_(False),
+            )
+            .order_by(models.Message.id.desc())
+            .first()
+        )
+        if prior_human_message is None:
+            intro = (
+                db.query(models.Message)
+                .filter(
+                    models.Message.conversation_id == conversation_id,
+                    models.Message.sender_id == business.id,
+                    models.Message.is_auto_message.is_(True),
+                    models.Message.is_deleted.is_(False),
+                )
+                .order_by(models.Message.id.desc())
+                .first()
+            )
+            if intro is not None and intro.options:
+                return _to_message_out(db, intro, customer.id)
+
+        if not chat_option_service.conversation_is_inactive(db, conversation_id, customer_message.id):
+            return None
+
+        greeting = models.Message(
+            conversation_id=conversation_id,
+            sender_id=business.id,
+            content=chat_option_service.effective_greeting(menu),
+            is_auto_message=True,
+        )
+        business_view = await _create_and_dispatch_message(
+            db,
+            conversation_id,
+            greeting,
+            business,
+            greeting.content[:80],
+            options=[schemas.ChatOptionIn(title=o["title"], action=o["action"]) for o in menu.options],
+            mark_sender_read=False,  # the customer's message is still unread for the business
+        )
+        # The business's own open chat screen should show it too.
+        await _push_message_event(db, [business.id], greeting, "message", business_view)
+        return _to_message_out(db, greeting, customer.id)
+    except Exception:  # noqa: BLE001 - must never break the customer's send
+        logger.exception("default menu auto-send failed for conversation %s", conversation_id)
+        db.rollback()
+        return None
+
+
+async def _create_and_dispatch_message(
+    db: Session,
+    conversation_id: int,
+    message: models.Message,
+    current_user: models.User,
+    preview: str,
+    options: list[schemas.ChatOptionIn] | None = None,
+    mark_sender_read: bool = True,
+) -> schemas.MessageOut:
+    """Shared by send_message (text) and send_media_message (image/video/
+    voice): persist the message, mark it read for the sender, create
+    per-recipient delivery-status rows, push it live over the chat socket,
+    and notify anyone who isn't currently connected. `preview` is the
+    short text used in that notification (e.g. the caption, or "Sent a
+    photo" for a caption-less media message)."""
+    db.add(message)
+    if message.message_type == "sticker" and message.sticker_id is not None:
+        db.add(models.StickerUsage(user_id=current_user.id, sticker_id=message.sticker_id))
+    for position, option in enumerate(options or []):
+        message.options.append(models.ChatMessageOption(
+            title=option.title, action=option.action, display_order=position
+        ))
+    db.commit()
+    db.refresh(message)
+
+    my_participant = _get_participant_or_403(db, conversation_id, current_user.id)
+    if mark_sender_read:
+        my_participant.last_read_message_id = message.id
+        db.commit()
+
+    participant_ids = _conversation_participant_ids(db, conversation_id)
+    recipient_ids = [uid for uid in participant_ids if uid != current_user.id]
+
+    now = datetime.now(timezone.utc)
+    for uid in recipient_ids:
+        db.add(models.MessageStatus(
+            message_id=message.id,
+            user_id=uid,
+            delivered_at=now if manager.is_online(uid) else None,
+        ))
+    db.commit()
+
+    message_out = _to_message_out(db, message, current_user.id)
+
+    await _push_message_event(db, recipient_ids, message, "message", message_out)
+
+    offline_ids = [uid for uid in recipient_ids if not manager.is_online(uid)]
+    # Muted-conversation participants still get delivery/WS updates above
+    # (the thread itself is unaffected) — muting only suppresses the
+    # Notification row + push below, same as Instagram's "mute
+    # notifications for this chat".
+    notify_ids = [uid for uid in offline_ids if not is_conversation_muted(db, uid, conversation_id)]
+    for uid in notify_ids:
+        await notify_user(
+            db,
+            user_id=uid,
+            actor=current_user,
+            notif_type=models.NotificationType.message,
+            message=f"{current_user.username} sent you a message",
+            target_type="conversation",
+            target_id=conversation_id,
+            push_body=(
+                "You received a new message"
+                if (
+                    (settings_row := db.query(models.ConversationMute)
+                     .filter(
+                         models.ConversationMute.user_id == uid,
+                         models.ConversationMute.conversation_id == conversation_id,
+                     )
+                     .first())
+                    and settings_row.hide_message_previews
+                )
+                else preview
+            ),
+        )
+
+    return message_out
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages",
+    response_model=schemas.MessageOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_message(
+    conversation_id: int,
+    payload: schemas.MessageCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_conversation_or_404(db, conversation_id)
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    _reject_if_blocked_in_conversation(db, conversation_id, current_user.id)
+
+    reply_to_id = _validate_reply_target(db, conversation_id, payload.reply_to_message_id)
+
+    if payload.options:
+        # Backend-enforced: only Business / active-Premium accounts may attach buttons.
+        chat_option_service.require_eligible_sender(db, current_user)
+
+    sticker_row = None
+    if payload.message_type == "sticker":
+        sticker_row = db.query(models.Sticker).filter(models.Sticker.id == payload.sticker_id).first()
+        if sticker_row is None:
+            raise HTTPException(status_code=404, detail="Sticker not found")
+        can_use = (
+            (sticker_row.owner_id == current_user.id and sticker_row.visibility == "private")
+            or (sticker_row.visibility == "public" and sticker_row.approval_status == "approved")
+            or db.query(models.Message.id).filter(
+                models.Message.conversation_id == conversation_id,
+                models.Message.sticker_id == sticker_row.id,
+            ).first() is not None
+        )
+        if not can_use:
+            raise HTTPException(status_code=404, detail="Sticker not found")
+    if payload.shared_reel_id is not None:
+        # Share a reel as a card (optionally with a note in `content`).
+        _get_shareable_reel_or_404(db, payload.shared_reel_id, current_user.id)
+    elif payload.shared_post_id is not None:
+        # Share a post as a card (optionally with a note in `content`).
+        _get_shareable_post_or_404(db, payload.shared_post_id, current_user.id)
+
+    message = models.Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content=payload.content,
+        message_type=payload.message_type,
+        sticker_id=payload.sticker_id if payload.message_type == "sticker" else None,
+        reply_to_message_id=reply_to_id,
+        shared_reel_id=payload.shared_reel_id,
+        shared_post_id=payload.shared_post_id,
+        expires_at=_message_expiry(db, conversation_id),
+    )
+    default_preview = (
+        "Sent a reel" if payload.shared_reel_id is not None
+        else "Sent a post" if payload.shared_post_id is not None
+        else ""
+    )
+    text = payload.content or ("Sent a sticker" if payload.message_type == "sticker" else default_preview)
+    preview = text if len(text) <= 80 else text[:77] + "..."
+    message_out = await _create_and_dispatch_message(
+        db, conversation_id, message, current_user, preview, options=payload.options
+    )
+    message_out.auto_reply = await _maybe_send_default_menu(db, conversation_id, current_user, message)
+    return message_out
+
+
+@router.post(
+    "/conversations/{conversation_id}/media",
+    response_model=schemas.MediaMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_media_message(
+    conversation_id: int,
+    file: UploadFile,
+    caption: str | None = Form(default=None),
+    reply_to_message_id: int | None = Form(default=None),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Send an image, video, or voice note. `file`'s content-type decides
+    which: images and videos go through the same validation as posts/reels
+    (see save_upload_file); anything under `audio/*` is treated as a voice
+    note. `caption` is optional text alongside the media."""
+    _get_conversation_or_404(db, conversation_id)
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    _reject_if_blocked_in_conversation(db, conversation_id, current_user.id)
+
+    reply_to_id = _validate_reply_target(db, conversation_id, reply_to_message_id)
+
+    content_type = (file.content_type or "").lower()
+    if content_type.startswith("audio/"):
+        url, kind = save_upload_file(file, "chat_voice", allow_audio=True)
+    else:
+        url, kind = save_upload_file(file, "chat_media", allow_video=True)
+
+    media_type = {
+        "image": models.MediaType.image,
+        "video": models.MediaType.video,
+        "audio": models.MediaType.audio,
+    }[kind]
+
+    message = models.Message(
+        conversation_id=conversation_id,
+        sender_id=current_user.id,
+        content=caption,
+        media_url=url,
+        media_type=media_type,
+        reply_to_message_id=reply_to_id,
+        expires_at=_message_expiry(db, conversation_id),
+    )
+    preview = caption or {"image": "Sent a photo", "video": "Sent a video", "audio": "Sent a voice message"}[kind]
+    message_out = await _create_and_dispatch_message(db, conversation_id, message, current_user, preview)
+    auto_reply = await _maybe_send_default_menu(db, conversation_id, current_user, message)
+    return schemas.MediaMessageResponse(
+        auto_reply=auto_reply,
+        id=message_out.id,
+        conversation_id=message_out.conversation_id,
+        sender_id=message_out.sender_id,
+        content=message_out.content,
+        media_url=message_out.media_url,
+        media_type=message_out.media_type,
+        reply_to_message_id=message_out.reply_to_message_id,
+        created_at=message_out.created_at,
+    )
+
+
+@router.post("/conversations/{conversation_id}/read", response_model=schemas.MarkReadResponse)
+async def mark_conversation_read(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Marks everything currently in the conversation as read by the caller,
+    and lets other participants know via a 'read' WebSocket event."""
+    _get_conversation_or_404(db, conversation_id)
+    participant = _get_participant_or_403(db, conversation_id, current_user.id)
+
+    latest = (
+        db.query(models.Message)
+        .filter(models.Message.conversation_id == conversation_id)
+        .order_by(models.Message.id.desc())
+        .first()
+    )
+    if latest is not None:
+        participant.last_read_message_id = latest.id
+        db.commit()
+
+        now = datetime.now(timezone.utc)
+        statuses = (
+            db.query(models.MessageStatus)
+            .join(models.Message, models.Message.id == models.MessageStatus.message_id)
+            .filter(
+                models.Message.conversation_id == conversation_id,
+                models.MessageStatus.user_id == current_user.id,
+                models.MessageStatus.read_at.is_(None),
+            )
+            .all()
+        )
+        for s in statuses:
+            s.read_at = now
+            if s.delivered_at is None:
+                s.delivered_at = now  # reading implies it was delivered
+        if statuses:
+            db.commit()
+
+    other_ids = [uid for uid in _conversation_participant_ids(db, conversation_id) if uid != current_user.id]
+    await manager.send_to_users(
+        other_ids,
+        {
+            "type": "read",
+            "conversation_id": conversation_id,
+            "user_id": current_user.id,
+            "last_read_message_id": latest.id if latest else None,
+        },
+    )
+
+    return schemas.MarkReadResponse(
+        message="Marked as read", last_read_message_id=latest.id if latest else None
+    )
+
+
+def _get_message_or_404(db: Session, message_id: int) -> models.Message:
+    message = db.query(models.Message).filter(models.Message.id == message_id).first()
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    return message
+
+
+@router.put("/messages/{message_id}", response_model=schemas.MessageOut)
+async def edit_message(
+    message_id: int,
+    payload: schemas.MessageEditRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = _get_message_or_404(db, message_id)
+    if message.sender_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only edit your own messages"
+        )
+    if message.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Can't edit a deleted message"
+        )
+
+    message.content = payload.content
+    message.edited_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(message)
+
+    message_out = _to_message_out(db, message, current_user.id)
+    other_ids = [
+        uid for uid in _conversation_participant_ids(db, message.conversation_id)
+        if uid != current_user.id
+    ]
+    await _push_message_event(db, other_ids, message, "message_edited", message_out)
+    return message_out
+
+
+@router.post("/messages/bulk-delete")
+async def bulk_delete_messages(
+    payload: BulkMessageDeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Soft-delete up to 500 of the caller's own messages in one conversation."""
+    _require_participant(db, payload.chat_id, current_user.id)
+    ids = list(dict.fromkeys(payload.message_ids))
+    messages = (
+        db.query(models.Message)
         .filter(
-            models.SavedItem.user_id == user_id,
-            models.SavedItem.target_type == target_type,
-            models.SavedItem.target_id == target_id,
+            models.Message.conversation_id == payload.chat_id,
+            models.Message.id.in_(ids),
+        )
+        .all()
+    )
+    found_ids = {message.id for message in messages}
+    if found_ids != set(ids):
+        raise HTTPException(status_code=404, detail="One or more messages were not found in this chat")
+    if any(message.sender_id != current_user.id for message in messages):
+        raise HTTPException(status_code=403, detail="You can only delete your own messages")
+
+    active_messages = [message for message in messages if not message.is_deleted]
+    now = datetime.now(timezone.utc)
+    for message in active_messages:
+        message.is_deleted = True
+        message.deleted_at = now
+        db.query(models.MessageReaction).filter(
+            models.MessageReaction.message_id == message.id
+        ).delete(synchronize_session=False)
+    db.commit()
+
+    deleted_ids = [message.id for message in active_messages]
+    other_ids = [uid for uid in _conversation_participant_ids(db, payload.chat_id) if uid != current_user.id]
+    if deleted_ids:
+        await manager.send_to_users(
+            other_ids,
+            {
+                "type": "messages_bulk_deleted",
+                "conversation_id": payload.chat_id,
+                "message_ids": deleted_ids,
+            },
+        )
+    return {
+        "success": True,
+        "message": "Messages deleted successfully",
+        "chat_id": payload.chat_id,
+        "deleted_count": len(deleted_ids),
+        "deleted_message_ids": deleted_ids,
+    }
+
+
+@router.post("/conversations/{conversation_id}/leave")
+async def leave_chat_screen(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Call when the chat screen is closed. In disappearing mode, clear all
+    conversation messages for everyone. In regular mode, preserve history."""
+    _require_participant(db, conversation_id, current_user.id)
+    setting = db.query(models.ConversationDisappearingSetting).filter_by(
+        conversation_id=conversation_id
+    ).first()
+    mode = setting.chat_mode if setting else "disappearing"
+    deleted_count = 0
+    if mode == "disappearing":
+        messages = db.query(models.Message).filter(
+            models.Message.conversation_id == conversation_id
+        ).all()
+        deleted_count = len(messages)
+        for message in messages:
+            db.delete(message)
+        db.commit()
+        participant_ids = [
+            uid for uid in _conversation_participant_ids(db, conversation_id)
+            if uid != current_user.id
+        ]
+        await manager.send_to_users(
+            participant_ids,
+            {
+                "type": "conversation_messages_cleared",
+                "conversation_id": conversation_id,
+                "reason": "disappearing_chat_left",
+            },
+        )
+    return {
+        "success": True,
+        "conversation_id": conversation_id,
+        "mode": mode,
+        "deleted_count": deleted_count,
+        "messages_cleared": mode == "disappearing",
+    }
+
+
+@router.delete("/messages/{message_id}", response_model=schemas.MessageResponse)
+async def delete_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Soft delete — the row and its history stay (for moderation/audit),
+    but content is never returned again once deleted; see _to_message_out.
+    This deletes for everyone in the conversation, not just the caller."""
+    message = _get_message_or_404(db, message_id)
+    if message.sender_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only delete your own messages"
+        )
+
+    message.is_deleted = True
+    message.deleted_at = datetime.now(timezone.utc)
+    db.query(models.MessageReaction).filter(
+        models.MessageReaction.message_id == message_id
+    ).delete(synchronize_session=False)
+    db.commit()
+
+    other_ids = [
+        uid for uid in _conversation_participant_ids(db, message.conversation_id)
+        if uid != current_user.id
+    ]
+    await manager.send_to_users(
+        other_ids,
+        {
+            "type": "message_deleted",
+            "conversation_id": message.conversation_id,
+            "message_id": message_id,
+        },
+    )
+    return schemas.MessageResponse(message="Message deleted")
+
+
+@router.post("/messages/{message_id}/react", response_model=schemas.MessageOut)
+async def react_to_message(
+    message_id: int,
+    payload: schemas.MessageReactionCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = _get_message_or_404(db, message_id)
+    _require_participant(db, message.conversation_id, current_user.id)
+    if message.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Can't react to a deleted message"
+        )
+
+    existing = (
+        db.query(models.MessageReaction)
+        .filter(
+            models.MessageReaction.message_id == message_id,
+            models.MessageReaction.user_id == current_user.id,
+        )
+        .first()
+    )
+    if existing is not None:
+        existing.emoji = payload.emoji
+    else:
+        db.add(models.MessageReaction(
+            message_id=message_id, user_id=current_user.id, emoji=payload.emoji
+        ))
+    db.commit()
+    db.refresh(message)
+
+    message_out = _to_message_out(db, message, current_user.id)
+    other_ids = [
+        uid for uid in _conversation_participant_ids(db, message.conversation_id)
+        if uid != current_user.id
+    ]
+    await manager.send_to_users(
+        other_ids,
+        {
+            "type": "message_reaction",
+            "conversation_id": message.conversation_id,
+            "message_id": message_id,
+            "user_id": current_user.id,
+            "emoji": payload.emoji,
+        },
+    )
+    return message_out
+
+
+@router.delete("/messages/{message_id}/react", response_model=schemas.MessageOut)
+async def remove_message_reaction(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = _get_message_or_404(db, message_id)
+    _require_participant(db, message.conversation_id, current_user.id)
+
+    existing = (
+        db.query(models.MessageReaction)
+        .filter(
+            models.MessageReaction.message_id == message_id,
+            models.MessageReaction.user_id == current_user.id,
         )
         .first()
     )
     if existing is not None:
         db.delete(existing)
         db.commit()
+        db.refresh(message)
 
+        other_ids = [
+            uid for uid in _conversation_participant_ids(db, message.conversation_id)
+            if uid != current_user.id
+        ]
+        await manager.send_to_users(
+            other_ids,
+            {
+                "type": "message_reaction_removed",
+                "conversation_id": message.conversation_id,
+                "message_id": message_id,
+                "user_id": current_user.id,
+            },
+        )
 
-@router.post("/{post_id}/save", response_model=schemas.MessageResponse)
-def save_post(
-    post_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    _get_post_or_404(db, post_id)
-    _save_target(db, current_user.id, models.SavedItemType.post, post_id)
-    return schemas.MessageResponse(message="Post saved")
-
-
-@router.delete("/{post_id}/save", response_model=schemas.MessageResponse)
-def unsave_post(
-    post_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    _unsave_target(db, current_user.id, models.SavedItemType.post, post_id)
-    return schemas.MessageResponse(message="Post unsaved")
+    return _to_message_out(db, message, current_user.id)
 
 
 # ==========================================================================
-# Reels
+# Chat settings
 # ==========================================================================
 
-@reels_router.post("", response_model=schemas.ReelDetailOut, status_code=status.HTTP_201_CREATED)
-async def create_reel(
-    file: UploadFile,
-    title: str | None = Form(default=None, max_length=150),
-    caption: str | None = Form(default=None),
-    # Share Reel screen settings are accepted with the upload so the client
-    # does not need a video_id before it can save per-reel options.
-    audience: str = Form(default="everyone"),
-    visibility: str = Form(default="public"),
-    age_restriction: str | None = Form(default=None),
-    comments_enabled: bool = Form(default=True),
-    hide_like_count: bool = Form(default=False),
-    hide_comments: bool = Form(default=False),
-    remixing_enabled: bool = Form(default=True),
-    downloads_enabled: bool = Form(default=True),
-    schedule_enabled: bool = Form(default=False),
-    scheduled_at: datetime | None = Form(default=None),
-    thumbnail: UploadFile | None = File(default=None),
-    source: str = Form(default="gallery", description="gallery or camera; camera means recorded in-app"),
-    location_name: str | None = Form(default=None),
-    location_latitude: OptionalFloatForm(
-        description="Optional. Leave unset (or blank) for no coordinates."
-    ) = None,
-    location_longitude: OptionalFloatForm(
-        description="Optional. Leave unset (or blank) for no coordinates."
-    ) = None,
-    location_id: OptionalIntForm(
-        description="Optional. Attach an already-saved location (see POST /api/locations) by id. "
-        "Leave unset (or blank) if you're not tagging an existing saved location."
-    ) = None,
-    location_address: str | None = Form(default=None),
-    location_city: str | None = Form(default=None),
-    location_state: str | None = Form(default=None),
-    location_country: str | None = Form(default=None),
-    location_place_id: str | None = Form(default=None),
-    audio_id: OptionalIntForm(
-        description="Optional. Use an existing saved sound (see GET /api/audio/{id}) as this "
-        "reel's audio track. Leave unset for a reel with its own original audio."
-    ) = None,
-    editor_state: str | None = Form(
-        default=None, description=editor_state_service.EDITOR_STATE_FORM_DESCRIPTION
-    ),
-    recording_duration_seconds: float | None = Form(
-        default=None, ge=0, le=600,
-        description="Optional actual recording duration in seconds (0–600). Metadata only; video duration is measured from the uploaded file.",
-    ),
-    timer_duration_seconds: int | None = Form(
-        default=None, ge=0, le=10,
-        description="Optional pre-recording countdown duration in seconds (0–10).",
-    ),
-    filter_id: str | None = Form(
-        default=None, max_length=100,
-        description="Optional frontend filter identifier, e.g. smooth_blur. The client must apply the filter to the uploaded video.",
-    ),
-    playback_speed: int | None = Form(
-        default=None, description="Optional speed applied by the client before upload: 1, 2, or 3.",
-    ),
-    audio_start_seconds: int | None = Form(
-        default=None, ge=0,
-        description="Optional offset in seconds for the selected audio track; does not mix audio into the video.",
-    ),
-    tag_user_ids: str | None = Form(
-        default=None, description="Comma-separated user ids to tag, e.g. '12,15,20'"
-    ),
+@router.get("/settings/font", response_model=schemas.ChatFontResponse)
+def get_chat_font(
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return the current user's chat display-font preference."""
+    return schemas.ChatFontResponse(message="Chat font retrieved", font=current_user.chat_font or "default")
+
+
+@router.put("/settings/font", response_model=schemas.ChatFontResponse)
+def update_chat_font(
+    payload: schemas.ChatFontUpdateRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """
-    `tag_user_ids` tags people as the reel is created (same rules as POST
-    /api/reels/{id}/tags: no blocked users, respects each person's "who can
-    tag me" / approve-manually settings, they get notified). The whole
-    request is rejected up front if anyone can't be tagged, so no reel is
-    created. To place a tag at a position on the video, or to add/remove
-    tags later, use POST/DELETE /api/reels/{id}/tags.
-
-    `thumbnail` is optional — send a poster-frame image alongside the video
-    in the same multipart request and it's used as thumbnail_url as-is.
-    If you don't send one, the backend automatically extracts a frame from
-    the uploaded video itself (via ffmpeg) and uses that instead — you
-    don't need to generate or upload a thumbnail on the frontend at all
-    unless you want to override the auto-generated one. If ffmpeg isn't
-    available on the server or the video can't be read, thumbnail_url
-    just comes back null (never blocks the reel from being created); you
-    can still call POST /api/videos/{id}/thumbnail afterward to attach one.
-
-    Location works the same as POST /api/posts: pass an existing
-    `location_id`, or `location_name`/the other `location_*` fields to
-    resolve-or-create one, or leave all of them unset for no location.
-    Changeable afterward too, via PUT /api/videos/{id}/metadata.
-    """
-    if location_latitude is not None and not (-90 <= location_latitude <= 90):
-        raise HTTPException(status_code=400, detail="location_latitude must be between -90 and 90")
-    if location_longitude is not None and not (-180 <= location_longitude <= 180):
-        raise HTTPException(status_code=400, detail="location_longitude must be between -180 and 180")
-
-    tag_ids = _parse_ids(tag_user_ids, "tag_user_ids")
-    if tag_ids:
-        # Before anything is saved: the reel doesn't exist yet, so only its
-        # owner matters for the visibility checks.
-        tag_service.assert_can_tag(
-            db, current_user, "reel", SimpleNamespace(user=current_user), tag_ids
-        )
-
-    audio = None
-    if audio_id is not None:
-        audio = db.query(models.Audio).filter(models.Audio.id == audio_id).first()
-        if audio is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio not found")
-
-    try:
-        location = resolve_location_from_form(
-            db,
-            location_id=location_id,
-            location_name=location_name,
-            location_address=location_address,
-            location_city=location_city,
-            location_state=location_state,
-            location_country=location_country,
-            location_latitude=location_latitude,
-            location_longitude=location_longitude,
-            location_place_id=location_place_id,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    # Validate editing metadata before any media is written. These settings are
-    # metadata only: the frontend must apply filters/speed and mix audio into
-    # the video itself before upload.
-    parsed_editor_state = editor_state_service.parse_form_value(editor_state)
-    if playback_speed is not None and playback_speed not in (1, 2, 3):
-        raise HTTPException(status_code=400, detail="playback_speed must be one of 1, 2, or 3")
-    if audio_start_seconds is not None and audio_id is None:
-        raise HTTPException(status_code=400, detail="audio_start_seconds requires audio_id")
-    if audio is not None and audio_start_seconds is not None and audio.duration_seconds is not None:
-        if audio_start_seconds > audio.duration_seconds:
-            raise HTTPException(status_code=400, detail="audio_start_seconds cannot exceed audio duration")
-
-    editing_fields = {
-        "recording_duration_seconds": recording_duration_seconds,
-        "timer_duration_seconds": timer_duration_seconds,
-        "filter_id": filter_id,
-        "playback_speed": playback_speed,
-        "audio_start_seconds": audio_start_seconds,
-    }
-    editing_fields = {key: value for key, value in editing_fields.items() if value is not None}
-    if editing_fields:
-        parsed_editor_state = {**(parsed_editor_state or {}), **editing_fields}
-        # Reuse the editor-state size/JSON validation for the merged object.
-        parsed_editor_state = editor_state_service.check_object(parsed_editor_state)
-
-    url, kind = save_upload_file(file, "reels", allow_video=True)
-    if kind != "video":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Reels must be a video file"
-        )
-
-    # Extract and store the real video duration. This is used by WatchSession
-    # validation so a viewer cannot accumulate more watch time than the reel
-    # actually contains.
-    duration_seconds = get_video_duration(url)
-
-    thumbnail_url = None
-    if thumbnail is not None and thumbnail.filename:
-        thumbnail_url, thumb_kind = save_upload_file(thumbnail, "thumbnails", allow_video=False)
-        if thumb_kind != "image":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Thumbnail must be an image file"
-            )
-    else:
-        thumbnail_url = generate_video_thumbnail(url)
-
-    reel = models.Reel(
-        user_id=current_user.id,
-        editor_state=parsed_editor_state,
-        title=title,
-        caption=caption,
-        video_url=url,
-        thumbnail_url=thumbnail_url,
-        duration_seconds=duration_seconds,
-        source=source,
-        location_name=location.name if location else location_name,
-        location_latitude=location.latitude if location else location_latitude,
-        location_longitude=location.longitude if location else location_longitude,
-        location_id=location.id if location else None,
-        audio_id=audio.id if audio else None,
-        audience=audience,
-        visibility=visibility,
-        age_restriction=age_restriction,
-        comments_enabled=comments_enabled,
-        hide_like_count=hide_like_count,
-        hide_comments=hide_comments,
-        remixing_enabled=remixing_enabled,
-        downloads_enabled=downloads_enabled,
-        schedule_enabled=schedule_enabled,
-        scheduled_at=(vss.to_storage_utc(scheduled_at) if schedule_enabled and scheduled_at else None),
-    )
-    db.add(reel)
+    current_user.chat_font = payload.font
     db.commit()
-    db.refresh(reel)
+    return schemas.ChatFontResponse(message="Chat font updated", font=payload.font)
 
-    newly_mentioned = sync_mentions(db, models.MentionTargetType.reel, reel.id, caption, current_user.id)
-    for user in newly_mentioned:
-        await notify_user(
-            db,
-            user_id=user.id,
-            actor=current_user,
-            notif_type=models.NotificationType.mention,
-            message=f"{current_user.username} mentioned you in a reel",
-            target_type="reel",
-            target_id=reel.id,
-        )
 
-    new_tags = (
-        tag_service.add_tags(
-            db, "reel", reel, current_user, [(uid, None, None) for uid in tag_ids]
-        )
-        if tag_ids
-        else []
+# ==========================================================================
+# WebSocket — real-time delivery, typing indicators, presence
+# ==========================================================================
+#
+# Connect with:  ws(s)://<host>/api/chat/ws?token=<access_token>
+#
+# The browser WebSocket API can't set an Authorization header, so the access
+# token travels as a query parameter here instead (same token you already
+# use for REST calls).
+#
+# Client -> server messages (JSON):
+#   {"type": "typing", "conversation_id": 1}
+#   {"type": "ping"}
+#
+# Server -> client messages (JSON):
+#   {"type": "message", "conversation_id": 1, "message": {...MessageOut}}
+#   {"type": "typing", "conversation_id": 1, "user_id": 4}
+#   {"type": "read", "conversation_id": 1, "user_id": 4, "last_read_message_id": 12}
+#   {"type": "presence", "user_id": 4, "status": "online" | "offline"}
+#   {"type": "pong"}
+#   {"type": "error", "detail": "..."}
+
+def _user_conversation_partner_ids(db: Session, user_id: int) -> set[int]:
+    """Every other user who shares a conversation with this user — the
+    audience for that user's presence changes."""
+    conv_ids = select(models.ConversationParticipant.conversation_id).where(
+        models.ConversationParticipant.user_id == user_id
     )
-    db.commit()
-    await tag_service.notify_new_tags(db, "reel", reel.id, current_user, new_tags)
-
-    return _to_reel_detail(db, reel, current_user.id)
-
-
-# NOTE: /feed and /trending must stay registered before /{reel_id} for the
-# same route-ordering reason as posts above.
-
-@reels_router.get("/home", response_model=schemas.PaginatedReelDetailResponse)
-def get_reels_home_feed(
-    limit: int = Query(10, ge=1, le=50),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """
-    Reels from people the current user follows, plus their own — the
-    reel-equivalent of GET /api/posts/feed, for surfacing a user's reel on
-    the Home page. GET /api/reels/feed (below) stays as the global,
-    Explore-style reel feed — this is the follows-scoped one.
-    """
-    author_ids = _following_ids(db, current_user.id) + [current_user.id]
-    muted_ids = set(muted_user_ids(db, current_user.id, for_stories=False))
-    author_ids = [uid for uid in author_ids if uid not in muted_ids]
-    query = db.query(models.Reel).filter(
-        models.Reel.user_id.in_(author_ids),
-        visible_reels_clause(db, current_user.id),
-    )
-    query = _exclude_not_interested(
-        query, db, current_user.id, "reel", models.Reel.id
-    )
-    total = query.count()
-    reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
-    items = [_to_reel_detail(db, r, current_user.id) for r in reels]
-    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
-
-
-@reels_router.get("/feed", response_model=schemas.PaginatedReelDetailResponse)
-def get_reels_feed(
-    limit: int = Query(10, ge=1, le=50),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
-):
-    """
-    Infinite-scroll reel feed. Reverse-chronological with limit/offset —
-    the same pagination style used everywhere else in this API — so the
-    client advances `offset` by `limit` each time it scrolls to the next page.
-    """
-    viewer_id = current_user.id if current_user else None
-    query = db.query(models.Reel).join(models.User, models.Reel.user_id == models.User.id)
-    query = query.filter(_visible_authors_clause(db, viewer_id))
-    query = query.filter(visible_reels_clause(db, viewer_id))
-    query = _exclude_not_interested(
-        query, db, viewer_id, "reel", models.Reel.id
-    )
-    total = query.count()
-    reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
-    items = [_to_reel_detail(db, r, viewer_id) for r in reels]
-    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
-
-
-@reels_router.get("/trending", response_model=schemas.PaginatedReelDetailResponse)
-def get_trending_reels(
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    days: int = Query(7, ge=1, le=90, description="Trending window, in days"),
-    db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
-):
-    """
-    Ranked by an engagement score (likes + valid watch sessions) within the
-    trailing `days` window, rather than raw like count alone — a reel that
-    gets watched heavily but isn't liked much can still surface, and vice versa.
-    """
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-
-    likes_subq = (
-        db.query(
-            models.Like.target_id.label("reel_id"),
-            func.count(models.Like.id).label("like_score"),
-        )
+    rows = (
+        db.query(models.ConversationParticipant.user_id)
         .filter(
-            models.Like.target_type == models.LikeTargetType.reel,
-            models.Like.created_at >= since,
+            models.ConversationParticipant.conversation_id.in_(conv_ids),
+            models.ConversationParticipant.user_id != user_id,
         )
-        .group_by(models.Like.target_id)
-        .subquery()
-    )
-    watch_subq = (
-        db.query(
-            models.WatchSession.reel_id.label("reel_id"),
-            func.count(models.WatchSession.id).label("watch_score"),
-        )
-        .filter(
-            models.WatchSession.is_valid.is_(True),
-            models.WatchSession.started_at >= since,
-        )
-        .group_by(models.WatchSession.reel_id)
-        .subquery()
-    )
-
-    score = func.coalesce(likes_subq.c.like_score, 0) + func.coalesce(watch_subq.c.watch_score, 0)
-
-    viewer_id = current_user.id if current_user else None
-
-    query = (
-        db.query(models.Reel, score.label("score"))
-        .join(models.User, models.Reel.user_id == models.User.id)
-        .outerjoin(likes_subq, models.Reel.id == likes_subq.c.reel_id)
-        .outerjoin(watch_subq, models.Reel.id == watch_subq.c.reel_id)
-        .filter(score > 0)
-        .filter(_visible_authors_clause(db, viewer_id))
-        .filter(visible_reels_clause(db, viewer_id))
-        .order_by(score.desc(), models.Reel.created_at.desc())
-    )
-    query = _exclude_not_interested(
-        query, db, viewer_id, "reel", models.Reel.id
-    )
-
-    total = query.count()
-    rows = query.offset(offset).limit(limit).all()
-    items = [_to_reel_detail(db, reel, viewer_id) for reel, _score in rows]
-    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
-
-
-@reels_router.get("/{reel_id}/audience-options")
-def get_reel_audience_options(
-    reel_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Choices used by the Share Reel audience picker."""
-    reel = db.query(models.Reel).filter(models.Reel.id == reel_id).first()
-    if reel is None:
-        raise HTTPException(status_code=404, detail="Reel not found")
-    if reel.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You can only manage your own reels")
-    return {
-        "audiences": [
-            {"value": "everyone", "label": "Everyone"},
-            {"value": "followers", "label": "Followers"},
-            {"value": "close_friends", "label": "Close Friends"},
-        ],
-        "age_restrictions": [
-            {"value": "below_18", "label": "All ages"},
-            {"value": "18_plus", "label": "18+"},
-        ],
-    }
-
-
-@reels_router.get("/{reel_id}", response_model=schemas.ReelDetailOut)
-def get_reel(
-    reel_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
-):
-    reel = _get_reel_or_404(db, reel_id)
-    viewer_id = current_user.id if current_user else None
-    _require_author_visible(db, reel.user, viewer_id)
-    require_reel_viewable(db, reel, viewer_id)
-    return _to_reel_detail(db, reel, viewer_id)
-
-
-@reels_router.put("/{reel_id}", response_model=schemas.ReelDetailOut)
-async def update_reel(
-    reel_id: int,
-    payload: schemas.ReelUpdate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Update the editable fields shown on the Reel Edit Info screen.
-
-    Only the owner can edit. Omitted fields are preserved; nullable fields
-    such as audio_id and location can be sent as null to clear them.
-    Video/thumbnail file replacement remains handled by dedicated endpoints.
-    """
-    reel = _get_reel_or_404(db, reel_id)
-    if reel.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only update your own reels",
-        )
-
-    updates = payload.model_dump(exclude_unset=True)
-
-    if "audio_id" in updates:
-        audio_id = updates["audio_id"]
-        if audio_id is not None:
-            audio = db.query(models.Audio).filter(models.Audio.id == audio_id).first()
-            if audio is None:
-                raise HTTPException(status_code=404, detail="Audio not found")
-        reel.audio_id = audio_id
-
-    if "caption" in updates:
-        reel.caption = updates["caption"]
-    if "source" in updates and updates["source"] is not None:
-        reel.source = updates["source"]
-
-    if "ai_generated" in updates and updates["ai_generated"] is not None:
-        reel.ai_generated = updates["ai_generated"]
-
-    if "editor_state" in updates:
-        reel.editor_state = editor_state_service.check_object(updates["editor_state"])
-
-    if "location" in updates:
-        location = updates["location"]
-        if location is None:
-            reel.location_name = None
-            reel.location_latitude = None
-            reel.location_longitude = None
-            reel.location_id = None
-        else:
-            loc_row = find_or_create_location(
-                db,
-                name=location["name"],
-                latitude=location.get("latitude"),
-                longitude=location.get("longitude"),
-            )
-            reel.location_name = loc_row.name
-            reel.location_latitude = loc_row.latitude
-            reel.location_longitude = loc_row.longitude
-            reel.location_id = loc_row.id
-
-    new_tags = []
-    if updates.get("tag_user_ids") is not None:
-        ids = list(dict.fromkeys(updates["tag_user_ids"]))
-        existing = {
-            tag.user_id: tag
-            for tag in db.query(models.ReelTag).filter(models.ReelTag.reel_id == reel.id).all()
-        }
-        new_tags = tag_service.add_tags(
-            db, "reel", reel, current_user, [(uid, None, None) for uid in ids]
-        )
-        for uid in set(existing) - set(ids):
-            db.delete(existing[uid])
-
-    db.commit()
-    await tag_service.notify_new_tags(db, "reel", reel.id, current_user, new_tags)
-    db.refresh(reel)
-    return _to_reel_detail(db, reel, current_user.id)
-
-
-@reels_router.delete("/{reel_id}", response_model=schemas.MessageResponse)
-def delete_reel(
-    reel_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    reel = _get_reel_or_404(db, reel_id)
-    if reel.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="You can only delete your own reels"
-        )
-
-    db.query(models.Like).filter(
-        models.Like.target_type == models.LikeTargetType.reel,
-        models.Like.target_id == reel_id,
-    ).delete(synchronize_session=False)
-
-    # Remove reel comments and their comment likes before deleting the reel.
-    reel_comment_ids = [
-        row[0] for row in db.query(models.Comment.id)
-        .filter(models.Comment.reel_id == reel_id).all()
-    ]
-    if reel_comment_ids:
-        db.query(models.Like).filter(
-            models.Like.target_type == models.LikeTargetType.comment,
-            models.Like.target_id.in_(reel_comment_ids),
-        ).delete(synchronize_session=False)
-        db.query(models.Comment).filter(
-            models.Comment.parent_id.in_(reel_comment_ids)
-        ).delete(synchronize_session=False)
-        db.query(models.Comment).filter(
-            models.Comment.id.in_(reel_comment_ids)
-        ).delete(synchronize_session=False)
-
-    # WatchSession.reel_id and SeriesReel.reel_id are real foreign keys
-    # with no ON DELETE CASCADE — deleting a reel that anyone has ever
-    # watched (very likely, since watch tracking is used throughout the
-    # app) or that's part of a Series would otherwise hit a foreign key
-    # violation on MySQL/InnoDB and 500. Clear them explicitly first, the
-    # same way Like is handled above.
-    db.query(models.WatchSession).filter(models.WatchSession.reel_id == reel_id).delete(
-        synchronize_session=False
-    )
-    db.query(models.SeriesReel).filter(models.SeriesReel.reel_id == reel_id).delete(
-        synchronize_session=False
-    )
-    # Audio.source_reel_id is nullable and only an optional "traced back
-    # to" reference — null it out rather than deleting the Audio row
-    # itself, since a bookmarked sound should survive its source reel
-    # being removed.
-    db.query(models.Audio).filter(models.Audio.source_reel_id == reel_id).update(
-        {models.Audio.source_reel_id: None}, synchronize_session=False
-    )
-
-    # CreatorCollaborationRequest.reel_id is the last real foreign key into
-    # reels, and the one that was still 500ing here: a reel that's ever been
-    # the subject of a collaboration proposal couldn't be deleted at all.
-    # The rows aren't dropped, because an accepted request may already have
-    # paid out a CreatorEarning and that audit trail has to survive. Instead
-    # the reel reference is nulled (the column is nullable by design — a
-    # request can always stand alone as a general proposal), and anything
-    # still pending is cancelled, since the reel it was proposing work on no
-    # longer exists and accepting it would tag a collaborator onto nothing.
-    db.query(models.CreatorCollaborationRequest).filter(
-        models.CreatorCollaborationRequest.reel_id == reel_id,
-        models.CreatorCollaborationRequest.status == models.CollaborationStatus.pending,
-    ).update(
-        {
-            models.CreatorCollaborationRequest.status: models.CollaborationStatus.cancelled,
-            models.CreatorCollaborationRequest.responded_at: datetime.now(timezone.utc),
-        },
-        synchronize_session=False,
-    )
-    db.query(models.CreatorCollaborationRequest).filter(
-        models.CreatorCollaborationRequest.reel_id == reel_id
-    ).update({models.CreatorCollaborationRequest.reel_id: None}, synchronize_session=False)
-
-    # Bookmarks point at the reel informally (target_type/target_id), so
-    # they don't raise a foreign key error — they just rot into entries that
-    # render as blanks in GET /api/saved. Drop the SavedItem rows and their
-    # collection memberships. Shares are deliberately left alone: a share is
-    # a historical record of "I sent you this", not a live pointer.
-    saved_item_ids = [
-        row[0]
-        for row in db.query(models.SavedItem.id)
-        .filter(
-            models.SavedItem.target_type == models.SavedItemType.reel,
-            models.SavedItem.target_id == reel_id,
-        )
+        .distinct()
         .all()
-    ]
-    if saved_item_ids:
-        db.query(models.SavedCollectionItem).filter(
-            models.SavedCollectionItem.saved_item_id.in_(saved_item_ids)
-        ).delete(synchronize_session=False)
-        db.query(models.SavedItem).filter(
-            models.SavedItem.id.in_(saved_item_ids)
-        ).delete(synchronize_session=False)
+    )
+    return {r[0] for r in rows}
 
-    video_url, thumbnail_url = reel.video_url, reel.thumbnail_url
+
+@router.websocket("/ws")
+async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
+    db = SessionLocal()
     try:
-        db.delete(reel)  # cascades collaborators + revenue splits via the ORM relationship
+        user = get_user_from_raw_token(token, db)
+        if user is None:
+            await websocket.close(code=4401)
+            return
+
+        user_id = user.id
+        partner_ids = _user_conversation_partner_ids(db, user_id)
+        just_came_online = await manager.connect(user_id, websocket)
+
+        if just_came_online and partner_ids:
+            await manager.send_to_users(
+                partner_ids, {"type": "presence", "user_id": user_id, "status": "online"}
+            )
+
+        try:
+            while True:
+                data = await websocket.receive_json()
+                event_type = data.get("type")
+
+                if event_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+
+                elif event_type == "typing":
+                    conversation_id = data.get("conversation_id")
+                    if not isinstance(conversation_id, int):
+                        await websocket.send_json({"type": "error", "detail": "conversation_id is required"})
+                        continue
+                    is_participant = (
+                        db.query(models.ConversationParticipant.id)
+                        .filter(
+                            models.ConversationParticipant.conversation_id == conversation_id,
+                            models.ConversationParticipant.user_id == user_id,
+                        )
+                        .first()
+                        is not None
+                    )
+                    if not is_participant:
+                        await websocket.send_json({"type": "error", "detail": "Not a participant in that conversation"})
+                        continue
+                    others = [
+                        uid for uid in _conversation_participant_ids(db, conversation_id) if uid != user_id
+                    ]
+                    await manager.send_to_users(
+                        others,
+                        {"type": "typing", "conversation_id": conversation_id, "user_id": user_id},
+                    )
+
+                else:
+                    await websocket.send_json({"type": "error", "detail": f"Unknown event type '{event_type}'"})
+
+        except WebSocketDisconnect:
+            pass
+        finally:
+            just_went_offline = await manager.disconnect(user_id, websocket)
+            if just_went_offline and partner_ids:
+                await manager.send_to_users(
+                    partner_ids, {"type": "presence", "user_id": user_id, "status": "offline"}
+                )
+    finally:
+        db.close()
+
+# ---------------------------------------------------------------------------
+# Message actions: forward, favourites, message info, and pinning
+# --------------------------------------------------------------------------------------
+
+class ForwardMessageRequest(BaseModel):
+    target_chat_ids: list[int] = Field(..., min_length=1, max_length=20)
+    caption: str | None = Field(default=None, max_length=2200)
+
+
+@router.post("/messages/{message_id}/forward", status_code=status.HTTP_201_CREATED)
+async def forward_message(
+    message_id: int,
+    payload: ForwardMessageRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    original = db.query(models.Message).filter(
+        models.Message.id == message_id, models.Message.is_deleted.is_(False)
+    ).first()
+    if original is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, original.conversation_id, current_user.id)
+    if original.expires_at is not None:
+        expiry = original.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="Expired messages cannot be forwarded")
+
+    if len(set(payload.target_chat_ids)) != len(payload.target_chat_ids):
+        raise HTTPException(status_code=400, detail="Duplicate target_chat_ids are not allowed")
+
+    forwarded = []
+    for target_id in payload.target_chat_ids:
+        _get_conversation_or_404(db, target_id)
+        _get_participant_or_403(db, target_id, current_user.id)
+        _reject_if_blocked_in_conversation(db, target_id, current_user.id)
+        if target_id == original.conversation_id:
+            raise HTTPException(status_code=400, detail="Cannot forward a message to its same conversation")
+        clone = models.Message(
+            conversation_id=target_id,
+            sender_id=current_user.id,
+            content=payload.caption if payload.caption is not None else original.content,
+            media_url=original.media_url,
+            media_type=original.media_type,
+            message_type=original.message_type,
+            sticker_id=original.sticker_id,
+            shared_reel_id=original.shared_reel_id,
+            shared_post_id=original.shared_post_id,
+            shared_story_id=original.shared_story_id,
+            forwarded_from_message_id=original.id,
+            expires_at=_message_expiry(db, target_id),
+        )
+        preview = clone.content or (
+            "Forwarded a photo" if clone.media_type == models.MediaType.image else
+            "Forwarded a video" if clone.media_type == models.MediaType.video else
+            "Forwarded a message"
+        )
+        forwarded_out = await _create_and_dispatch_message(
+            db, target_id, clone, current_user, preview[:80]
+        )
+        forwarded.append(forwarded_out)
+    return {"message": "Message forwarded successfully", "items": forwarded}
+
+
+@router.post("/messages/{message_id}/favorite")
+def add_message_favorite(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    message = db.query(models.Message).filter(
+        models.Message.id == message_id, models.Message.is_deleted.is_(False)
+    ).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, message.conversation_id, current_user.id)
+    existing = db.query(models.MessageFavorite).filter_by(
+        message_id=message_id, user_id=current_user.id
+    ).first()
+    if existing is None:
+        existing = models.MessageFavorite(message_id=message_id, user_id=current_user.id)
+        db.add(existing)
         db.commit()
-    except IntegrityError:
-        # Something still references the reel. Roll back so the cleanup
-        # above doesn't get half-committed, leaving a reel that's had its
-        # likes and comments stripped but is still there.
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This reel can't be deleted because other records still reference it",
-        )
-
-    # Only unlink the media once the row is actually gone — deleting the
-    # file first would leave a playable-looking reel with a dead video URL
-    # if the commit failed.
-    delete_media_file(video_url)
-    if thumbnail_url:
-        delete_media_file(thumbnail_url)
-    return schemas.MessageResponse(message="Reel deleted")
+        db.refresh(existing)
+    return {"message": "Message added to favourites", "message_id": message_id,
+            "is_favorite": True, "created_at": existing.created_at}
 
 
-@reels_router.post(
-    "/{reel_id}/audio-remix",
-    response_model=schemas.ReelDetailOut,
-    status_code=status.HTTP_201_CREATED,
-)
-def remix_reel_audio(
-    reel_id: int,
-    file: UploadFile,
-    caption: str | None = Form(default=None),
+@router.delete("/messages/{message_id}/favorite")
+def remove_message_favorite(
+    message_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """
-    Creates a new reel that reuses an existing reel's audio — new visuals
-    (the uploaded file), paired with the original via `remixed_from_id`,
-    the same shape as a "use this audio" remix.
-    """
-    original = _get_reel_or_404(db, reel_id)
-    require_reel_viewable(db, original, current_user.id)
-
-    # If the original doesn't already have a saved Audio row (e.g. it was
-    # uploaded with its own baked-in sound, never explicitly "used" an
-    # existing one), back-fill one now so the remix — and this original —
-    # both point at the same audio_id and show up together under
-    # GET /api/audio/{id}/reels. ASSUMPTION: the audio_url itself is the
-    # original reel's video_url (audio and video aren't stored separately
-    # anywhere in this codebase); flag if a real extracted-audio file is
-    # expected instead.
-    if original.audio_id is None:
-        audio = models.Audio(
-            title=original.title or original.caption or f"Original audio · reel {original.id}",
-            audio_url=original.video_url,
-            source_reel_id=original.id,
-        )
-        db.add(audio)
-        db.flush()
-        original.audio_id = audio.id
-        db.add(original)
-
-    url, kind = save_upload_file(file, "reels", allow_video=True)
-    if kind != "video":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Reels must be a video file"
-        )
-
-    # Extract and store the real duration for the remixed reel too.
-    duration_seconds = get_video_duration(url)
-
-    remix = models.Reel(
-        user_id=current_user.id,
-        caption=caption,
-        video_url=url,
-        duration_seconds=duration_seconds,
-        remixed_from_id=original.id,
-        audio_id=original.audio_id,
-    )
-    db.add(remix)
+    message = db.query(models.Message).filter(models.Message.id == message_id).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, message.conversation_id, current_user.id)
+    db.query(models.MessageFavorite).filter_by(
+        message_id=message_id, user_id=current_user.id
+    ).delete(synchronize_session=False)
     db.commit()
-    db.refresh(remix)
-    return _to_reel_detail(db, remix, current_user.id)
+    return {"message": "Message removed from favourites", "message_id": message_id,
+            "is_favorite": False}
 
 
-@reels_router.get("/{reel_id}/remixes", response_model=schemas.PaginatedReelDetailResponse)
-def get_reel_remixes(
-    reel_id: int,
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
-):
-    """All reels remixed from this one (models.Reel.remixed_from_id), newest
-    first — the "N remixes" list a client shows under a reel's audio/remix
-    button."""
-    original = _get_reel_or_404(db, reel_id)
-    viewer_id = current_user.id if current_user else None
-    require_reel_viewable(db, original, viewer_id)
-
-    query = db.query(models.Reel).filter(
-        models.Reel.remixed_from_id == reel_id, visible_reels_clause(db, viewer_id)
-    )
-    total = query.count()
-    reels = query.order_by(models.Reel.created_at.desc()).offset(offset).limit(limit).all()
-    items = [_to_reel_detail(db, r, viewer_id) for r in reels]
-    return schemas.PaginatedReelDetailResponse(total=total, limit=limit, offset=offset, items=items)
-
-
-@reels_router.post("/{reel_id}/save", response_model=schemas.MessageResponse)
-def save_reel(
-    reel_id: int,
+@router.get("/favorites")
+def get_favorite_messages(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    reel = _get_reel_or_404(db, reel_id)
-    require_reel_viewable(db, reel, current_user.id)
-    _save_target(db, current_user.id, models.SavedItemType.reel, reel_id)
-    return schemas.MessageResponse(message="Reel saved")
+    rows = (db.query(models.MessageFavorite)
+            .join(models.Message, models.Message.id == models.MessageFavorite.message_id)
+            .filter(models.MessageFavorite.user_id == current_user.id,
+                    models.Message.is_deleted.is_(False))
+            .order_by(models.MessageFavorite.created_at.desc())
+            .offset(offset).limit(limit).all())
+    items = []
+    for row in rows:
+        message = db.query(models.Message).filter_by(id=row.message_id).first()
+        if message is not None:
+            items.append({"favorite_id": row.id, "saved_at": row.created_at,
+                          "message": _to_message_out(db, message, current_user.id)})
+    total = db.query(models.MessageFavorite).filter_by(user_id=current_user.id).count()
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
 
 
-@reels_router.delete("/{reel_id}/save", response_model=schemas.MessageResponse)
-def unsave_reel(
-    reel_id: int,
+@router.get("/messages/{message_id}/info")
+def get_message_info(
+    message_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    _unsave_target(db, current_user.id, models.SavedItemType.reel, reel_id)
-    return schemas.MessageResponse(message="Reel unsaved")
-
-
-# ==========================================================================
-# Reel Tags — "I appear in this video" (tap-to-tag), same shape as Tag
-# People on posts (post_details_routes.py) but scoped to reels via
-# models.ReelTag. Not to be confused with ReelCollaborator (a co-creator
-# credit, managed via POST /api/videos/:id/collaborators) — a reel can have
-# both a tagged friend and a credited collaborator, and they're unrelated.
-# ==========================================================================
-
-def _all_reel_tags(db: Session, reel_id: int) -> list[models.ReelTag]:
-    return (
-        db.query(models.ReelTag)
-        .filter(models.ReelTag.reel_id == reel_id)
-        .order_by(models.ReelTag.tagged_at)
-        .all()
+    message = db.query(models.Message).filter_by(id=message_id).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _get_participant_or_403(db, message.conversation_id, current_user.id)
+    statuses = db.query(models.MessageStatus).filter_by(message_id=message_id).all()
+    recipient_ids = [uid for uid in _conversation_participant_ids(db, message.conversation_id)
+                     if uid != message.sender_id]
+    status_by_user = {s.user_id: s for s in statuses}
+    recipients = []
+    for uid in recipient_ids:
+        user = db.query(models.User).filter_by(id=uid).first()
+        row = status_by_user.get(uid)
+        recipients.append({
+            "user_id": uid,
+            "username": user.username if user else None,
+            "delivered_at": row.delivered_at if row else None,
+            "read_at": row.read_at if row else None,
+            "status": "read" if row and row.read_at else
+                      "delivered" if row and row.delivered_at else "sent",
+        })
+    aggregate = "read" if recipients and all(r["status"] == "read" for r in recipients) else (
+        "delivered" if recipients and all(r["status"] in ("delivered", "read") for r in recipients)
+        else "sent"
     )
+    return {"message_id": message.id, "conversation_id": message.conversation_id,
+            "sender_id": message.sender_id, "sent_at": message.created_at,
+            "status": aggregate, "recipients": recipients}
 
 
-@reels_router.post(
-    "/{reel_id}/tags", response_model=schemas.ReelTagsResponse, status_code=status.HTTP_201_CREATED
-)
-async def tag_reel_people(
-    reel_id: int,
-    payload: schemas.TagPeopleRequest,
+@router.post("/conversations/{conversation_id}/messages/{message_id}/pin")
+def pin_message(
+    conversation_id: int,
+    message_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Same rules as tagging people on a post — see tag_service."""
-    reel = _get_reel_or_404(db, reel_id)
-    if reel.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="You can only tag people on your own reels"
-        )
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    message = db.query(models.Message).filter_by(
+        id=message_id, conversation_id=conversation_id
+    ).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found in this conversation")
+    if message.is_deleted:
+        raise HTTPException(status_code=400, detail="Deleted messages cannot be pinned")
+    row = db.query(models.PinnedMessage).filter_by(
+        conversation_id=conversation_id, message_id=message_id
+    ).first()
+    if row is None:
+        row = models.PinnedMessage(conversation_id=conversation_id,
+                                   message_id=message_id, pinned_by=current_user.id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return {"message": "Message pinned successfully", "conversation_id": conversation_id,
+            "message_id": message_id, "pinned_by": row.pinned_by, "pinned_at": row.created_at}
 
-    created = tag_service.add_tags(
-        db, "reel", reel, current_user,
-        [(t.user_id, t.x_position, t.y_position) for t in payload.tags],
-    )
+
+@router.delete("/conversations/{conversation_id}/messages/{message_id}/pin")
+def unpin_message(
+    conversation_id: int,
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    row = db.query(models.PinnedMessage).filter_by(
+        conversation_id=conversation_id, message_id=message_id
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Pinned message not found")
+    db.delete(row)
     db.commit()
-    await tag_service.notify_new_tags(db, "reel", reel.id, current_user, created)
-
-    return schemas.ReelTagsResponse(message="Tagged", tags=_all_reel_tags(db, reel_id))
-
-
-@reels_router.get("/{reel_id}/tags", response_model=schemas.ReelTagsResponse)
-def get_reel_tags(
-    reel_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User | None = Depends(get_current_user_optional),
-):
-    reel = _get_reel_or_404(db, reel_id)
-    viewer_id = current_user.id if current_user else None
-    _require_author_visible(db, reel.user, viewer_id)
-    require_reel_viewable(db, reel, viewer_id)
-    return schemas.ReelTagsResponse(
-        message="", tags=tag_service.visible_tags(db, "reel", reel, viewer_id)
-    )
+    return {"message": "Message unpinned successfully", "conversation_id": conversation_id,
+            "message_id": message_id, "is_pinned": False}
 
 
-@reels_router.delete("/{reel_id}/tags/{user_id}", response_model=schemas.MessageResponse)
-def remove_reel_tag(
-    reel_id: int,
-    user_id: int,
+@router.get("/conversations/{conversation_id}/pinned-messages")
+def get_pinned_messages(
+    conversation_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    reel = _get_reel_or_404(db, reel_id)
-    tag = (
-        db.query(models.ReelTag)
-        .filter(models.ReelTag.reel_id == reel_id, models.ReelTag.user_id == user_id)
-        .first()
-    )
-    if tag is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag not found")
-
-    # Same rule as post tags: the reel owner can remove any tag, and a
-    # tagged person can untag themselves.
-    if current_user.id != reel.user_id and current_user.id != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the reel owner or the tagged user can remove this tag",
-        )
-
-    db.delete(tag)
-    db.commit()
-    return schemas.MessageResponse(message="Tag removed")
+    _get_participant_or_403(db, conversation_id, current_user.id)
+    rows = (db.query(models.PinnedMessage)
+            .filter_by(conversation_id=conversation_id)
+            .order_by(models.PinnedMessage.created_at.desc()).all())
+    items = []
+    for row in rows:
+        message = db.query(models.Message).filter_by(id=row.message_id).first()
+        if message is not None and not message.is_deleted:
+            items.append({"pinned_by": row.pinned_by, "pinned_at": row.created_at,
+                          "message": _to_message_out(db, message, current_user.id)})
+    return {"conversation_id": conversation_id, "total": len(items), "items": items}

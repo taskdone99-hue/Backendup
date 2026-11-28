@@ -60,6 +60,7 @@ from app.routers import (
     video_engagement_routes,
     video_parity_routes,
     upload_lifecycle_routes,
+    upload_uid_settings_routes,
 )
 
 # Creates tables if they don't exist yet (fine for dev; use Alembic migrations in production).
@@ -173,3 +174,4 @@ def health_check():
     return {"status": "ok"}
 
 app.include_router(kpp_analytics_routes.router)
+app.include_router(upload_uid_settings_routes.router)
